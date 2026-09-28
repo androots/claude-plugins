@@ -356,20 +356,40 @@ class ListTest(Base):
 
     def test_big_conversation_is_split_into_parts_and_checkers(self):
         L = Lines()
-        for i in range(400):
+        for i in range(35):
             L.user("指示 %03d " % i + "あ" * 900).assistant("返事 %03d " % i + "い" * 900)
         self.w.write(L)
         res = self.w.list()
-        batches = res["items"][0]["review"]
-        files = [f for b in batches for f in b]
+        files = self.w.review_files(1)
         self.assertGreater(len(files), agentlog.REVIEW_PARTS_PER_CHECKER)          # 大きいので分割
-        self.assertTrue(all(len(b) <= agentlog.REVIEW_PARTS_PER_CHECKER for b in batches))
-        for name in files:
-            with open(os.path.join(res["review_dir"], name), encoding="utf-8") as f:
+        checkers = res["checkers"]
+        self.assertEqual([c["id"] for c in checkers], res["items"][0]["checkers"])
+        self.assertTrue(all(c["parts"][1] - c["parts"][0] + 1 <= agentlog.REVIEW_PARTS_PER_CHECKER for c in checkers))
+        for path in files:
+            with open(path, encoding="utf-8") as f:
                 text = f.read()
             self.assertLessEqual(len(text), agentlog.REVIEW_PART_CHARS + 300)
             self.assertTrue(all(len(line) <= agentlog.REVIEW_LINE_CHARS for line in text.split("\n")))
-        self.assertEqual(len(self.w.human(1)), 400)
+        self.assertEqual(len(self.w.human(1)), 35)
+        # 担当範囲: パート a〜b（全 N パート中）をプロンプトで伝える
+        self.assertEqual([c["parts"] for c in checkers], [[1, 3], [4, 6], [7, len(files)]][:len(checkers)])
+        self.assertIn("パート 1〜3（全 %d パート中）" % len(files), checkers[0]["prompt"])
+        self.assertIn(files[0], checkers[0]["prompt"])
+        self.assertNotIn(files[3], checkers[0]["prompt"])
+
+    def test_conversation_too_big_for_the_checker_cap_is_not_checked(self):
+        L = Lines()
+        for i in range(400):
+            L.user("指示 %03d " % i + "あ" * 900).assistant("返事 %03d " % i + "い" * 900)
+        self.w.write(L)
+        self.w.write(Lines(base=time.time() - 60).user("小さな会話").assistant())
+        res = self.w.list()
+        big = [it for it in res["items"] if it.get("too_big")]
+        self.assertEqual(len(big), 1)
+        self.assertNotIn("checkers", big[0])
+        self.assertEqual(len(res["checkers"]), 1)                  # 小さな会話の 1 体だけ
+        out = self.w.check()
+        self.assertEqual([c["why"] for c in out["conversations"] if c["result"] == "unconfirmed"], ["too_big"])
 
 
 class SessionGuardTest(Base):
@@ -485,30 +505,34 @@ class RoundTest(Base):
             self.w.write(L)
             sids.append(L.sid)
         r1 = self.w.list()
-        self.assertEqual((r1["count"], r1["remaining"], r1["round"]), (15, 25, 1))
+        # 1 会話に確認係 1 体。確認係は 1 ラウンド 12 体までなので、小さな会話は 12 件ずつ
+        self.assertEqual((r1["count"], r1["remaining"], r1["round"]), (12, 28, 1))
+        self.assertEqual(len(r1["checkers"]), 12)
         self.assertNotIn("note_already_sent", r1)
-        self.assertEqual([it["session_id"] for it in r1["items"]], sids[25:])   # 新しい 15 件を古い順に
-        self.assertEqual([it["n"] for it in r1["items"]], list(range(1, 16)))
+        self.assertEqual([it["session_id"] for it in r1["items"]], sids[28:])   # 新しい 12 件を古い順に
+        self.assertEqual([it["n"] for it in r1["items"]], list(range(1, 13)))
         self.assertEqual(self.w.list(), r1)                                       # 番号は固定
         res = self.next_round()                                                    # 外すと決める
-        self.assertEqual((res["sent_count"], res["excluded_count"], res["remaining"]), (0, 15, 25))
+        self.assertEqual((res["sent_count"], res["excluded_count"], res["remaining"]), (0, 12, 28))
 
         r2 = self.w.list()                                                         # 同じ会話でもう一度
-        self.assertEqual((r2["count"], r2["remaining"], r2["round"]), (15, 10, 2))
+        self.assertEqual((r2["count"], r2["remaining"], r2["round"]), (12, 16, 2))
         self.assertNotIn("note_already_sent", r2)                                 # 感想はまだ送っていない
         self.assertNotIn("first_run", r2)
-        self.assertEqual([it["session_id"] for it in r2["items"]], sids[10:25])
+        self.assertEqual([it["session_id"] for it in r2["items"]], sids[16:28])
         # 2 ラウンド目も返事のゲートが効く
-        code, out, err = self.w.run("send", "--exclude", "1-15", reply=False)
+        code, out, err = self.w.run("send", "--exclude", "1-12", reply=False)
         self.assertEqual(code, agentlog.EXIT_NOT_ANSWERED)
-        self.assertEqual(self.next_round()["remaining"], 10)
+        self.assertEqual(self.next_round()["remaining"], 16)
 
         r3 = self.w.list()
-        self.assertEqual((r3["count"], r3["remaining"], r3["round"]), (10, 0, 3))
-        self.assertEqual([it["session_id"] for it in r3["items"]], sids[:10])
+        self.assertEqual((r3["count"], r3["remaining"], r3["round"]), (12, 4, 3))
         self.next_round()
         r4 = self.w.list()
-        self.assertEqual((r4["count"], r4["remaining"]), (0, 0))
+        self.assertEqual((r4["count"], r4["remaining"]), (4, 0))
+        self.assertEqual([it["session_id"] for it in r4["items"]], sids[:4])
+        self.next_round()
+        self.assertEqual((self.w.list()["count"]), 0)
         decided = self.w.state()["sessions"]
         self.assertEqual(sorted(k for k in decided if k in sids), sorted(sids))
         self.assertTrue(all(decided[k]["d"] == "excluded" for k in sids))
@@ -521,22 +545,22 @@ class RoundTest(Base):
             self.w.write(L)
             sids.append(L.sid)
         r1 = self.w.list()
-        self.assertEqual([it["session_id"] for it in r1["items"]], sids[20:])
-        self.w.check(ok="none")                                        # 15 番（一番新しい）は確認できなかった
-        code, out, err = self.w.run("send", "--exclude", "1-14")
+        self.assertEqual([it["session_id"] for it in r1["items"]], sids[23:])
+        self.w.check(ok="none")                                        # 12 番（一番新しい）は確認できなかった
+        code, out, err = self.w.run("send", "--exclude", "1-11")
         self.assertEqual(code, 0, err)
         res = json.loads(out)
-        self.assertEqual((res["excluded_count"], res["deferred_unconfirmed"], res["remaining"]), (14, 1, 21))
+        self.assertEqual((res["excluded_count"], res["deferred_unconfirmed"], res["remaining"]), (11, 1, 24))
         self.assertNotIn(sids[34], self.w.state()["sessions"])         # 記録は付けない
         r2 = self.w.list()                                              # 同じ会話の次のラウンド
         ids2 = [it["session_id"] for it in r2["items"]]
-        self.assertEqual(ids2, sids[5:20])                             # 未確認は後ろに回す（先頭に出続けない）
-        self.assertEqual(r2["remaining"], 6)
+        self.assertEqual(ids2, sids[11:23])                            # 未確認は後ろに回す（先頭に出続けない）
+        self.assertEqual(r2["remaining"], 12)
         self.w.check(ok="none")
-        code, out, err = self.w.run("send", "--exclude", "1-15")
+        code, out, err = self.w.run("send", "--exclude", "1-12")
         self.assertEqual(code, 0, err)
         r3 = self.w.list()                                              # ほかが尽きたら出る
-        self.assertEqual([it["session_id"] for it in r3["items"]], sids[:5] + [sids[34]])
+        self.assertEqual([it["session_id"] for it in r3["items"]], sids[:11] + [sids[34]])
         self.assertEqual(r3["remaining"], 0)
 
     def test_share_groups_are_never_split(self):
@@ -544,13 +568,13 @@ class RoundTest(Base):
         root = Lines(base=now - 90000).user("元の会話").assistant()
         forks = [root] + [Lines(base=now - 80000 + i * 100).copy_from(root).user("分岐 %d" % i).assistant()
                           for i in range(2)]
-        singles = [Lines(base=now - 50000 + i * 1000).user("単独 %d" % i).assistant() for i in range(14)]
+        singles = [Lines(base=now - 50000 + i * 1000).user("単独 %d" % i).assistant() for i in range(11)]
         for L in forks + singles:
             self.w.write(L)
         group = {L.sid for L in forks}
         r1 = self.w.list()
         ids1 = {it["session_id"] for it in r1["items"]}
-        self.assertEqual(r1["count"], 14)            # 新しい 14 件 + 3 件のまとまりは 15 を超えるので入れない
+        self.assertEqual(r1["count"], 11)            # 新しい 11 件（11 体）+ 3 件のまとまり（3 体）は 12 体を超えるので入れない
         self.assertFalse(ids1 & group)
         self.next_round()
         r2 = self.w.list()
@@ -563,16 +587,16 @@ class RoundTest(Base):
         root = Lines(base=now - 30000).user("まとまりの元").assistant()
         group = [root] + [Lines(base=now - 29000 + i * 100).copy_from(root).user("分岐 %d" % i).assistant()
                           for i in range(4)]
-        newer = [Lines(base=now - 20000 + i * 1000).user("新しい単独 %d" % i).assistant() for i in range(12)]
+        newer = [Lines(base=now - 20000 + i * 1000).user("新しい単独 %d" % i).assistant() for i in range(8)]
         older = [Lines(base=now - 90000 + i * 1000).user("古い単独 %d" % i).assistant() for i in range(5)]
         for L in group + newer + older:
             self.w.write(L)
         r1 = self.w.list()
         ids = {it["session_id"] for it in r1["items"]}
-        self.assertEqual(r1["count"], 15)
-        self.assertFalse(ids & {L.sid for L in group})                 # 5 件のまとまりは入らない
-        self.assertEqual(len(ids & {L.sid for L in older}), 3)         # 古い単独で埋める
-        self.assertEqual(r1["remaining"], 22 - 15)
+        self.assertEqual((r1["count"], len(r1["checkers"])), (12, 12))
+        self.assertFalse(ids & {L.sid for L in group})                 # 5 件のまとまりは 12 体を超えるので入らない
+        self.assertEqual(len(ids & {L.sid for L in older}), 4)         # 古い単独で埋める
+        self.assertEqual(r1["remaining"], 18 - 12)
 
     def test_one_group_over_fifteen_is_one_whole_round(self):
         now = time.time()
@@ -589,6 +613,9 @@ class RoundTest(Base):
         self.assertEqual((r1["count"], r1["remaining"]), (20, 3))
         self.assertEqual({it["session_id"] for it in r1["items"]}, {L.sid for L in group})
         self.assertFalse(any(it.get("default_excluded") or it.get("group_cut") for it in r1["items"]))
+        # 確認係は新しい会話から 12 体まで。残りの 8 件は確認係にかけない（確認できなかった扱い）
+        self.assertEqual(len(r1["checkers"]), 12)
+        self.assertEqual([it["n"] for it in r1["items"] if it.get("too_big")], list(range(1, 9)))
         res = self.next_round()
         self.assertEqual((res["excluded_count"], res["remaining"]), (20, 3))
         r2 = self.w.list()
@@ -602,14 +629,14 @@ class RoundTest(Base):
         for L in group:
             self.w.write(L)
         saved = agentlog.LIST_OUTPUT_MAX
-        agentlog.LIST_OUTPUT_MAX = 700      # 短い行でも全部は入らない
+        agentlog.LIST_OUTPUT_MAX = 1400     # 短い行でも全部は入らない
         try:
             code, out, err = self.w.run("list")
         finally:
             agentlog.LIST_OUTPUT_MAX = saved
         self.assertEqual(code, 0, err)
         r1 = json.loads(out)
-        self.assertLessEqual(len(out.strip()), 700)
+        self.assertLessEqual(len(out.strip()), 1400)
         self.assertGreater(r1["count"], 0)
         self.assertEqual(r1["count"] + r1["remaining"], 10)
         shown = {self.w.pending()["items"][i]["session_id"] for i in range(r1["count"])}
@@ -628,7 +655,7 @@ class RoundTest(Base):
         for L in group:
             self.w.write(L)
         saved = agentlog.LIST_OUTPUT_MAX
-        agentlog.LIST_OUTPUT_MAX = 6000     # 抜粋 0 でも入らないが、短い行なら全部入る
+        agentlog.LIST_OUTPUT_MAX = 9000     # ふつうの行では入らないが、短い行なら全部入る
         try:
             code, out, err = self.w.run("list")
         finally:

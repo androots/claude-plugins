@@ -213,18 +213,18 @@ class RoundSendTest(SendBase):
             self.w.write(L)
             sids.append(L.sid)
         r1 = self.w.list()
-        self.assertEqual((r1["count"], r1["remaining"], r1["round"]), (15, 5, 1))
+        self.assertEqual((r1["count"], r1["remaining"], r1["round"]), (12, 8, 1))
         self.assertNotIn("note_already_sent", r1)
         code, out, err = self.send(exclude="1", note="1 ラウンド目の感想")
         self.assertEqual(code, 0, err)
         res = json.loads(out)
-        self.assertEqual((res["sent_count"], res["excluded_count"], res["remaining"]), (14, 1, 5))
+        self.assertEqual((res["sent_count"], res["excluded_count"], res["remaining"]), (11, 1, 8))
         self.srv.finished = False                        # 次のラウンドは新しい引換券
         # 送信のあと、同じ会話でもう一度 /send-to-nobu → 次のラウンド
         code, out, err = self.w.run("status")
         self.assertEqual(json.loads(out), {"pending": False})
         r2 = self.w.list()
-        self.assertEqual((r2["count"], r2["remaining"], r2["round"]), (5, 0, 2))
+        self.assertEqual((r2["count"], r2["remaining"], r2["round"]), (8, 0, 2))
         self.assertTrue(r2["note_already_sent"])        # 2 ラウンド目は感想を聞かない
         # 別の会話（翌日）では 1 ラウンド目から・感想も聞く
         other = self.w.start_send_session()
@@ -234,15 +234,15 @@ class RoundSendTest(SendBase):
         self.assertNotIn("note_already_sent", r_other)
         code, out, err = self.w.run("list")   # もとの会話に戻る（控えは別の会話に移った）
         r2 = json.loads(out)
-        self.assertEqual((r2["count"], r2["round"]), (5, 2))
-        self.assertEqual([it["session_id"] for it in r2["items"]], sids[:5])
-        self.assertEqual([it["n"] for it in r2["items"]], [1, 2, 3, 4, 5])
+        self.assertEqual((r2["count"], r2["round"]), (8, 2))
+        self.assertEqual([it["session_id"] for it in r2["items"]], sids[:8])
+        self.assertEqual([it["n"] for it in r2["items"]], list(range(1, 9)))
         code, out, err = self.send()
         self.assertEqual(code, 0, err)
         self.assertEqual(json.loads(out)["remaining"], 0)
         self.assertEqual(self.w.list()["count"], 0)
         sent = {o.split("/")[-1].split(".")[0] for o in self.srv.objects}
-        self.assertEqual(sent, set(sids) - {sids[5]})
+        self.assertEqual(sent, set(sids) - {sids[8]})
 
 
 class UnconfirmedTest(SendBase):
@@ -264,13 +264,15 @@ class UnconfirmedTest(SendBase):
         # 同じ会話の次のラウンドで、同じ 3 件がもう一度出て確認係にかかる
         r2 = self.w.list()
         self.assertEqual([it["session_id"] for it in r2["items"]], [it["session_id"] for it in r1["items"]])
-        self.assertTrue(all(it["review"] for it in r2["items"]))
+        self.assertTrue(all(it["checkers"] for it in r2["items"]))
         self.assertNotEqual(r2["review_dir"], r1["review_dir"])
 
     def test_unconfirmed_is_deferred_not_excluded(self):
         r1 = self.three()
         unconfirmed_sid = r1["items"][2]["session_id"]
-        self.assertEqual(self.w.check(ok="1", caution="2"), {"unconfirmed": [3]})
+        res = self.w.check(ok="1", caution="2")                       # 3 の確認係の答えは届かなかった
+        self.assertEqual(res["missing"], [3])
+        self.assertEqual([c["result"] for c in res["conversations"]], ["ok", "caution", "unconfirmed"])
         code, out, err = self.send(check=False)
         self.assertEqual(code, 0, err)
         res = json.loads(out)
@@ -282,7 +284,7 @@ class UnconfirmedTest(SendBase):
         # 同じ会話でもう一度 /send-to-nobu → 未確認だった会話が出て、確認係にかかる（前に外した印は付かない）
         r2 = self.w.list()
         self.assertEqual([it["session_id"] for it in r2["items"]], [unconfirmed_sid])
-        self.assertEqual(r2["items"][0]["review"], [["01-1.txt"]])
+        self.assertEqual(r2["items"][0]["checkers"], [1])
         self.assertNotIn("default_excluded", r2["items"][0])
         self.w.check()                                                     # 今度は確認できた
         code, out, err = self.send(check=False)
@@ -310,12 +312,13 @@ class UnconfirmedTest(SendBase):
 
     def test_checked_rejects_bad_input(self):
         self.three()
-        for args in (["--ok", "1", "--caution", "1"], ["--ok", "4"], ["--ok", ""], ["--caution", "2-1"]):
-            code, out, err = self.w.run("checked", *args)
-            self.assertEqual(code, agentlog.EXIT_USAGE, args)
+        for text in ("{broken", '"ok"', '[{"checker": 99, "verdict": "ok"}]', '[{"verdict": "ok"}]'):
+            code, out, err = self.w.run("checked", stdin=text)
+            self.assertEqual(code, agentlog.EXIT_USAGE, text)
         other = self.w.start_send_session()
-        code, out, err = self.w.run("checked", "--ok", "1", session=other)
+        code, out, err = self.w.run("checked", stdin="[]", session=other)
         self.assertEqual(code, agentlog.EXIT_USAGE)                          # 別の会話の控えには書けない
+
 
     def test_queued_text_does_not_open_the_gate(self):
         # 一覧のターンの最中に打った文（queued）は、一覧を見る前かもしれないので返事にしない
@@ -345,6 +348,122 @@ class UnconfirmedTest(SendBase):
         self.assertEqual(code, 0, err)
         res = json.loads(out)
         self.assertEqual((res["sent_count"], res["excluded_count"], res["deferred_unconfirmed"]), (1, 0, 1))
+
+
+class SplitConversationTest(SendBase):
+    """分けた会話は、確認係全員の結果で決める（スクリプトがまとめる）。"""
+
+    def big(self):
+        L = Lines(base=time.time() - 3600)
+        for i in range(35):
+            L.user("指示 %02d " % i + "あ" * 900).assistant("返事 %02d " % i + "い" * 900)
+        self.w.write(L)
+        res = self.w.list()
+        ids = res["items"][0]["checkers"]
+        self.assertEqual(len(ids), 3)
+        return ids
+
+    def conv(self, results):
+        return self.w.check(results=results)["conversations"][0]
+
+    def test_all_ok_is_ok_even_though_each_checker_saw_only_its_parts(self):
+        ids = self.big()
+        c = self.conv([{"checker": i, "verdict": "ok", "reasons": []} for i in ids])
+        self.assertEqual(c["result"], "ok")
+        code, out, err = self.send(check=False)
+        self.assertEqual(json.loads(out)["sent_count"], 1)
+
+    def test_one_caution_makes_it_caution(self):
+        ids = self.big()
+        c = self.conv([{"checker": ids[0], "verdict": "ok", "reasons": []},
+                       {"checker": ids[1], "verdict": "caution", "reasons": ["健康の相談"]},
+                       {"checker": ids[2], "verdict": "caution", "reasons": ["健康の相談", "お金の話"]}])
+        self.assertEqual((c["result"], c["reasons"]), ("caution", ["健康の相談", "お金の話"]))
+
+    def test_one_unknown_or_missing_makes_it_unconfirmed(self):
+        ids = self.big()
+        c = self.conv([{"checker": ids[0], "verdict": "ok"}, {"checker": ids[1], "verdict": "unknown"},
+                       {"checker": ids[2], "verdict": "ok"}])
+        self.assertEqual((c["result"], c["why"]), ("unconfirmed", "unknown"))
+        code, out, err = self.send(check=False)
+        self.assertEqual(json.loads(out)["deferred_unconfirmed"], 1)
+
+    def test_line_format_without_braces(self):
+        # スキルが渡す形（波かっこと引用符なし）: 番号 verdict 理由 / 理由
+        ids = self.big()
+        text = "%d ok\n%d caution 健康の相談 / お金の話\n\n%d ok\n" % tuple(ids)
+        self.assertNotIn("{", text)
+        code, out, err = self.w.run("checked", stdin=text)
+        self.assertEqual(code, 0, err)
+        c = json.loads(out)["conversations"][0]
+        self.assertEqual((c["result"], c["reasons"]), ("caution", ["健康の相談", "お金の話"]))
+        for bad in ("1 good", "x ok", "ok 1"):
+            code, out, err = self.w.run("checked", stdin=bad)
+            self.assertEqual(code, agentlog.EXIT_USAGE, bad)
+
+    def test_results_arrive_one_by_one(self):
+        ids = self.big()
+        out1 = self.w.check(results=[{"checker": ids[2], "verdict": "ok", "reasons": []}])
+        self.assertEqual(out1["missing"], ids[:2])
+        self.assertEqual(out1["conversations"][0]["why"], "waiting")
+        out2 = self.w.check(results=[{"checker": ids[0], "verdict": "ok"}, {"checker": ids[1], "verdict": "ok"}])
+        self.assertEqual((out2["missing"], out2["conversations"][0]["result"]), ([], "ok"))
+
+    def test_checker_prompt_tells_its_range_and_the_checker_file_says_so(self):
+        ids = self.big()
+        prompts = {c["id"]: c["prompt"] for c in self.w.pending()["output"]["checkers"]}
+        self.assertIn("担当は会話 1 のパート 4〜6（全 7 パート中）", prompts[ids[1]])
+        with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "agents", "checker.md"),
+                  encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn("担当", text)
+        self.assertNotIn("渡された全パートについて", text)
+
+
+class AssistantNoteTest(SendBase):
+    """感想は本人の言葉だけ。AI の報告は区切りの行のあとに書き、別の欄（assistant_note）で届く。"""
+    SEP = agentlog.ASSISTANT_NOTE_SEPARATOR
+
+    def test_note_and_assistant_note_arrive_separately(self):
+        self.two_sessions()
+        self.w.list()
+        user = "昨日の感想: 確認係の結果がわかりやすかった\n2 行目も本人の言葉"
+        ai = "確認係 3 がタイムアウトしたので、その会話は今回送っていない。キー %s は伏せる" % ANTHROPIC
+        code, out, err = self.send(note=user + "\n" + self.SEP + "\n" + ai + "\n")
+        self.assertEqual(code, 0, err)
+        self.assertTrue(json.loads(out)["assistant_note_sent"])
+        fin = self.srv.finish_bodies[0]
+        self.assertEqual(fin["note"], user)
+        self.assertNotIn("タイムアウト", fin["note"])                       # 感想に AI の文が混ざらない
+        self.assertNotIn("確認係の結果がわかりやすかった", fin["assistant_note"])
+        self.assertTrue(fin["assistant_note"].startswith("確認係 3 がタイムアウト"))
+        self.assertNotIn(ANTHROPIC, fin["assistant_note"])                 # 伏せる
+        self.assertNotIn(self.SEP, fin["note"] + fin["assistant_note"])
+
+    def test_assistant_note_only_leaves_the_note_empty(self):
+        self.two_sessions()
+        self.w.list()
+        code, out, err = self.send(note=self.SEP + "\n許可ダイアログが 1 回出た\n")
+        self.assertEqual(code, 0, err)
+        fin = self.srv.finish_bodies[0]
+        self.assertEqual((fin["note"], fin["assistant_note"]), ("", "許可ダイアログが 1 回出た"))
+
+    def test_without_separator_there_is_no_assistant_note(self):
+        self.two_sessions()
+        self.w.list()
+        code, out, err = self.send(note="感想だけ")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("assistant_note", self.srv.finish_bodies[0])
+        self.assertNotIn("assistant_note_sent", json.loads(out))
+
+    def test_bad_assistant_note_is_refused_before_upload(self):
+        self.two_sessions()
+        self.w.list()
+        code, out, err = self.send(note="感想\n%s\nA\n%s\nB" % (self.SEP, self.SEP))
+        self.assertEqual(code, agentlog.EXIT_USAGE)
+        code, out, err = self.send(note="感想\n%s\n%s" % (self.SEP, "あ" * (agentlog.ASSISTANT_NOTE_MAX + 1)))
+        self.assertEqual(code, agentlog.EXIT_USAGE)
+        self.assertEqual(self.srv.upload_calls, 0)
 
 
 class GateTest(SendBase):

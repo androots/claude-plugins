@@ -227,15 +227,19 @@ class World(object):
             raise AssertionError("list failed: %s" % err)
         return json.loads(out)
 
+    def review_files(self, n):
+        """いまの一覧の n 番の確認用ファイル（パート順）。"""
+        d = self.pending()["output"]["review_dir"]
+        names = [x for x in os.listdir(d) if re.match(r"^%02d-\d+\.txt$" % n, x)]
+        return [os.path.join(d, x) for x in sorted(names, key=lambda x: int(x.split("-")[1].split(".")[0]))]
+
     def review_blocks(self, n):
         """いまの一覧の n 番の確認用ファイルを読み、[(話し手, 本文)] にする。"""
-        out = self.pending()["output"]
-        item = [it for it in out["items"] if it["n"] == n][0]
         lines = []
-        for batch in item["review"]:
-            for name in batch:
-                with open(os.path.join(out["review_dir"], name), encoding="utf-8") as f:
-                    lines += [l for l in f.read().split("\n") if not l.startswith("# ")]
+        for path in self.review_files(n):
+            with open(path, encoding="utf-8") as f:
+                lines += [l for l in f.read().split("\n")
+                          if not l.startswith("# ") and not re.match(r"^（\d+/\d+ ここまで）$", l)]
         blocks = []
         for line in lines:
             m = re.match(r"^【(本人|AI|サブエージェントへの指示|サブエージェント)】$", line)
@@ -249,16 +253,30 @@ class World(object):
         """n 番の会話で、確認係に「本人の指示」として渡る本文。"""
         return [t for who, t in self.review_blocks(n) if who == "本人"]
 
-    def check(self, ok="all", caution=None, session=None):
-        """確認係の結果を控えに書く（既定は全部 ok）。"""
+    def checker_results(self, ok="all", caution=None, unknown=None):
+        """番号の指定から、確認係ごとの答えの並びを作る（書かなかった会話の確認係は未着のまま）。"""
         p = self.pending()
-        n = len(p["items"]) if p else 0
-        args = ["checked"]
-        if ok is not None:
-            args += ["--ok", ("1-%d" % n if n else "none") if ok == "all" else ok]
-        if caution is not None:
-            args += ["--caution", caution]
-        code, out, err = self.run(*args, session=session)
+        ids = {it["n"]: it.get("checkers") or [] for it in p["items"]}
+
+        def nums(spec):
+            if spec == "all":
+                return sorted(ids)
+            if not spec or spec == "none":
+                return []
+            return sorted(agentlog.parse_numbers(spec, ids, "test"))
+        out = []
+        for verdict, spec in (("ok", ok), ("caution", caution), ("unknown", unknown)):
+            for n in nums(spec):
+                for k, c in enumerate(ids[n]):
+                    v = verdict if (verdict != "caution" or k == 0) else "ok"
+                    out.append({"checker": c, "verdict": v, "reasons": ["テストの理由"] if v == "caution" else []})
+        return out
+
+    def check(self, ok="all", caution=None, unknown=None, session=None, results=None):
+        """確認係の結果を控えに渡す（既定は全部 ok）。checked の出力を返す。"""
+        if results is None:
+            results = self.checker_results(ok, caution, unknown)
+        code, out, err = self.run("checked", stdin=json.dumps(results, ensure_ascii=False), session=session)
         if code != 0:
             raise AssertionError("checked failed: %s" % err)
         return json.loads(out)
@@ -394,7 +412,8 @@ class FakeInbox(object):
             def _finish(self, req):
                 if inbox.finished:
                     return self._err(409, "already_finished")
-                if set(req) != {"sent", "excluded_count", "note", "plugin_version"}:
+                if not {"sent", "excluded_count", "note", "plugin_version"} <= set(req) \
+                        or set(req) - {"sent", "excluded_count", "note", "plugin_version", "assistant_note"}:
                     return self._err(400, "invalid_argument")
                 sent = req.get("sent") or []
                 if not sent and not req.get("note"):

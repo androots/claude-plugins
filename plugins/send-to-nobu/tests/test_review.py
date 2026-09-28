@@ -24,12 +24,10 @@ class ReviewFileTest(unittest.TestCase):
         self.w.close()
 
     def files_text(self, res, n=1):
-        item = res["items"][n - 1]
         out = []
-        for batch in item["review"]:
-            for name in batch:
-                with open(os.path.join(res["review_dir"], name), encoding="utf-8") as f:
-                    out.append(f.read())
+        for path in self.w.review_files(n):
+            with open(path, encoding="utf-8") as f:
+                out.append(f.read())
         return "".join(out)
 
     def test_conversation_layer_only_masked_without_images(self):
@@ -51,7 +49,7 @@ class ReviewFileTest(unittest.TestCase):
         self.assertNotIn("cat ~/work", text)                              # ツールの入力も渡さない
         self.assertEqual([w for w, _ in self.w.review_blocks(1)],
                          ["本人", "AI", "AI", "サブエージェントへの指示", "サブエージェント"])
-        mode = stat.S_IMODE(os.stat(os.path.join(res["review_dir"], res["items"][0]["review"][0][0])).st_mode)
+        mode = stat.S_IMODE(os.stat(self.w.review_files(1)[0]).st_mode)
         self.assertEqual(mode, 0o600)
 
     def test_detects_personal_data_in_tool_results_by_kind_and_count(self):
@@ -100,7 +98,8 @@ class ReviewFileTest(unittest.TestCase):
         self.assertNotIn("人事異動", out)                                  # 本文は出力に出さない
         self.assertNotIn("転職", out)
         res = json.loads(out)
-        self.assertEqual(res["items"][0]["review"], [["01-1.txt"]])
+        self.assertEqual(res["items"][0]["checkers"], [1])
+        self.assertEqual(res["checkers"][0]["prompt"].split("\n")[1], os.path.join(res["review_dir"], "01-1.txt"))
 
 
     def test_parts_end_with_a_marker_and_are_small(self):
@@ -109,12 +108,11 @@ class ReviewFileTest(unittest.TestCase):
             L.user("指示 %02d " % i + "あ" * 500).assistant("返事 %02d " % i + "い" * 500)
         self.w.write(L)
         res = self.w.list()
-        batches = res["items"][0]["review"]
-        files = [f for b in batches for f in b]
+        files = self.w.review_files(1)
         self.assertGreater(len(files), 3)
-        self.assertTrue(all(len(b) <= 3 for b in batches))
-        for k, name in enumerate(files, 1):
-            with open(os.path.join(res["review_dir"], name), encoding="utf-8") as f:
+        self.assertTrue(all(c["parts"][1] - c["parts"][0] < 3 for c in res["checkers"]))
+        for k, path in enumerate(files, 1):
+            with open(path, encoding="utf-8") as f:
                 text = f.read()
             self.assertLessEqual(len(text), agentlog.REVIEW_PART_CHARS + 300)
             self.assertTrue(text.rstrip("\n").endswith("（%d/%d ここまで）" % (k, len(files))))
