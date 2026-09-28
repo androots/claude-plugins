@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "agent-log-inbox": {
+      "type": "http",
+      "url": "https://agent-log-inbox-mcp.androots.co.jp/mcp"
+    }
+  }
+}

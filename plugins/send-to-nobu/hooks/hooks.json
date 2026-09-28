@@ -1,0 +1,17 @@
+{
+  "description": "その日最初の起動で、未送信の会話があれば 1 行知らせる",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "xcode-select -p >/dev/null 2>&1 && /usr/bin/python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/agentlog.py\" nudge --data-dir \"${CLAUDE_PLUGIN_DATA}\" || true",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

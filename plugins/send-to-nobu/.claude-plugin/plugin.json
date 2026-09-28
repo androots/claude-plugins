@@ -1,0 +1,10 @@
+{
+  "name": "send-to-nobu",
+  "version": "0.1.0",
+  "description": "Claude Code の会話ログを のぶろう に送る。毎朝 /send-to-nobu で一覧を見て、外すものと感想を答えるだけ",
+  "author": {
+    "name": "androots"
+  },
+  "homepage": "https://github.com/androots/claude-plugins",
+  "repository": "https://github.com/androots/claude-plugins"
+}
