@@ -58,7 +58,7 @@ TITLE_FALLBACK_CHARS = 40
 TITLE_MAX = 200
 PROJECT_MAX = 300
 NOTE_MAX = 20000
-ASSISTANT_NOTE_MAX = 5000
+ASSISTANT_NOTE_MAX = 1000       # サーバーは 5,000 まで受けるが、プラグインは短く抑える
 # 標準入力の感想（本人の言葉）のあとに AI の報告を続けるときの区切りの行（この 1 行ちょうど）
 ASSISTANT_NOTE_SEPARATOR = "@@SEND_TO_NOBU_ASSISTANT_NOTE@@"
 FACTS_VERSION = 5          # 一覧に出すかの判定を変えたら上げる（nudge のキャッシュを読み直させる）
@@ -1203,11 +1203,13 @@ def select_round(items, need=lambda idx: 0):
         return sorted(first), unchecked
     chosen, used = [], 0
     for g in groups:
+        if len(chosen) + len(g) > ROUND_SIZE:
+            continue  # 件数で入らないまとまりは、確認係の数を見に行かない（本文を読まない）
         g_need = sum(need(i) for i in g)
-        if len(chosen) + len(g) <= ROUND_SIZE and used + g_need <= CHECKER_CAP:
+        if used + g_need <= CHECKER_CAP:
             chosen.extend(g)
             used += g_need
-        if len(chosen) == ROUND_SIZE:
+        if len(chosen) == ROUND_SIZE or used >= CHECKER_CAP:
             break
     return sorted(chosen), set()
 
@@ -1218,6 +1220,7 @@ REVIEW_PART_CHARS = 10000       # 確認係が 1 回の Read で読む量
 REVIEW_LINE_CHARS = 1000        # 1 行の長さ（Read は長い行を切るので折り返す）
 REVIEW_PARTS_PER_CHECKER = 3    # 確認係 1 体が読むファイルの数（大きい会話は確認係を分ける）
 CHECKER_CAP = 12                # 1 ラウンドの確認係の総数（同時に動かせる上限 20 に余裕を持たせる）
+TICKET_LEN = 12                 # 確認係の札の長さ（16 進）
 REVIEW_KEEP = 86400             # 残った確認用ファイルを消すまでの時間
 
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}")
@@ -1414,10 +1417,15 @@ def write_parts(review_dir, n, parts):
     return names
 
 
-def checker_prompt(cid, n, a, b, total, paths):
-    return ("あなたは確認係 %d。担当は会話 %d のパート %d〜%d（全 %d パート中）。"
-            "担当のパートだけを全部読んで判定し、{\"checker\": %d, \"verdict\": …, \"reasons\": […]} の形で返す。\n%s"
-            % (cid, n, a, b, total, cid, "\n".join(paths)))
+def new_ticket():
+    """確認係の札（推測できない乱数）。今のラウンドの控えにある札の答えだけを受け付ける。"""
+    return hashlib.sha256(os.urandom(32)).hexdigest()[:TICKET_LEN]
+
+
+def checker_prompt(cid, ticket, n, a, b, total, paths):
+    return ("あなたは確認係 %d。札は %s。担当は会話 %d のパート %d〜%d（全 %d パート中）。"
+            "担当のパートだけを全部読んで判定し、{\"ticket\": \"%s\", \"verdict\": …, \"reasons\": […]} の形で返す。\n%s"
+            % (cid, ticket, n, a, b, total, ticket, "\n".join(paths)))
 
 
 def review_root(data_dir):
@@ -1557,8 +1565,9 @@ def build_round(items, shown, unchecked, layers, review_dir):
         for a in range(0, len(names), REVIEW_PARTS_PER_CHECKER):
             batch = names[a:a + REVIEW_PARTS_PER_CHECKER]
             cid = len(checkers) + 1
-            checkers.append({"id": cid, "n": k, "parts": [a + 1, a + len(batch)], "total": len(names),
-                             "prompt": checker_prompt(cid, k, a + 1, a + len(batch), len(names),
+            ticket = new_ticket()
+            checkers.append({"id": cid, "ticket": ticket, "n": k, "parts": [a + 1, a + len(batch)], "total": len(names),
+                             "prompt": checker_prompt(cid, ticket, k, a + 1, a + len(batch), len(names),
                                                       [os.path.join(review_dir, nm) for nm in batch])})
             ids.append(cid)
         rev["checkers"] = ids
@@ -1638,20 +1647,23 @@ def cmd_list(args, out):
     pending = {LIST_MARKER: 1, "v": PENDING_VERSION, "session": sid, "created_at": iso_utc(now), "created_ts": now,
                "session_size": file_size(cur_path), "items": pend_items, "output": result,
                "remaining": result["remaining"], "review_dir": review_dir,
-               "checkers": {str(c["id"]): c["n"] for c in checkers}, "checker_results": {}}
+               "checkers": {str(c["id"]): c["n"] for c in checkers},
+               "tickets": {c["ticket"]: c["id"] for c in checkers}, "checker_results": {}}
     write_json_atomic(pending_path(data_dir), pending)
     out.write(json.dumps(result, ensure_ascii=False) + "\n")
     return 0
 
 
-_RESULT_LINE_RE = re.compile(r"^\s*(\d+)\s+(ok|caution|unknown)\b\s*(.*?)\s*$")
+_RESULT_LINE_RE = re.compile(r"^\s*([0-9a-f]{%d})\s+(ok|caution|unknown)\b\s*(.*?)\s*$" % TICKET_LEN)
+_SEVERITY = {"ok": 1, "unknown": 2, "caution": 3}   # 同じ確認係の答えは重い方を残す（後から軽くしない）
 
 
 def _read_checker_results(stdin):
     """checked の標準入力: 確認係の答え。空なら []。
 
-    1 行に 1 体: `<番号> <ok|caution|unknown> [理由 / 理由 …]`（波かっこと引用符を含まない形。Bash の安全チェックが
+    1 行に 1 体: `<札> <ok|caution|unknown> [理由 / 理由 …]`（波かっこと引用符を含まない形。Bash の安全チェックが
     `{` と `"` の組み合わせを止めるため、スキルはこの形で渡す）。JSON（1 つ・並び・{"results": [...]}）も受け付ける。
+    札（ticket）の無い答え・番号だけの答えは受け付けない。理由は 1 行に限る。
     """
     text = stdin.read().strip()
     if not text:
@@ -1667,17 +1679,23 @@ def _read_checker_results(stdin):
             data = [data]
         if not isinstance(data, list) or not all(isinstance(r, dict) for r in data):
             raise Fail("確認係の結果の形が違う", EXIT_USAGE)
-        return data
+        out = []
+        for r in data:
+            reasons = r.get("reasons") if isinstance(r.get("reasons"), list) else []
+            if any(isinstance(x, str) and ("\n" in x or "\r" in x) for x in reasons):
+                raise Fail("確認係の理由に改行がある（理由は 1 行ずつ）", EXIT_USAGE)
+            out.append({"ticket": r.get("ticket"), "verdict": r.get("verdict"), "reasons": reasons})
+        return out
     out = []
     for line in text.split("\n"):
         if not line.strip():
             continue
         m = _RESULT_LINE_RE.match(line)
         if not m:
-            raise Fail("確認係の結果の行が読めない（「番号 ok|caution|unknown 理由 / 理由」の形で）: %s" % line.strip()[:40],
+            raise Fail("確認係の結果の行が読めない（「札 ok|caution|unknown 理由 / 理由」の形で）: %s" % line.strip()[:40],
                        EXIT_USAGE)
         reasons = [r.strip() for r in re.split(r"\s+[/／]\s+", m.group(3)) if r.strip()] if m.group(3) else []
-        out.append({"checker": int(m.group(1)), "verdict": m.group(2), "reasons": reasons})
+        out.append({"ticket": m.group(1), "verdict": m.group(2), "reasons": reasons})
     return out
 
 
@@ -1692,18 +1710,23 @@ def cmd_checked(args, out):
     require_send_session(sid)
     now = _now()
     pending = load_pending(data_dir, sid, now)
-    known = pending.get("checkers") or {}
+    tickets = pending.get("tickets") or {}
     results = dict(pending.get("checker_results") or {})
-    for r in _read_checker_results(args.stdin):
-        cid = r.get("checker")
-        if isinstance(cid, str) and cid.isdigit():
-            cid = int(cid)
-        if not isinstance(cid, int) or str(cid) not in known:
-            raise Fail("確認係の番号が一覧にない: %r" % (cid,), EXIT_USAGE)
-        verdict = r.get("verdict") if r.get("verdict") in ("ok", "caution", "unknown") else "unknown"
-        reasons = r.get("reasons") if isinstance(r.get("reasons"), list) else []
-        results[str(cid)] = {"verdict": verdict,
-                             "reasons": [str(x)[:60] for x in reasons if isinstance(x, (str, int, float))][:5]}
+    incoming = _read_checker_results(args.stdin)
+    bad = [r.get("ticket") for r in incoming if not isinstance(r.get("ticket"), str) or r["ticket"] not in tickets]
+    if bad:
+        # 前のラウンドの札・偽の札・札の無い答えは、今のラウンドの答えとして受け付けない（入力ごと止める）
+        raise Fail("今のラウンドの確認係の札ではない答えがある（前のラウンドの答えや札の無い答えは渡さない）: %s"
+                   % ", ".join(str(t)[:16] for t in bad[:5]), EXIT_USAGE)
+    for r in incoming:
+        cid = str(tickets[r["ticket"]])
+        verdict = r.get("verdict") if r.get("verdict") in _SEVERITY else "unknown"
+        reasons = [str(x)[:60] for x in (r.get("reasons") or []) if isinstance(x, (str, int, float))][:5]
+        old = results.get(cid)
+        if old is None or _SEVERITY[verdict] > _SEVERITY[old["verdict"]]:
+            results[cid] = {"verdict": verdict, "reasons": reasons if verdict == "caution" else []}
+        elif _SEVERITY[verdict] == _SEVERITY[old["verdict"]] == _SEVERITY["caution"]:
+            old["reasons"] = (old["reasons"] + [x for x in reasons if x not in old["reasons"]])[:5]
     pending["checker_results"] = results
 
     missing, convs, summary = [], [], {"ok": 0, "caution": 0, "unconfirmed": 0}
@@ -2041,6 +2064,25 @@ def parse_numbers(text, numbers, what):
     return out
 
 
+def assistant_note_leak(text, pending, excluded_numbers):
+    """AI の報告に、今回の一覧の中身（タイトル・確認係の理由・外した会話の番号）が入っていないか。入っていれば種類を返す。"""
+    folded = re.sub(r"\s+", "", text)
+
+    def contains(value):
+        v = re.sub(r"\s+", "", value or "")
+        return len(v) >= 4 and v in folded
+    for it in pending.get("items") or []:
+        if contains(it.get("title")):
+            return "一覧の会話のタイトル"
+    for r in (pending.get("checker_results") or {}).values():
+        if any(contains(x) for x in r.get("reasons") or []):
+            return "確認係の理由"
+    for n in excluded_numbers:
+        if re.search(r"(?<![0-9])%d\s*番|#%d(?![0-9])" % (n, n), text):
+            return "外した会話の番号"
+    return None
+
+
 def read_note(args, stdin):
     """標準入力から (感想, AI の報告)。区切りの行より前が本人の感想、後ろが AI の報告（無ければ空）。"""
     if args.note_file is None:
@@ -2236,6 +2278,10 @@ def cmd_send(args, out, stdin):
     assistant_note = mask_text(raw_assistant)[0]
     if len(assistant_note) > ASSISTANT_NOTE_MAX:
         raise Fail("AI の報告が長すぎる（%d 文字まで）" % ASSISTANT_NOTE_MAX, EXIT_USAGE)
+    if assistant_note:
+        leak = assistant_note_leak(assistant_note, pending, explicit)
+        if leak:
+            raise Fail("AI の報告に%sが入っている。報告は送る手順・道具の不具合だけにして書き直して" % leak, EXIT_USAGE)
 
     if not send_items and not note:
         # 送るものも感想もない日: サーバーには何も送らず、外したことだけ覚える

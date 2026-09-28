@@ -257,6 +257,7 @@ class World(object):
         """番号の指定から、確認係ごとの答えの並びを作る（書かなかった会話の確認係は未着のまま）。"""
         p = self.pending()
         ids = {it["n"]: it.get("checkers") or [] for it in p["items"]}
+        ticket = {c["id"]: c["ticket"] for c in p["output"]["checkers"]}
 
         def nums(spec):
             if spec == "all":
@@ -269,7 +270,7 @@ class World(object):
             for n in nums(spec):
                 for k, c in enumerate(ids[n]):
                     v = verdict if (verdict != "caution" or k == 0) else "ok"
-                    out.append({"checker": c, "verdict": v, "reasons": ["テストの理由"] if v == "caution" else []})
+                    out.append({"ticket": ticket[c], "verdict": v, "reasons": ["テストの理由"] if v == "caution" else []})
         return out
 
     def check(self, ok="all", caution=None, unknown=None, session=None, results=None):
@@ -280,6 +281,10 @@ class World(object):
         if code != 0:
             raise AssertionError("checked failed: %s" % err)
         return json.loads(out)
+
+    def tickets(self):
+        """いまの一覧の確認係の番号 → 札。"""
+        return {c["id"]: c["ticket"] for c in self.pending()["output"]["checkers"]}
 
     def state(self):
         return agentlog.read_json(os.path.join(self.data, "state.json"), None)

@@ -666,6 +666,19 @@ class RoundTest(Base):
         self.assertFalse(any(it.get("group_cut") for it in r1["items"]))
 
 
+class SelectRoundTest(unittest.TestCase):
+    def test_stops_looking_once_the_checker_cap_is_reached(self):
+        items = [{"shares_idx": [], "deferred_before": False} for _ in range(200)]
+        asked = []
+
+        def need(i):
+            asked.append(i)
+            return 1
+        shown, unchecked = agentlog.select_round(items, need)
+        self.assertEqual(len(shown), agentlog.CHECKER_CAP)
+        self.assertLessEqual(len(asked), agentlog.CHECKER_CAP + 1)   # 残りの会話の本文は読まない
+
+
 class SameNumbersTest(Base):
     def test_list_twice_in_the_same_conversation_returns_the_same_items(self):
         self.w.write(Lines(base=time.time() - 7200).user("一つ目").assistant())
