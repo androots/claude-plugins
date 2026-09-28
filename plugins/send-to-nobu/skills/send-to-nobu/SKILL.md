@@ -2,6 +2,7 @@
 name: send-to-nobu
 description: 自分の Claude Code の会話ログを のぶろう に送る（毎朝 1 回）。新しい会話で /send-to-nobu → 一覧、/send-to-nobu <返事> → 送信
 disable-model-invocation: true
+model: opus
 argument-hint: "[一覧を見たあとの返事: 外す番号と感想]"
 allowed-tools:
   - mcp__plugin_send-to-nobu_agent-log-inbox__whoami
@@ -48,10 +49,11 @@ Bash で実行する:
    - フラグは必ず平易に添える:
      - `previously_excluded` →「前に外した会話の続き（今回も外す。送るなら『n も送る』と書いて）」
      - `contains_excluded_copy`（`previously_excluded` が無いとき）→「前に外した会話の中身を引き継いでいる（今回は外す。送るなら『n も送る』と書いて）」
-     - `shares_history_with_later` →「次回に回した会話と同じ履歴を含む（今回は外す。送るなら『n も送る』と書いて。次回の分の中身も届く）」
+     - `history_group`（同じ番号どうし）→「同じ履歴を含む。片方だけ外しても、もう片方から届く」
+     - `group_cut` →「同じ履歴の会話が多すぎて全部は出せなかった。送ると出していない分の中身も届く」
      - `shares_history_with: [m]` →「m 番と同じ履歴を含む。片方だけ外しても、もう片方から届く」
    - `first_run` なら先頭に「初回なので `since` 以降の分」と一言
-   - `remaining` があれば最後に「ほかに `remaining` 件あるけど、それは次回」と一言
+   - `remaining` が 1 以上なら最後に「この `count` 件のあとに `remaining` 件ある（送ったあと /send-to-nobu で続き）」と一言
 5. 最後にこう聞いて終わる（AskUserQuestion などの選択ダイアログは使わない）:
 
    ```
@@ -82,8 +84,9 @@ Bash で実行する:
    ```
 
 4. 終了コードで分ける:
-   - 0 → 出力の JSON から 1 行で「`sent_count` 件送った・`excluded_count` 件外した」（0 件で感想だけなら「感想を送った」）
-   - 3（同じ履歴を共有している・次回に回した会話と同じ履歴）→ 中身を平易に伝えて終わる。「それでも送るなら `/send-to-nobu それでも送る`、
+   - 0 → 出力の JSON から 1 行で「`sent_count` 件送った・`excluded_count` 件外した」（0 件で感想だけなら「感想を送った」）。
+     `remaining` が 1 以上なら「あと `remaining` 件ある。続けるなら /send-to-nobu」と続ける
+   - 3（同じ履歴を共有している）→ 中身を平易に伝えて終わる。「それでも送るなら `/send-to-nobu それでも送る`、
      やめるなら `/send-to-nobu 両方外す`」と案内する。次の呼び出しで了承なら、同じ番号と感想で 3 に `--confirm-shared` を付ける
    - 4（引換券が使えない・使用済み）→ 2 からもう一度だけやり直す
    - 5（まだ本人の返事が無い）→ 一覧モード 5 の質問をして終わる

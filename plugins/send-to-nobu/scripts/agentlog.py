@@ -7,7 +7,7 @@ python3 3.9 の標準ライブラリだけで動く（macOS の /usr/bin/python3
 サブコマンド:
   nudge  SessionStart フック。未送信の会話があれば 1 日 1 回だけ 1 行知らせる
   status いまの会話に有効な一覧の控えがあるか（スキルが一覧モードか送信モードかを決める）
-  list   未送信の会話の一覧を出し、控えを保存する（--preview で人の指示の抜粋）
+  list   未送信の会話のうち 1 ラウンド分（最大 15 件）の一覧を出し、控えを保存する（--preview で抜粋）
   send   控えに沿って、画像の base64 を外す → 秘密を伏せる → gzip → 引換券でアップロード → 送信票
 
 status / list / send は「いまの会話の最初の人の指示が /send-to-nobu」の会話でしか動かない。
@@ -51,7 +51,8 @@ DAY_START_HOUR = 6          # nudge の日の区切り（ローカル時刻）
 PENDING_TTL = 6 * 3600      # 一覧の控えの有効期限
 HEAD_LINES = 200            # 分岐コピーの判定に使う先頭の行数
 PREVIEW_MAX = 15            # 1 会話あたりの抜粋の最大数
-PREVIEW_LEVELS = (15, 10, 6, 3, 1)  # 出力が大きいときは抜粋をこの順に減らす
+ROUND_SIZE = 15             # 1 回の一覧（1 ラウンド）の件数。同じ履歴のまとまりは分けない
+PREVIEW_LEVELS = (15, 10, 6, 3, 1, 0)  # 出力が大きいときは抜粋をこの順に減らす
 PREVIEW_CHARS = 160         # 抜粋 1 つの最大文字数
 LIST_OUTPUT_MAX = 20000     # 一覧の出力全体の上限（Bash ツールの 30,000 文字で切れないように）
 TITLE_FALLBACK_CHARS = 40
@@ -59,7 +60,7 @@ TITLE_MAX = 200
 PROJECT_MAX = 300
 NOTE_MAX = 20000
 FACTS_VERSION = 3          # 一覧に出すかの判定を変えたら上げる（nudge のキャッシュを読み直させる）
-PENDING_VERSION = 3        # 一覧の控えの形を変えたら上げる
+PENDING_VERSION = 4        # 一覧の控えの形を変えたら上げる
 
 UPLOAD_BATCH = 100
 PUT_WORKERS = 4
@@ -1117,52 +1118,6 @@ def build_list(state, current, excluded_store, cache):
     return items, [r[5] for r in rows]
 
 
-def render_list(items, scans, shown, level, preview, state, split=frozenset()):
-    """items のうち shown（添字の昇順）を 1 から番号を振り直して、出力と控えの形にする。
-
-    split は「同じ履歴の仲間の一部を次回に回した」会話。既定で外し、送るには --include と --confirm-shared が要る。
-    """
-    number = {idx: k + 1 for k, idx in enumerate(shown)}
-    rows, pend = [], []
-    for idx in shown:
-        it, s = items[idx], scans[idx]
-        n = number[idx]
-        shares = sorted(number[o] for o in it["shares_idx"] if o in number)
-        split_group = idx in split
-        default_excluded = it["previously_excluded"] or it["contains_excluded_copy"] or split_group
-        row = {"n": n, "session_id": it["session_id"], "title": it["title"], "project": it["project"],
-               "updated": local_short(it["last_ts"]), "size": human_size(it["total_bytes"]),
-               "prompts": it["prompt_count"]}
-        if it["sub_n"]:
-            row["subagent_files"] = it["sub_n"]
-        if it["previously_excluded"]:
-            row["previously_excluded"] = True
-        if it["contains_excluded_copy"]:
-            row["contains_excluded_copy"] = True
-        if split_group:
-            row["shares_history_with_later"] = True
-        if default_excluded:
-            row["default_excluded"] = True
-        if shares:
-            row["shares_history_with"] = shares
-        if preview:
-            picked = s.prompts_for_preview(level)
-            row["preview"] = [squash(mask_text(display_text(t))[0], PREVIEW_CHARS) for t in picked]
-            if s.prompt_count > len(picked):
-                row["preview_omitted"] = s.prompt_count - len(picked)
-        rows.append(row)
-        p = {k: v for k, v in it.items() if k not in ("prompt_count", "total_bytes", "last_ts", "shares_idx")}
-        p.update({"n": n, "shares": shares, "split_group": split_group})
-        pend.append(p)
-    result = {"count": len(rows), "items": rows}
-    if len(shown) < len(items):
-        result["remaining"] = len(items) - len(shown)
-    if not state["sessions"]:
-        result["first_run"] = True
-        result["since"] = local_short(state["baseline"])
-    return result, pend
-
-
 def share_groups(items):
     """shares_history_with でつながった会話のまとまり。新しい順（まとまりの中の一番新しい会話で比べる）。"""
     parent = list(range(len(items)))
@@ -1184,37 +1139,110 @@ def share_groups(items):
     return sorted((sorted(g) for g in groups.values()), key=lambda g: g[-1], reverse=True)
 
 
-def fit_list(items, scans, preview, state):
-    """出力が LIST_OUTPUT_MAX 文字に収まるようにする。
+def select_round(items):
+    """1 ラウンドに入れる会話（添字の昇順）。
 
-    まず抜粋を減らす。それでも多ければ、同じ履歴でつながった会話をまとめて、古いまとまりから次回に回す
-    （片方だけ回すと、回した方の中身が確認なしに届くため）。一番新しいまとまり 1 つで上限を超えるときは、
-    その中の新しい会話から入るだけ出し、出した分を既定で外す（送るには --include と --confirm-shared）。
+    同じ履歴のまとまりは分けない。新しいまとまりから ROUND_SIZE 件まで詰める（入らないまとまりは飛ばして、
+    もっと古い小さなまとまりで埋める）。一番新しいまとまりだけで ROUND_SIZE を超えるなら、そのまとまりだけ。
     """
-    levels = PREVIEW_LEVELS if preview else (0,)
-
-    def attempt(shown, split=frozenset()):
-        for level in levels:
-            result, pend = render_list(items, scans, shown, level, preview, state, split)
-            if len(json.dumps(result, ensure_ascii=False)) <= LIST_OUTPUT_MAX:
-                return result, pend
-        return None
-
-    got = attempt(list(range(len(items))))
-    if got:
-        return got
     groups = share_groups(items)
-    for k in range(len(groups) - 1, 0, -1):
-        got = attempt(sorted(idx for g in groups[:k] for idx in g))
-        if got:
-            return got
-    newest = groups[0] if groups else []
-    for m in range(len(newest) - 1, 0, -1):
-        shown = newest[-m:]
-        got = attempt(shown, frozenset(shown))
-        if got:
-            return got
-    return render_list(items, scans, [], levels[-1], preview, state)
+    if not groups:
+        return []
+    if len(groups[0]) > ROUND_SIZE:
+        return groups[0]
+    chosen = []
+    for g in groups:
+        if len(chosen) + len(g) <= ROUND_SIZE:
+            chosen.extend(g)
+        if len(chosen) == ROUND_SIZE:
+            break
+    return sorted(chosen)
+
+
+def render_round(items, scans, shown, level, preview, state, remaining, compact=False, cut=False):
+    """items のうち shown（添字の昇順）を 1 から番号を振って、出力と控えの形にする。
+
+    compact: 抜粋・会話 ID・プロジェクトを省き、タイトルを短くし、同じ履歴は番号の並びでなく group で示す。
+    cut: 同じ履歴のまとまりが大きすぎて一部しか出せなかった。出した会話を送るには --confirm-shared が要る。
+    """
+    number = {idx: k + 1 for k, idx in enumerate(shown)}
+    group_of = {}
+    if compact:
+        for gno, g in enumerate(sorted((g for g in share_groups(items) if len(g) > 1 and any(i in number for i in g)),
+                                       key=lambda g: min(number[i] for i in g if i in number)), 1):
+            for i in g:
+                group_of[i] = gno
+    rows, pend = [], []
+    for idx in shown:
+        it, s = items[idx], scans[idx]
+        n = number[idx]
+        shares = sorted(number[o] for o in it["shares_idx"] if o in number)
+        default_excluded = it["previously_excluded"] or it["contains_excluded_copy"]
+        if compact:
+            row = {"n": n, "title": it["title"][:TITLE_FALLBACK_CHARS], "updated": local_short(it["last_ts"]),
+                   "size": human_size(it["total_bytes"]), "prompts": it["prompt_count"]}
+        else:
+            row = {"n": n, "session_id": it["session_id"], "title": it["title"], "project": it["project"],
+                   "updated": local_short(it["last_ts"]), "size": human_size(it["total_bytes"]),
+                   "prompts": it["prompt_count"]}
+            if it["sub_n"]:
+                row["subagent_files"] = it["sub_n"]
+        if it["previously_excluded"]:
+            row["previously_excluded"] = True
+        if it["contains_excluded_copy"]:
+            row["contains_excluded_copy"] = True
+        if default_excluded:
+            row["default_excluded"] = True
+        if compact:
+            if idx in group_of:
+                row["history_group"] = group_of[idx]
+        elif shares:
+            row["shares_history_with"] = shares
+        if cut:
+            row["group_cut"] = True
+        if preview and not compact:
+            picked = s.prompts_for_preview(level)
+            row["preview"] = [squash(mask_text(display_text(t))[0], PREVIEW_CHARS) for t in picked]
+            if s.prompt_count > len(picked):
+                row["preview_omitted"] = s.prompt_count - len(picked)
+        rows.append(row)
+        p = {k: v for k, v in it.items() if k not in ("prompt_count", "total_bytes", "last_ts", "shares_idx")}
+        p.update({"n": n, "shares": shares, "group_cut": cut})
+        pend.append(p)
+    result = {"count": len(rows), "items": rows, "remaining": remaining}
+    if not state["sessions"]:
+        result["first_run"] = True
+        result["since"] = local_short(state["baseline"])
+    return result, pend
+
+
+def fit_round(items, scans, preview, state):
+    """1 ラウンドを選び、出力が LIST_OUTPUT_MAX 文字に収まるように抜粋を減らす。
+
+    抜粋 0 でも収まらなければ行を短くする（全件のタイトル行は出す）。それでも収まらないほど大きなまとまりは
+    新しい会話から入るだけ出す。出さなかった会話は控えに入れない（送らない）。出した会話にも同じ履歴が
+    入っているので、送るには --confirm-shared を要る。
+    """
+    shown = select_round(items)
+    remaining = len(items) - len(shown)
+
+    def fits(result):
+        return len(json.dumps(result, ensure_ascii=False)) <= LIST_OUTPUT_MAX
+
+    for level in (PREVIEW_LEVELS if preview else (0,)):
+        result, pend = render_round(items, scans, shown, level, preview, state, remaining)
+        if fits(result):
+            return result, pend
+    result, pend = render_round(items, scans, shown, 0, preview, state, remaining, compact=True)
+    if fits(result):
+        return result, pend
+    for m in range(len(shown) - 1, 0, -1):
+        part = shown[-m:]
+        result, pend = render_round(items, scans, part, 0, preview, state, remaining + len(shown) - m,
+                                    compact=True, cut=True)
+        if fits(result):
+            return result, pend
+    return render_round(items, scans, [], 0, preview, state, len(items))
 
 
 def file_size(path):
@@ -1241,11 +1269,12 @@ def cmd_list(args, out):
     old_cache = load_cache(data_dir)
     cache = dict(old_cache)
     items, scans = build_list(state, sid, store, cache)
-    result, pend_items = fit_list(items, scans, args.preview, state)
+    result, pend_items = fit_round(items, scans, args.preview, state)
     if cache != old_cache:
         write_json_atomic(cache_path(data_dir), cache)
     pending = {"v": PENDING_VERSION, "session": sid, "created_at": iso_utc(now), "created_ts": now,
-               "session_size": file_size(cur_path), "items": pend_items, "output": result}
+               "session_size": file_size(cur_path), "items": pend_items, "output": result,
+               "remaining": result["remaining"]}
     write_json_atomic(pending_path(data_dir), pending)
     out.write(json.dumps(result, ensure_ascii=False) + "\n")
     return 0
@@ -1674,18 +1703,17 @@ def cmd_send(args, out, stdin):
         raise Fail("同じ番号が --exclude と --include の両方にある: %s" % ",".join(map(str, sorted(excluded & included))),
                    EXIT_USAGE)
     # 前に外した会話の続き・前に外した会話を引き継いだ会話は、--include で明示されない限り外す
-    # 前に外した会話の続き・引き継ぎ・次回に回した会話と同じ履歴の会話は、--include で明示されない限り外す
-    default_excluded = {n for n, it in items.items()
-                        if it.get("previously_excluded") or it.get("contains_excluded_copy") or it.get("split_group")}
+    # 前に外した会話の続き・前に外した会話を引き継いだ会話は、--include で明示されない限り外す
+    default_excluded = {n for n, it in items.items() if it.get("previously_excluded") or it.get("contains_excluded_copy")}
     excluded |= (default_excluded - included)
     send_items = [items[n] for n in sorted(items) if n not in excluded]
     excluded_items = [items[n] for n in sorted(excluded)]
 
     if not args.confirm_shared:
-        later = [it["n"] for it in send_items if it.get("split_group")]
-        if later:
-            raise Fail("%s 番は、次回に回した会話と同じ履歴を含む。送ると次回の分の中身も届く。"
-                       "了承なら --confirm-shared を付けてやり直す" % "、".join(map(str, later)), EXIT_CONFIRM_SHARED)
+        cut = [it["n"] for it in send_items if it.get("group_cut")]
+        if cut:
+            raise Fail("%s 番は、大きすぎて一覧に出しきれなかった会話と同じ履歴を含む。送るとその中身も届く。"
+                       "了承なら --confirm-shared を付けてやり直す" % "、".join(map(str, cut)), EXIT_CONFIRM_SHARED)
         pairs = sorted({(it["n"], m) for it in send_items for m in it.get("shares", []) if m in excluded})
         if pairs:
             desc = "、".join("%d 番と %d 番" % pr for pr in pairs)
@@ -1701,8 +1729,8 @@ def cmd_send(args, out, stdin):
         record_decisions(data_dir, now, [], excluded_items)
         remove_quietly(pending_path(data_dir))
         out.write(json.dumps({"submission_id": None, "sent_count": 0, "excluded_count": len(excluded_items),
-                              "subagent_count": 0, "bytes": 0, "redactions": 0, "omitted": 0},
-                             ensure_ascii=False) + "\n")
+                              "subagent_count": 0, "bytes": 0, "redactions": 0, "omitted": 0,
+                              "remaining": int(pending.get("remaining") or 0)}, ensure_ascii=False) + "\n")
         return 0
 
     if not args.code or not api_base:
@@ -1762,6 +1790,7 @@ def cmd_send(args, out, stdin):
         "bytes": sum(f["bytes"] for f in files),
         "redactions": sum(p["sent"]["redactions"] for p in packed),
         "omitted": sum(p["omitted"] for p in packed),
+        "remaining": int(pending.get("remaining") or 0),
     }
     out.write(json.dumps(result, ensure_ascii=False) + "\n")
     return 0

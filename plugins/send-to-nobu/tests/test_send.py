@@ -199,6 +199,36 @@ class RoundTripTest(SendBase):
         self.assertEqual((fin["sent"], fin["excluded_count"]), ([], 2))
 
 
+class RoundSendTest(SendBase):
+    def test_sent_and_excluded_do_not_come_back_in_later_rounds(self):
+        now = time.time()
+        sids = []
+        for i in range(20):
+            L = Lines(base=now - 90000 + i * 2000).user("会話 %02d" % i).assistant()
+            self.w.write(L)
+            sids.append(L.sid)
+        r1 = self.w.list()
+        self.assertEqual((r1["count"], r1["remaining"]), (15, 5))
+        code, out, err = self.send(exclude="1", note="1 ラウンド目の感想")
+        self.assertEqual(code, 0, err)
+        res = json.loads(out)
+        self.assertEqual((res["sent_count"], res["excluded_count"], res["remaining"]), (14, 1, 5))
+        self.srv.finished = False                        # 次のラウンドは新しい引換券
+        # 送信のあと、同じ会話でもう一度 /send-to-nobu → 次のラウンド
+        code, out, err = self.w.run("status")
+        self.assertEqual(json.loads(out), {"pending": False})
+        r2 = self.w.list()
+        self.assertEqual((r2["count"], r2["remaining"]), (5, 0))
+        self.assertEqual([it["session_id"] for it in r2["items"]], sids[:5])
+        self.assertEqual([it["n"] for it in r2["items"]], [1, 2, 3, 4, 5])
+        code, out, err = self.send()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["remaining"], 0)
+        self.assertEqual(self.w.list()["count"], 0)
+        sent = {o.split("/")[-1].split(".")[0] for o in self.srv.objects}
+        self.assertEqual(sent, set(sids) - {sids[5]})
+
+
 class GateTest(SendBase):
     def test_send_without_a_reply_is_refused(self):
         self.two_sessions()
