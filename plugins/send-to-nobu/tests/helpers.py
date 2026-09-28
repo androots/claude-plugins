@@ -153,8 +153,10 @@ class World(object):
 
     def run(self, *argv, stdin="", session=None, now=None):
         argv = list(argv) + ["--data-dir", self.data, "--projects-dir", self.projects]
-        if argv[0] in ("list", "send"):
-            argv += ["--session", session or self.current]
+        if session is not None:
+            argv += ["--session", session]
+        if argv[0] in ("status", "list", "send") and "--session" not in argv:
+            argv += ["--session", self.current]
         if now is not None:
             argv += ["--now", str(now)]
         out, err = io.StringIO(), io.StringIO()

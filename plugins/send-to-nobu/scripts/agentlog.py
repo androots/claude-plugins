@@ -6,8 +6,9 @@ python3 3.9 の標準ライブラリだけで動く（macOS の /usr/bin/python3
 
 サブコマンド:
   nudge  SessionStart フック。未送信の会話があれば 1 日 1 回だけ 1 行知らせる
+  status いまの会話に有効な一覧の控えがあるか（スキルが一覧モードか送信モードかを決める）
   list   未送信の会話の一覧を出し、控えを保存する（--preview で人の指示の抜粋）
-  send   控えに沿って、マスク → gzip → 引換券でアップロード → 送信票
+  send   控えに沿って、画像の base64 を外す → 秘密を伏せる → gzip → 引換券でアップロード → 送信票
 
 出力は AI が読む前提の短い JSON（stdout）。エラーは stderr に 1 行 + 非 0 終了。
 本物の会話本文を stdout に出すのは `list --preview` のマスク済み抜粋だけ。
@@ -907,12 +908,87 @@ class _HashWriter(object):
         self.fh.flush()
 
 
-def pack_jsonl(src, dst):
-    """JSONL を 1 行ずつマスクして gzip（mtime=0 で sha256 を安定させる）。
+_MEDIA_TYPE_RE = re.compile(r"^[a-z]+/[A-Za-z0-9.+-]+$")
+_OMITTED_PREFIX = "[OMITTED:"
 
-    戻り値 (gzip 後のバイト数, sha256, {種類: 件数}, 読んだ位置)。書きかけの最終行は含めない。
+
+def _b64_size(data):
+    """base64 文字列の元のバイト数（デコードせずに長さから）。"""
+    n = len(data) * 3 // 4
+    if data.endswith("=="):
+        n -= 2
+    elif data.endswith("="):
+        n -= 1
+    return max(n, 0)
+
+
+def _omit_obj(obj, counter):
+    """画像・文書の base64 を短い印に置き換える（その場で書き換える。ほかのキーは残す）。
+
+    - `source.type == "base64"` のブロック（本文・tool_result の中の画像や PDF）の `data`
+    - Read ツールの画像の結果 `{"base64": …, "type": "image/png", …}` の `base64`（同じ画像がもう 1 度入っている）
+    """
+    if isinstance(obj, dict):
+        src = obj.get("source")
+        if isinstance(src, dict) and src.get("type") == "base64":
+            data = src.get("data")
+            if isinstance(data, str) and not data.startswith(_OMITTED_PREFIX):
+                media = src.get("media_type") if isinstance(src.get("media_type"), str) else "unknown"
+                src["data"] = "%s%s %d bytes]" % (_OMITTED_PREFIX, media, _b64_size(data))
+                counter[0] += 1
+        data = obj.get("base64")
+        media = obj.get("type")
+        if (isinstance(data, str) and not data.startswith(_OMITTED_PREFIX)
+                and isinstance(media, str) and _MEDIA_TYPE_RE.match(media)):
+            obj["base64"] = "%s%s %d bytes]" % (_OMITTED_PREFIX, media, _b64_size(data))
+            counter[0] += 1
+        for v in obj.values():
+            if isinstance(v, (dict, list)):
+                _omit_obj(v, counter)
+    elif isinstance(obj, list):
+        for v in obj:
+            if isinstance(v, (dict, list)):
+                _omit_obj(v, counter)
+
+
+def omit_blob(raw):
+    """JSON 1 つぶんから画像・文書の base64 を外す。(バイト列, 置き換えた件数)。
+
+    `"base64"` を含まない行はバイト単位でそのまま。置き換えた行だけ JSON を書き直す（壊さない）。
+    """
+    if b'"base64"' not in raw:
+        return raw, 0
+    body = raw.rstrip(b"\r\n")
+    ending = raw[len(body):]
+    try:
+        obj = _loads_lenient(body)
+    except ValueError:
+        return raw, 0
+    counter = [0]
+    _omit_obj(obj, counter)
+    if not counter[0]:
+        return raw, 0
+    try:
+        out = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    except UnicodeEncodeError:  # 対になっていないサロゲートは \u エスケープで書く
+        out = json.dumps(obj, separators=(",", ":")).encode("ascii")
+    return out + ending, counter[0]
+
+
+def transform_blob(raw):
+    """送る前の変換: 画像・文書の base64 を外す → 秘密を伏せる。(バイト列, {種類: 件数}, 外した件数)。"""
+    line, omitted = omit_blob(raw)
+    line, counts = mask_blob(line)
+    return line, counts, omitted
+
+
+def pack_jsonl(src, dst):
+    """JSONL を 1 行ずつ変換して gzip（mtime=0 で sha256 を安定させる）。書きかけの最終行は含めない。
+
+    戻り値 {"bytes": gzip 後, "sha256", "counts": 伏せた件数, "omitted": 外した件数, "end": 読んだ位置}。
     """
     counts = {}
+    omitted = 0
     end = 0
     with open(src, "rb") as fin, open(dst, "wb") as fout:
         w = _HashWriter(fout)
@@ -920,24 +996,26 @@ def pack_jsonl(src, dst):
             for raw in fin:
                 if not raw.endswith(b"\n") and parse_line(raw) is None:
                     break
-                line, c = mask_blob(raw)
+                line, c, o = transform_blob(raw)
                 gz.write(line)
                 end += len(raw)
+                omitted += o
                 if c:
                     _merge_counts(counts, c)
         digest = w.h.hexdigest()
-    return os.path.getsize(dst), digest, counts, end
+    return {"bytes": os.path.getsize(dst), "sha256": digest, "counts": counts, "omitted": omitted, "end": end}
 
 
 def pack_json(src, dst):
-    """.json（1 つの JSON）を丸ごとマスクして gzip。"""
+    """.json（1 つの JSON）を丸ごと変換して gzip。"""
     with open(src, "rb") as f:
         raw = f.read()
-    masked, counts = mask_blob(raw)
-    data = gzip.compress(masked, compresslevel=GZIP_LEVEL, mtime=0)
+    data, counts, omitted = transform_blob(raw)
+    gz = gzip.compress(data, compresslevel=GZIP_LEVEL, mtime=0)
     with open(dst, "wb") as f:
-        f.write(data)
-    return len(data), hashlib.sha256(data).hexdigest(), counts, len(raw)
+        f.write(gz)
+    return {"bytes": len(gz), "sha256": hashlib.sha256(gz).hexdigest(), "counts": counts, "omitted": omitted,
+            "end": len(raw)}
 
 
 def pack_session(item, tmp):
@@ -951,33 +1029,37 @@ def pack_session(item, tmp):
     subs = subagent_files(path[:-len(".jsonl")])
     base = os.path.join(tmp, sid)
     os.makedirs(base)
-    size, digest, counts, end = pack_jsonl(path, base + ".jsonl.gz")
-    files = [{"session_id": sid, "rel": None, "bytes": size, "sha256": digest, "local": base + ".jsonl.gz"}]
+    main = pack_jsonl(path, base + ".jsonl.gz")
+    counts = dict(main["counts"])
+    omitted = main["omitted"]
+    files = [{"session_id": sid, "rel": None, "bytes": main["bytes"], "sha256": main["sha256"],
+              "local": base + ".jsonl.gz"}]
     sub_meta = []
     for i, (rel, p, _size) in enumerate(subs):
         dst = os.path.join(base, "%04d.gz" % i)
-        packer = pack_jsonl if rel.endswith(".jsonl") else pack_json
-        b, d, c, _ = packer(p, dst)
-        _merge_counts(counts, c)
-        files.append({"session_id": sid, "rel": rel, "bytes": b, "sha256": d, "local": dst})
-        sub_meta.append({"rel": rel, "bytes": b, "sha256": d})
+        r = (pack_jsonl if rel.endswith(".jsonl") else pack_json)(p, dst)
+        _merge_counts(counts, r["counts"])
+        omitted += r["omitted"]
+        files.append({"session_id": sid, "rel": rel, "bytes": r["bytes"], "sha256": r["sha256"], "local": dst})
+        sub_meta.append({"rel": rel, "bytes": r["bytes"], "sha256": r["sha256"]})
     sig = sub_signature(subs)
     return {
         "item": item,
         "files": files,
         "sent": {
             "session_id": sid,
-            "bytes": size,
-            "sha256": digest,
+            "bytes": main["bytes"],
+            "sha256": main["sha256"],
             "title": item.get("title", "")[:TITLE_MAX],
             "project": item.get("project", "")[:PROJECT_MAX],
             "last_activity": item.get("last_activity"),
             "redactions": sum(counts.values()),
             "subagents": sub_meta,
         },
-        "record": {"offset": end, "size": st.st_size, "mtime": int(st.st_mtime),
+        "record": {"offset": main["end"], "size": st.st_size, "mtime": int(st.st_mtime),
                    "sub_n": sig[0], "sub_bytes": sig[1]},
         "counts": counts,
+        "omitted": omitted,
     }
 
 
@@ -1234,7 +1316,8 @@ def cmd_send(args, out, stdin):
         record_decisions(data_dir, now, [], excluded_items)
         remove_quietly(pending_path(data_dir))
         out.write(json.dumps({"submission_id": None, "sent_count": 0, "excluded_count": len(excluded_items),
-                              "subagent_count": 0, "bytes": 0, "redactions": 0}, ensure_ascii=False) + "\n")
+                              "subagent_count": 0, "bytes": 0, "redactions": 0, "omitted": 0},
+                             ensure_ascii=False) + "\n")
         return 0
 
     if not args.code or not api_base:
@@ -1279,8 +1362,25 @@ def cmd_send(args, out, stdin):
         "subagent_count": sum(len(p["sent"]["subagents"]) for p in packed),
         "bytes": sum(f["bytes"] for f in files),
         "redactions": sum(p["sent"]["redactions"] for p in packed),
+        "omitted": sum(p["omitted"] for p in packed),
     }
     out.write(json.dumps(result, ensure_ascii=False) + "\n")
+    return 0
+
+
+# ---------------------------------------------------------------- status
+
+
+def cmd_status(args, out):
+    """いまの会話に、有効な一覧の控え（同じ会話 ID・6 時間以内）があるか。スキルのモード分けに使う。"""
+    now = args.now if args.now is not None else time.time()
+    data_dir = resolve_data_dir(args.data_dir)
+    try:
+        p = load_pending(data_dir, current_session(args.session), now)
+        res = {"pending": True, "count": len(p["items"])}
+    except Fail:
+        res = {"pending": False}
+    out.write(json.dumps(res) + "\n")
     return 0
 
 
@@ -1298,6 +1398,10 @@ def build_parser():
 
     sp = sub.add_parser("nudge", help="未送信の会話があれば 1 日 1 回知らせる（フック用）")
     common(sp)
+
+    sp = sub.add_parser("status", help="いまの会話に有効な一覧の控えがあるか")
+    common(sp)
+    sp.add_argument("--session", default=None, help="いまの会話 ID（省略時は CLAUDE_CODE_SESSION_ID）")
 
     sp = sub.add_parser("list", help="未送信の会話の一覧")
     common(sp)
@@ -1338,6 +1442,8 @@ def main(argv=None, stdin=None, stdout=None, stderr=None):
     if args.cmd == "nudge":
         return cmd_nudge(args, stdout)
     try:
+        if args.cmd == "status":
+            return cmd_status(args, stdout)
         if args.cmd == "list":
             return cmd_list(args, stdout)
         return cmd_send(args, stdout, stdin)

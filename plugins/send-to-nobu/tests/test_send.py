@@ -14,6 +14,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from helpers import FakeInbox, Lines, World, agentlog  # noqa: E402
 
 ANTHROPIC = "sk-ant-api03-" + "Z9x8C7v6B5n4M3a2S1d0" * 4
+IMG = __import__("base64").b64encode(b"\x89PNG" + b"\x01" * 5996).decode()
+
+
 def read_bytes(path):
     with open(path, "rb") as f:
         return f.read()
@@ -52,6 +55,10 @@ class SendTest(unittest.TestCase):
     def two_sessions(self):
         a = Lines(base=time.time() - 7200)
         a.user("請求書の集計をしたい。キーは %s" % ANTHROPIC).assistant("了解").tool_result("ok").assistant()
+        a.user_blocks([{"type": "tool_result", "tool_use_id": "t1", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": IMG}}]}],
+            toolUseResult={"type": "image", "file": {"base64": IMG, "type": "image/png", "originalSize": 6000}})
+        a.assistant("スクショを見た")
         a.meta("ai-title", aiTitle="請求書の集計")
         pa = self.w.write(a)
         self.w.subagent(pa, "agent-a1b2.jsonl", Lines().user("サブ %s" % GITHUB).assistant())
@@ -75,14 +82,17 @@ class SendTest(unittest.TestCase):
         self.assertEqual(res["submission_id"], "20260928T090312Z-1a2b3c4d")
         self.assertEqual((res["sent_count"], res["excluded_count"], res["subagent_count"]), (2, 0, 3))
         self.assertEqual(res["redactions"], 2)
+        self.assertEqual(res["omitted"], 2)  # 画像ブロックと Read の結果の 2 か所
 
-        # 本体: マスクした行以外はバイト一致
+        # 本体: 変換した行（マスク 1 行・画像 1 行）以外はバイト一致
         orig = read_bytes(pa).splitlines(True)
         got = self.srv.object_lines(self.obj(a.sid)).splitlines(True)
         self.assertEqual(len(orig), len(got))
         diff = [i for i, (x, y) in enumerate(zip(orig, got)) if x != y]
-        self.assertEqual(len(diff), 1)
+        self.assertEqual(len(diff), 2)
         self.assertNotIn(ANTHROPIC.encode(), got[diff[0]])
+        self.assertNotIn(IMG.encode(), b"".join(got))
+        self.assertEqual(got[diff[1]].count(b"[OMITTED:image/png 6000 bytes]"), 2)
         for ln in got:
             json.loads(ln)
         self.assertEqual(self.srv.object_lines(self.obj(b.sid)), read_bytes(pb))
@@ -100,7 +110,9 @@ class SendTest(unittest.TestCase):
         sa = [s for s in fin["sent"] if s["session_id"] == a.sid][0]
         self.assertEqual(sa["title"], "請求書の集計")
         self.assertEqual(sa["project"], "~/work/billing")
-        self.assertEqual(sa["redactions"], 2)
+        self.assertEqual(sa["redactions"], 2)  # 外した画像は数えない（契約は変えない）
+        self.assertEqual(sorted(sa), ["bytes", "last_activity", "project", "redactions", "session_id", "sha256",
+                                      "subagents", "title"])
         self.assertTrue(sa["last_activity"].endswith("Z"))
         self.assertEqual(sorted(x["rel"] for x in sa["subagents"]),
                          ["agent-a1b2.jsonl", "agent-a1b2.meta.json", "workflows/wf_abc-123/agent-c3.jsonl"])
@@ -127,7 +139,7 @@ class SendTest(unittest.TestCase):
         os.makedirs(tmp)
         s1 = agentlog.pack_jsonl(pa, os.path.join(tmp, "1.gz"))
         s2 = agentlog.pack_jsonl(pa, os.path.join(tmp, "2.gz"))
-        self.assertEqual(s1[:2], s2[:2])
+        self.assertEqual((s1["bytes"], s1["sha256"]), (s2["bytes"], s2["sha256"]))
         with gzip.open(os.path.join(tmp, "1.gz")) as g:
             self.assertEqual(len(g.read().splitlines()), len(read_bytes(pa).splitlines()))
 

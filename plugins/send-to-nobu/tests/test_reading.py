@@ -420,6 +420,37 @@ class NudgeTest(Base):
         self.assertEqual((code, out.getvalue()), (0, ""))
 
 
+class StatusTest(Base):
+    def status(self, **kw):
+        code, out, err = self.w.run("status", **kw)
+        self.assertEqual(code, 0, err)
+        return json.loads(out)
+
+    def test_pending_is_per_session_and_expires(self):
+        self.assertEqual(self.status(), {"pending": False})
+        self.w.write(Lines().user("指示").assistant())
+        self.w.list()
+        self.assertEqual(self.status(), {"pending": True, "count": 1})
+        self.assertEqual(self.status(session="another"), {"pending": False})
+        self.assertEqual(self.status(now=time.time() + 7 * 3600), {"pending": False})
+        code, out, err = self.w.run("send", "--exclude", "1")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.status(), {"pending": False})
+
+    def test_empty_list_still_leaves_pending(self):
+        self.w.list()
+        self.assertEqual(self.status(), {"pending": True, "count": 0})
+
+    def test_second_call_keeps_send_session_hidden(self):
+        # /send-to-nobu → 一覧 → /send-to-nobu <返事> と続けた会話は、あとで一覧に出ない
+        L = Lines().user(SEND_CMD).user("スキル本文", isMeta=True).assistant("一覧")
+        L.user(SEND_CMD + "\n<command-args>2 は外して。感想: 迷った</command-args>")
+        L.user("スキル本文", isMeta=True).assistant("送った")
+        L.user("ありがとう").assistant()  # /send-to-nobu を付けない普通の返事が続いても
+        self.w.write(L)
+        self.assertEqual(self.w.list()["count"], 0)
+
+
 class CliTest(Base):
     def test_subprocess_uses_session_env(self):
         L = Lines().user("いまの会話").assistant()
