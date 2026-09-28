@@ -191,6 +191,26 @@ class ListTest(Base):
         self.assertEqual(it["prompts"], 1)
         self.assertEqual(it["title"], "本題の指示")
 
+    def test_list_output_and_pending_carry_the_marker(self):
+        self.w.write(Lines().user("指示").assistant())
+        code, out, err = self.w.run("list", "--preview")
+        self.assertEqual(json.loads(out)[agentlog.LIST_MARKER], 1)
+        self.assertEqual(self.w.pending()[agentlog.LIST_MARKER], 1)
+
+    def test_conversation_holding_list_or_pending_contents_is_hidden(self):
+        # データディレクトリのパスが書き方しだいで見えなくても、中身の目印がツールの結果に残る
+        leaked = json.dumps({agentlog.LIST_MARKER: 1, "count": 1, "items": [{"n": 1, "title": "よその会話"}]})
+        for cmd in ("cd ~/.claude/plugins/data && cat send-to-nobu-androots/pending.json",
+                    "cat ~/.claude/plugins/data/send-to-nob*/pending.json",
+                    "find ~/.claude/plugins -name 'pending*' -exec cat {} \\;"):
+            L = Lines().user("調べて").assistant().bash(cmd).tool_result(leaked).user("続き").assistant()
+            self.w.write(L)
+        pasted = Lines().user("これ見て: " + leaked).assistant()      # 本人が一覧を貼り付けた
+        self.w.write(pasted)
+        ok = Lines().user("ふつうの作業").assistant().bash("cat ~/work/memo.txt").tool_result("メモ").assistant()
+        self.w.write(ok)
+        self.assertEqual([it["session_id"] for it in self.w.list()["items"]], [ok.sid])
+
     def test_command_name_first_is_builtin_even_without_stdout(self):
         # /context・/goal などは直後に <local-command-stdout> が続かないことがある
         L = Lines().user("<command-name>/context</command-name>\n<command-message>context</command-message>\n"
@@ -463,7 +483,8 @@ class RoundTest(Base):
             self.w.write(L)
             sids.append(L.sid)
         r1 = self.w.list()
-        self.assertEqual((r1["count"], r1["remaining"]), (15, 25))
+        self.assertEqual((r1["count"], r1["remaining"], r1["round"]), (15, 25, 1))
+        self.assertNotIn("note_already_sent", r1)
         self.assertEqual([it["session_id"] for it in r1["items"]], sids[25:])   # 新しい 15 件を古い順に
         self.assertEqual([it["n"] for it in r1["items"]], list(range(1, 16)))
         self.assertEqual(self.w.list(), r1)                                       # 番号は固定
@@ -471,7 +492,8 @@ class RoundTest(Base):
         self.assertEqual((res["sent_count"], res["excluded_count"], res["remaining"]), (0, 15, 25))
 
         r2 = self.w.list()                                                         # 同じ会話でもう一度
-        self.assertEqual((r2["count"], r2["remaining"]), (15, 10))
+        self.assertEqual((r2["count"], r2["remaining"], r2["round"]), (15, 10, 2))
+        self.assertNotIn("note_already_sent", r2)                                 # 感想はまだ送っていない
         self.assertNotIn("first_run", r2)
         self.assertEqual([it["session_id"] for it in r2["items"]], sids[10:25])
         # 2 ラウンド目も返事のゲートが効く
@@ -480,7 +502,7 @@ class RoundTest(Base):
         self.assertEqual(self.next_round()["remaining"], 10)
 
         r3 = self.w.list()
-        self.assertEqual((r3["count"], r3["remaining"]), (10, 0))
+        self.assertEqual((r3["count"], r3["remaining"], r3["round"]), (10, 0, 3))
         self.assertEqual([it["session_id"] for it in r3["items"]], sids[:10])
         self.next_round()
         r4 = self.w.list()

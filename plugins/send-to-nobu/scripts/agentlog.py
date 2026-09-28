@@ -59,8 +59,12 @@ TITLE_FALLBACK_CHARS = 40
 TITLE_MAX = 200
 PROJECT_MAX = 300
 NOTE_MAX = 20000
-FACTS_VERSION = 3          # 一覧に出すかの判定を変えたら上げる（nudge のキャッシュを読み直させる）
-PENDING_VERSION = 4        # 一覧の控えの形を変えたら上げる
+FACTS_VERSION = 4          # 一覧に出すかの判定を変えたら上げる（nudge のキャッシュを読み直させる）
+PENDING_VERSION = 5        # 一覧の控えの形を変えたら上げる
+# 一覧の出力と控えに入れる目印。会話ファイルの生のバイト列にこれがある会話は（どう読んだにせよ
+# 一覧や控えの中身が残っているので）一覧から隠す
+LIST_MARKER = "send_to_nobu_list"
+_LIST_MARKER_B = LIST_MARKER.encode("ascii")
 
 UPLOAD_BATCH = 100
 PUT_WORKERS = 4
@@ -728,6 +732,8 @@ def scan_session(path, light=False, stop_at_first=False):
             if not raw.endswith(b"\n") and d is None:
                 break  # 書きかけの最終行
             s.end += len(raw)
+            if not s.touched and _LIST_MARKER_B in raw:
+                s.touched = True  # 一覧や控えの中身が、どれかのツールの結果に残っている
             if d is None:
                 continue
             u = d.get("uuid")
@@ -1159,7 +1165,7 @@ def select_round(items):
     return sorted(chosen)
 
 
-def render_round(items, scans, shown, level, preview, state, remaining, compact=False, cut=False):
+def render_round(items, scans, shown, level, preview, state, remaining, compact=False, cut=False, header=None):
     """items のうち shown（添字の昇順）を 1 から番号を振って、出力と控えの形にする。
 
     compact: 抜粋・会話 ID・プロジェクトを省き、タイトルを短くし、同じ履歴は番号の並びでなく group で示す。
@@ -1209,14 +1215,16 @@ def render_round(items, scans, shown, level, preview, state, remaining, compact=
         p = {k: v for k, v in it.items() if k not in ("prompt_count", "total_bytes", "last_ts", "shares_idx")}
         p.update({"n": n, "shares": shares, "group_cut": cut})
         pend.append(p)
-    result = {"count": len(rows), "items": rows, "remaining": remaining}
+    result = {LIST_MARKER: 1}
+    result.update(header or {})
+    result.update({"count": len(rows), "items": rows, "remaining": remaining})
     if not state["sessions"]:
         result["first_run"] = True
         result["since"] = local_short(state["baseline"])
     return result, pend
 
 
-def fit_round(items, scans, preview, state):
+def fit_round(items, scans, preview, state, header=None):
     """1 ラウンドを選び、出力が LIST_OUTPUT_MAX 文字に収まるように抜粋を減らす。
 
     抜粋 0 でも収まらなければ行を短くする（全件のタイトル行は出す）。それでも収まらないほど大きなまとまりは
@@ -1230,19 +1238,19 @@ def fit_round(items, scans, preview, state):
         return len(json.dumps(result, ensure_ascii=False)) <= LIST_OUTPUT_MAX
 
     for level in (PREVIEW_LEVELS if preview else (0,)):
-        result, pend = render_round(items, scans, shown, level, preview, state, remaining)
+        result, pend = render_round(items, scans, shown, level, preview, state, remaining, header=header)
         if fits(result):
             return result, pend
-    result, pend = render_round(items, scans, shown, 0, preview, state, remaining, compact=True)
+    result, pend = render_round(items, scans, shown, 0, preview, state, remaining, compact=True, header=header)
     if fits(result):
         return result, pend
     for m in range(len(shown) - 1, 0, -1):
         part = shown[-m:]
         result, pend = render_round(items, scans, part, 0, preview, state, remaining + len(shown) - m,
-                                    compact=True, cut=True)
+                                    compact=True, cut=True, header=header)
         if fits(result):
             return result, pend
-    return render_round(items, scans, [], 0, preview, state, len(items))
+    return render_round(items, scans, [], 0, preview, state, len(items), header=header)
 
 
 def file_size(path):
@@ -1269,10 +1277,15 @@ def cmd_list(args, out):
     old_cache = load_cache(data_dir)
     cache = dict(old_cache)
     items, scans = build_list(state, sid, store, cache)
-    result, pend_items = fit_round(items, scans, args.preview, state)
+    # この会話で何ラウンド目か・感想をもう送ったか（2 ラウンド目以降は感想を聞かない。前の答えを使い回させない）
+    conv = conversation_record(state, sid)
+    header = {"round": int(conv.get("rounds") or 0) + 1}
+    if conv.get("note_sent"):
+        header["note_already_sent"] = True
+    result, pend_items = fit_round(items, scans, args.preview, state, header)
     if cache != old_cache:
         write_json_atomic(cache_path(data_dir), cache)
-    pending = {"v": PENDING_VERSION, "session": sid, "created_at": iso_utc(now), "created_ts": now,
+    pending = {LIST_MARKER: 1, "v": PENDING_VERSION, "session": sid, "created_at": iso_utc(now), "created_ts": now,
                "session_size": file_size(cur_path), "items": pend_items, "output": result,
                "remaining": result["remaining"]}
     write_json_atomic(pending_path(data_dir), pending)
@@ -1622,10 +1635,25 @@ def excluded_uuid_hashes(item):
     return sorted(out)
 
 
-def record_decisions(data_dir, now, packed, excluded_items):
-    """送った / 外したを、判断した時点（一覧の時点）の位置で状態に記録する。"""
+def conversation_record(state, sid):
+    c = state.get("conversations")
+    rec = c.get(sid) if isinstance(c, dict) else None
+    return rec if isinstance(rec, dict) else {}
+
+
+def record_decisions(data_dir, now, packed, excluded_items, sid, note_sent):
+    """送った / 外したを、判断した時点（一覧の時点）の位置で状態に記録する。この会話のラウンド数と感想の有無も。"""
     state = load_state(data_dir, now)
     sessions = state["sessions"]
+    convs = state.get("conversations") if isinstance(state.get("conversations"), dict) else {}
+    conv = dict(convs.get(sid) or {})
+    conv["rounds"] = int(conv.get("rounds") or 0) + 1
+    conv["note_sent"] = bool(conv.get("note_sent") or note_sent)
+    conv["at"] = now
+    convs[sid] = conv
+    # 古い会話の記録は捨てる（30 日）
+    state["conversations"] = {k: v for k, v in convs.items()
+                              if isinstance(v, dict) and now - float(v.get("at") or 0) < 30 * 86400}
     store = load_excluded_store(data_dir)
     at = iso_utc(now)
     for p in packed:
@@ -1726,7 +1754,7 @@ def cmd_send(args, out, stdin):
 
     if not send_items and not note:
         # 全部外して感想もない日: サーバーには何も送らず、外したことだけ覚える
-        record_decisions(data_dir, now, [], excluded_items)
+        record_decisions(data_dir, now, [], excluded_items, sid, False)
         remove_quietly(pending_path(data_dir))
         out.write(json.dumps({"submission_id": None, "sent_count": 0, "excluded_count": len(excluded_items),
                               "subagent_count": 0, "bytes": 0, "redactions": 0, "omitted": 0,
@@ -1774,7 +1802,7 @@ def cmd_send(args, out, stdin):
                 "note": note, "plugin_version": plugin_version()}
         res = api_post(api_base, "/v1/finish", body, code, retry_ok_codes=("already_finished",))
 
-        record_decisions(data_dir, now, packed, excluded_items)
+        record_decisions(data_dir, now, packed, excluded_items, sid, bool(note))
         remove_quietly(pending_path(data_dir))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

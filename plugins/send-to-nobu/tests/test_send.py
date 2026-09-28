@@ -208,7 +208,8 @@ class RoundSendTest(SendBase):
             self.w.write(L)
             sids.append(L.sid)
         r1 = self.w.list()
-        self.assertEqual((r1["count"], r1["remaining"]), (15, 5))
+        self.assertEqual((r1["count"], r1["remaining"], r1["round"]), (15, 5, 1))
+        self.assertNotIn("note_already_sent", r1)
         code, out, err = self.send(exclude="1", note="1 ラウンド目の感想")
         self.assertEqual(code, 0, err)
         res = json.loads(out)
@@ -218,7 +219,17 @@ class RoundSendTest(SendBase):
         code, out, err = self.w.run("status")
         self.assertEqual(json.loads(out), {"pending": False})
         r2 = self.w.list()
-        self.assertEqual((r2["count"], r2["remaining"]), (5, 0))
+        self.assertEqual((r2["count"], r2["remaining"], r2["round"]), (5, 0, 2))
+        self.assertTrue(r2["note_already_sent"])        # 2 ラウンド目は感想を聞かない
+        # 別の会話（翌日）では 1 ラウンド目から・感想も聞く
+        other = self.w.start_send_session()
+        code, out, err = self.w.run("list", "--preview", session=other)
+        r_other = json.loads(out)
+        self.assertEqual(r_other["round"], 1)
+        self.assertNotIn("note_already_sent", r_other)
+        code, out, err = self.w.run("list", "--preview")   # もとの会話に戻る（控えは別の会話に移った）
+        r2 = json.loads(out)
+        self.assertEqual((r2["count"], r2["round"]), (5, 2))
         self.assertEqual([it["session_id"] for it in r2["items"]], sids[:5])
         self.assertEqual([it["n"] for it in r2["items"]], [1, 2, 3, 4, 5])
         code, out, err = self.send()
