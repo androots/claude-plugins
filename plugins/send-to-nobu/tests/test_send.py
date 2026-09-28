@@ -393,13 +393,17 @@ class TransportTest(SendBase):
         self.assertEqual(code, 0, err)
         self.assertEqual(json.loads(out)["sent_count"], 2)
 
-    def test_already_finished_is_success(self):
+    def test_already_finished_on_the_first_try_is_a_used_ticket(self):
+        # 古い引換券の使い回し: 感想だけの送信でも黙って成功にしない（スキルは start_submission からやり直す）
         self.w.list()
         self.srv.finished = True
         code, out, err = self.send(note="感想")
-        self.assertEqual(code, 0, err)
-        self.assertIsNone(self.w.pending())
+        self.assertEqual(code, agentlog.EXIT_UNAUTHORIZED)
+        self.assertIn("使用済み", err)
+        self.assertIsNotNone(self.w.pending())
+        self.assertEqual(self.w.state()["sessions"], {})
 
+    @unittest.skipUnless(os.path.exists(agentlog.SYSTEM_CA_BUNDLE), "macOS のシステムバンドルが無い環境")
     def test_ssl_falls_back_to_system_bundle(self):
         import ssl
         saved = ssl.create_default_context
@@ -456,7 +460,9 @@ class SafetyTest(SendBase):
 
     def test_old_pack_dirs_are_swept(self):
         self.w.list()
-        os.makedirs(os.path.join(self.w.data, "pack-999999-dead"))      # もういないプロセス
+        gone = subprocess.Popen([sys.executable, "-c", "pass"])
+        gone.wait()
+        os.makedirs(os.path.join(self.w.data, "pack-%d-dead" % gone.pid))   # もういないプロセス
         os.makedirs(os.path.join(self.w.data, "pack-oldformat"))
         alive = os.path.join(self.w.data, "pack-%d-alive" % os.getppid())  # 生きているプロセスは残す
         os.makedirs(alive)

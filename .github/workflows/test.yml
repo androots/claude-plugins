@@ -1,0 +1,34 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # 利用者の Mac と同じ /usr/bin/python3（Command Line Tools の 3.9）
+  macos-system-python:
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: plugins/send-to-nobu
+    steps:
+      - uses: actions/checkout@v4
+      - run: /usr/bin/python3 --version
+      - run: /usr/bin/python3 -m unittest -v
+
+  # 標準ライブラリだけ・3.9 互換であることの確認
+  ubuntu-python39:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: plugins/send-to-nobu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+      - run: python --version
+      - run: python -m unittest -v

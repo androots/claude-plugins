@@ -58,7 +58,8 @@ TITLE_FALLBACK_CHARS = 40
 TITLE_MAX = 200
 PROJECT_MAX = 300
 NOTE_MAX = 20000
-NUDGE_TAIL_BYTES = 256 * 1024
+FACTS_VERSION = 3          # 一覧に出すかの判定を変えたら上げる（nudge のキャッシュを読み直させる）
+PENDING_VERSION = 3        # 一覧の控えの形を変えたら上げる
 
 UPLOAD_BATCH = 100
 PUT_WORKERS = 4
@@ -542,7 +543,8 @@ def parse_line(raw):
 
 _SEND_CMD_RE = re.compile(r"<command-name>/?send-to-nobu(?::send-to-nobu)?</command-name>")
 _SR_PREFIX_RE = re.compile(r"^\s*(?:<system-reminder>.*?</system-reminder>\s*)+", re.S)
-_AGENTLOG_RUN_RE = re.compile(r"agentlog\.py[\"']?\s+(?:list|send)\b")
+# tool_use の入力にこれが出る会話は一覧から隠す（一覧や控えの中身が残っているかもしれない）
+_TOUCH_MARKERS = ("agentlog.py", "plugins/data/send-to-nobu")
 _NOT_HUMAN_PREFIXES = (
     "[Request interrupted by user",
     "<task-notification>",
@@ -551,7 +553,6 @@ _NOT_HUMAN_PREFIXES = (
     "<local-command-stdout>",
     "<local-command-stderr>",
 )
-_LOCAL_STDOUT_PREFIXES = ("<local-command-stdout>", "<local-command-stderr>")
 _TAG_RE = {
     name: re.compile(r"<%s>(.*?)</%s>" % (name, name), re.S)
     for name in ("command-name", "command-args", "bash-input")
@@ -579,9 +580,8 @@ def classify(d):
 
     戻り値 (種類, テキスト)。種類は
       send  … 送信コマンド（/send-to-nobu）
-      human … 人の指示
-      cmd   … 先頭が <command-name>。次の user 行が <local-command-stdout> なら組み込みコマンド
-      None  … 人の指示ではない
+      human … 人の指示（スキル呼び出しは <command-message> で始まる）
+      None  … 人の指示ではない（<command-name> で始まる組み込みコマンドを含む）
     """
     if d.get("type") != "user" or d.get("isSidechain") is True:
         return None, None
@@ -603,13 +603,8 @@ def classify(d):
     if not t or t.startswith(_NOT_HUMAN_PREFIXES):
         return None, None
     if t.startswith("<command-name>"):
-        return "cmd", t
+        return None, None  # 組み込みコマンド（/model /context /goal など。直後に stdout が無いものもある）
     return "human", t
-
-
-def _is_local_stdout(d):
-    t = user_text(d)
-    return isinstance(t, str) and t.lstrip().startswith(_LOCAL_STDOUT_PREFIXES)
 
 
 def _command_args(text):
@@ -617,17 +612,19 @@ def _command_args(text):
     return m.group(1).strip() if m else ""
 
 
-def _ran_agentlog(d):
-    """assistant 行が Bash で agentlog.py list / send を実行しているか。"""
+def _touches_send_to_nobu(d):
+    """assistant 行の tool_use の入力に agentlog.py（どのサブコマンドでも）や send-to-nobu のデータディレクトリが出るか。"""
     m = d.get("message")
     content = m.get("content") if isinstance(m, dict) else None
     if not isinstance(content, list):
         return False
     for b in content:
-        if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") == "Bash":
-            inp = b.get("input")
-            cmd = inp.get("command") if isinstance(inp, dict) else None
-            if isinstance(cmd, str) and _AGENTLOG_RUN_RE.search(cmd):
+        if isinstance(b, dict) and b.get("type") == "tool_use":
+            try:
+                text = json.dumps(b.get("input"), ensure_ascii=False)
+            except (TypeError, ValueError):
+                continue
+            if any(mk in text for mk in _TOUCH_MARKERS):
                 return True
     return False
 
@@ -667,7 +664,7 @@ class Scan(object):
         self.uuids = set()
         self.head_uuids = set()
         self.end = 0                # 読み終えた位置（書きかけの最終行は含めない）
-        self.ran_agentlog = False   # agentlog.py list / send を実行した跡
+        self.touched = False        # agentlog.py や send-to-nobu のデータを触った跡
         self.saw_sdk = False        # entrypoint: sdk-cli の行
         self.saw_other_entry = False
 
@@ -683,7 +680,7 @@ class Scan(object):
 
     def facts(self):
         """一覧に出すかを決める事実（nudge のキャッシュにもそのまま入る）。"""
-        return {"prompts": self.prompt_count, "first": self.first_kind, "agentlog": self.ran_agentlog,
+        return {"prompts": self.prompt_count, "first": self.first_kind, "touched": self.touched,
                 "sdk_only": self.saw_sdk and not self.saw_other_entry, "last_ts": self.last_ts}
 
     def title(self):
@@ -712,7 +709,7 @@ class Scan(object):
 
 def listable(facts, rec, baseline, mtime):
     """一覧に出す会話か（list と nudge で同じ判定）。"""
-    if not facts["prompts"] or facts["first"] == "send" or facts["agentlog"] or facts["sdk_only"]:
+    if not facts["prompts"] or facts["first"] == "send" or facts["touched"] or facts["sdk_only"]:
         return False
     if rec is None:
         last = facts["last_ts"] if facts["last_ts"] is not None else mtime
@@ -724,7 +721,6 @@ def listable(facts, rec, baseline, mtime):
 def scan_session(path, light=False, stop_at_first=False):
     """会話ファイルを先頭から読む。"""
     s = Scan(light=light)
-    pending_cmd = None
     with open_nofollow(path) as fh:
         for i, raw in enumerate(fh):
             d = parse_line(raw)
@@ -750,32 +746,22 @@ def scan_session(path, light=False, stop_at_first=False):
                     s.saw_sdk = True
                 elif isinstance(ep, str):
                     s.saw_other_entry = True
-                if t == "assistant" and not s.ran_agentlog and _ran_agentlog(d):
-                    s.ran_agentlog = True
+                if t == "assistant" and not s.touched and _touches_send_to_nobu(d):
+                    s.touched = True
             elif t == "custom-title" and isinstance(d.get("customTitle"), str):
                 s.custom_title = d["customTitle"]
             elif t == "ai-title" and isinstance(d.get("aiTitle"), str):
                 s.ai_title = d["aiTitle"]
             if t != "user" or d.get("isSidechain") is True:
                 continue
-            if pending_cmd is not None:
-                if _is_local_stdout(d):
-                    pending_cmd = None  # 組み込みコマンド（/model /mcp など）
-                    continue
-                s.add_prompt(pending_cmd)
-                pending_cmd = None
             kind, text = classify(d)
             if kind == "send":
                 if s.first_kind is None:
                     s.first_kind = "send"
-            elif kind == "cmd":
-                pending_cmd = text
             elif kind == "human":
                 s.add_prompt(text)
             if stop_at_first and s.first_kind is not None:
                 return s
-    if pending_cmd is not None:
-        s.add_prompt(pending_cmd)
     return s
 
 
@@ -996,10 +982,10 @@ def cached_facts(cache, sid, path, st):
     """(size, mtime) が同じならキャッシュの事実を使う。違えば読み直してキャッシュを更新する。"""
     c = cache.get(sid)
     if isinstance(c, dict) and c.get("size") == st.st_size and c.get("mtime") == int(st.st_mtime) \
-            and isinstance(c.get("facts"), dict):
+            and c.get("v") == FACTS_VERSION and isinstance(c.get("facts"), dict):
         return c["facts"]
     facts = scan_session(path, light=True).facts()
-    cache[sid] = {"size": st.st_size, "mtime": int(st.st_mtime), "facts": facts}
+    cache[sid] = {"v": FACTS_VERSION, "size": st.st_size, "mtime": int(st.st_mtime), "facts": facts}
     return facts
 
 
@@ -1050,7 +1036,8 @@ def cmd_nudge(args, out):
 def valid_pending(data_dir, current, now):
     """同じ会話 ID・6 時間以内の一覧の控え。無ければ None。"""
     p = read_json(pending_path(data_dir), None)
-    if not isinstance(p, dict) or not isinstance(p.get("items"), list) or p.get("session") != current:
+    if (not isinstance(p, dict) or p.get("v") != PENDING_VERSION or not isinstance(p.get("items"), list)
+            or p.get("session") != current):
         return None
     created = p.get("created_ts")
     if not isinstance(created, (int, float)) or now - created > PENDING_TTL or now < created - 300:
@@ -1079,7 +1066,7 @@ def build_list(state, current, excluded_store, cache):
         except OSError:
             continue
         facts = s.facts()
-        cache[sid] = {"size": st.st_size, "mtime": int(st.st_mtime), "facts": facts}
+        cache[sid] = {"v": FACTS_VERSION, "size": st.st_size, "mtime": int(st.st_mtime), "facts": facts}
         if not listable(facts, rec, state["baseline"], st.st_mtime):
             continue
         last = s.last_ts if s.last_ts is not None else st.st_mtime
@@ -1130,16 +1117,19 @@ def build_list(state, current, excluded_store, cache):
     return items, [r[5] for r in rows]
 
 
-def render_list(items, scans, first, level, preview, state):
-    """items[first:] を 1 から番号を振り直して出力と控えの形にする。"""
-    shown = list(range(first, len(items)))
+def render_list(items, scans, shown, level, preview, state, split=frozenset()):
+    """items のうち shown（添字の昇順）を 1 から番号を振り直して、出力と控えの形にする。
+
+    split は「同じ履歴の仲間の一部を次回に回した」会話。既定で外し、送るには --include と --confirm-shared が要る。
+    """
     number = {idx: k + 1 for k, idx in enumerate(shown)}
     rows, pend = [], []
     for idx in shown:
         it, s = items[idx], scans[idx]
         n = number[idx]
         shares = sorted(number[o] for o in it["shares_idx"] if o in number)
-        default_excluded = it["previously_excluded"] or it["contains_excluded_copy"]
+        split_group = idx in split
+        default_excluded = it["previously_excluded"] or it["contains_excluded_copy"] or split_group
         row = {"n": n, "session_id": it["session_id"], "title": it["title"], "project": it["project"],
                "updated": local_short(it["last_ts"]), "size": human_size(it["total_bytes"]),
                "prompts": it["prompt_count"]}
@@ -1149,6 +1139,8 @@ def render_list(items, scans, first, level, preview, state):
             row["previously_excluded"] = True
         if it["contains_excluded_copy"]:
             row["contains_excluded_copy"] = True
+        if split_group:
+            row["shares_history_with_later"] = True
         if default_excluded:
             row["default_excluded"] = True
         if shares:
@@ -1160,38 +1152,69 @@ def render_list(items, scans, first, level, preview, state):
                 row["preview_omitted"] = s.prompt_count - len(picked)
         rows.append(row)
         p = {k: v for k, v in it.items() if k not in ("prompt_count", "total_bytes", "last_ts", "shares_idx")}
-        p.update({"n": n, "shares": shares})
+        p.update({"n": n, "shares": shares, "split_group": split_group})
         pend.append(p)
     result = {"count": len(rows), "items": rows}
-    if first:
-        result["remaining"] = first
+    if len(shown) < len(items):
+        result["remaining"] = len(items) - len(shown)
     if not state["sessions"]:
         result["first_run"] = True
         result["since"] = local_short(state["baseline"])
     return result, pend
 
 
-def fit_list(items, scans, preview, state):
-    """出力が LIST_OUTPUT_MAX 文字に収まるように、まず抜粋を減らし、それでも多ければ古い会話から次回に回す。"""
-    def size(result):
-        return len(json.dumps(result, ensure_ascii=False))
+def share_groups(items):
+    """shares_history_with でつながった会話のまとまり。新しい順（まとまりの中の一番新しい会話で比べる）。"""
+    parent = list(range(len(items)))
 
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for idx, it in enumerate(items):
+        for o in it["shares_idx"]:
+            a, b = find(idx), find(o)
+            if a != b:
+                parent[a] = b
+    groups = collections.defaultdict(list)
+    for idx in range(len(items)):
+        groups[find(idx)].append(idx)
+    return sorted((sorted(g) for g in groups.values()), key=lambda g: g[-1], reverse=True)
+
+
+def fit_list(items, scans, preview, state):
+    """出力が LIST_OUTPUT_MAX 文字に収まるようにする。
+
+    まず抜粋を減らす。それでも多ければ、同じ履歴でつながった会話をまとめて、古いまとまりから次回に回す
+    （片方だけ回すと、回した方の中身が確認なしに届くため）。一番新しいまとまり 1 つで上限を超えるときは、
+    その中の新しい会話から入るだけ出し、出した分を既定で外す（送るには --include と --confirm-shared）。
+    """
     levels = PREVIEW_LEVELS if preview else (0,)
-    for level in levels:
-        result, pend = render_list(items, scans, 0, level, preview, state)
-        if size(result) <= LIST_OUTPUT_MAX:
-            return result, pend
-    first = 1
-    while first < len(items):
-        result, pend = render_list(items, scans, first, levels[-1], preview, state)
-        if size(result) <= LIST_OUTPUT_MAX:
-            break
-        first += 1
-    for level in levels:
-        result, pend = render_list(items, scans, first, level, preview, state)
-        if size(result) <= LIST_OUTPUT_MAX:
-            return result, pend
-    return result, pend
+
+    def attempt(shown, split=frozenset()):
+        for level in levels:
+            result, pend = render_list(items, scans, shown, level, preview, state, split)
+            if len(json.dumps(result, ensure_ascii=False)) <= LIST_OUTPUT_MAX:
+                return result, pend
+        return None
+
+    got = attempt(list(range(len(items))))
+    if got:
+        return got
+    groups = share_groups(items)
+    for k in range(len(groups) - 1, 0, -1):
+        got = attempt(sorted(idx for g in groups[:k] for idx in g))
+        if got:
+            return got
+    newest = groups[0] if groups else []
+    for m in range(len(newest) - 1, 0, -1):
+        shown = newest[-m:]
+        got = attempt(shown, frozenset(shown))
+        if got:
+            return got
+    return render_list(items, scans, [], levels[-1], preview, state)
 
 
 def file_size(path):
@@ -1221,7 +1244,7 @@ def cmd_list(args, out):
     result, pend_items = fit_list(items, scans, args.preview, state)
     if cache != old_cache:
         write_json_atomic(cache_path(data_dir), cache)
-    pending = {"v": 2, "session": sid, "created_at": iso_utc(now), "created_ts": now,
+    pending = {"v": PENDING_VERSION, "session": sid, "created_at": iso_utc(now), "created_ts": now,
                "session_size": file_size(cur_path), "items": pend_items, "output": result}
     write_json_atomic(pending_path(data_dir), pending)
     out.write(json.dumps(result, ensure_ascii=False) + "\n")
@@ -1403,10 +1426,11 @@ def _read_api_error(e):
     return "", ""
 
 
-def api_post(api_base, path, body, code, ok_codes=()):
+def api_post(api_base, path, body, code, retry_ok_codes=()):
     """引換券つきで JSON を POST する。5xx と通信エラーだけ指数バックオフでリトライ（4xx はしない）。
 
-    ok_codes のエラーは成功扱い（/v1/finish の already_finished = 送信票はもう置かれている）。
+    retry_ok_codes のエラーは、同じ送信のリトライ（2 回目以降）のときだけ成功扱い
+    （/v1/finish の already_finished = 前の試行で送信票が置けていた）。1 回目から返ってきたら使用済みの引換券。
     """
     url = api_base.rstrip("/") + path
     data = json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -1419,8 +1443,11 @@ def api_post(api_base, path, body, code, ok_codes=()):
                 return json.loads(r.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             api_code, message = _read_api_error(e)
-            if api_code in ok_codes:
+            if api_code in retry_ok_codes and attempt > 0:
                 return {}
+            if api_code == "already_finished":
+                raise ApiError(401, "unauthorized", "その引換券は使用済み。start_submission からやり直して（%s %d）"
+                               % (path, e.code))
             if e.code >= 500 and attempt < RETRIES:
                 _backoff(attempt)
                 continue
@@ -1536,6 +1563,8 @@ def load_pending(data_dir, current, now):
     p = read_json(pending_path(data_dir), None)
     if not isinstance(p, dict) or not isinstance(p.get("items"), list):
         raise Fail("一覧の控えがない。先に /send-to-nobu で一覧を出して", EXIT_USAGE)
+    if p.get("v") != PENDING_VERSION:
+        raise Fail("一覧の控えが古い形。/send-to-nobu で一覧を出し直して", EXIT_USAGE)
     if p.get("session") != current:
         raise Fail("一覧の控えが別の会話のもの。この会話で /send-to-nobu をやり直して", EXIT_USAGE)
     created = p.get("created_ts")
@@ -1645,12 +1674,18 @@ def cmd_send(args, out, stdin):
         raise Fail("同じ番号が --exclude と --include の両方にある: %s" % ",".join(map(str, sorted(excluded & included))),
                    EXIT_USAGE)
     # 前に外した会話の続き・前に外した会話を引き継いだ会話は、--include で明示されない限り外す
-    default_excluded = {n for n, it in items.items() if it.get("previously_excluded") or it.get("contains_excluded_copy")}
+    # 前に外した会話の続き・引き継ぎ・次回に回した会話と同じ履歴の会話は、--include で明示されない限り外す
+    default_excluded = {n for n, it in items.items()
+                        if it.get("previously_excluded") or it.get("contains_excluded_copy") or it.get("split_group")}
     excluded |= (default_excluded - included)
     send_items = [items[n] for n in sorted(items) if n not in excluded]
     excluded_items = [items[n] for n in sorted(excluded)]
 
     if not args.confirm_shared:
+        later = [it["n"] for it in send_items if it.get("split_group")]
+        if later:
+            raise Fail("%s 番は、次回に回した会話と同じ履歴を含む。送ると次回の分の中身も届く。"
+                       "了承なら --confirm-shared を付けてやり直す" % "、".join(map(str, later)), EXIT_CONFIRM_SHARED)
         pairs = sorted({(it["n"], m) for it in send_items for m in it.get("shares", []) if m in excluded})
         if pairs:
             desc = "、".join("%d 番と %d 番" % pr for pr in pairs)
@@ -1709,7 +1744,7 @@ def cmd_send(args, out, stdin):
 
         body = {"sent": [p["sent"] for p in packed], "excluded_count": len(excluded_items),
                 "note": note, "plugin_version": plugin_version()}
-        res = api_post(api_base, "/v1/finish", body, code, ok_codes=("already_finished",))
+        res = api_post(api_base, "/v1/finish", body, code, retry_ok_codes=("already_finished",))
 
         record_decisions(data_dir, now, packed, excluded_items)
         remove_quietly(pending_path(data_dir))

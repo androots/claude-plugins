@@ -146,22 +146,33 @@ class ListTest(Base):
             self.w.write(L)
         self.assertEqual(self.w.list()["count"], 0)
 
-    def test_midway_send_command_rejected_then_conversation_is_listed_without_the_list(self):
-        # 普通の会話の途中で /send-to-nobu → スクリプトが断るので一覧はその会話に残らない。会話は翌日ふつうに出る
+    def test_midway_send_command_conversation_is_hidden(self):
+        # 普通の会話の途中で /send-to-nobu → スクリプトは断る。agentlog.py を呼んだ跡があるので、その会話ごと出さない
         L = Lines().user("作業する").assistant().user(SEND_CMD).user("スキル本文", isMeta=True)
         L.bash("/usr/bin/python3 /x/scripts/agentlog.py status --data-dir /y/send-to-nobu-z")
         L.assistant("新しい会話で /send-to-nobu と打ってね")
         self.w.write(L)
-        it = self.w.list()["items"][0]
-        self.assertEqual(it["prompts"], 1)
-        self.assertEqual(it["preview"], ["作業する"])
-
-    def test_conversation_that_ran_list_or_send_is_hidden_anywhere(self):
-        for cmd in ("/usr/bin/python3 /p/scripts/agentlog.py list --preview --data-dir /d/send-to-nobu-x",
-                    "python3 '/p/scripts/agentlog.py' send --code c --exclude none"):
-            L = Lines().user("作業する").assistant().bash(cmd).tool_result('{"count": 1}').user("続き").assistant()
-            self.w.write(L)
         self.assertEqual(self.w.list()["count"], 0)
+
+    def test_conversation_that_touched_send_to_nobu_is_hidden_anywhere(self):
+        def tool(L, name, inp):
+            return L._msg("assistant", [{"type": "tool_use", "id": "toolu_x", "name": name, "input": inp}])
+        cases = [
+            lambda L: L.bash("/usr/bin/python3 /p/scripts/agentlog.py list --preview --data-dir /d/send-to-nobu-x"),
+            lambda L: L.bash("python3 '/p/scripts/agentlog.py' send --code c --exclude none"),
+            lambda L: L.bash("/usr/bin/python3 /p/scripts/agentlog.py status --data-dir /d"),
+            lambda L: tool(L, "Read", {"file_path": "/Users/a/.claude/plugins/data/send-to-nobu-androots/pending.json"}),
+            lambda L: L.bash("cat ~/.claude/plugins/data/send-to-nobu-androots/state.json"),
+            lambda L: tool(L, "Agent", {"prompt": "agentlog.py を直して"}),
+        ]
+        for add in cases:
+            L = Lines().user("作業する").assistant()
+            add(L)
+            L.tool_result("{}").user("続き").assistant()
+            self.w.write(L)
+        ok = Lines().user("ふつうの作業").assistant().bash("ls ~/work").tool_result("a").assistant()
+        self.w.write(ok)
+        self.assertEqual([it["session_id"] for it in self.w.list()["items"]], [ok.sid])
 
     def test_sdk_only_is_hidden_but_mixed_is_listed(self):
         self.w.write(Lines(entrypoint="sdk-cli").user("自動実行のプロンプト").assistant())
@@ -179,6 +190,19 @@ class ListTest(Base):
         it = self.w.list()["items"][0]
         self.assertEqual(it["prompts"], 1)
         self.assertEqual(it["title"], "本題の指示")
+
+    def test_command_name_first_is_builtin_even_without_stdout(self):
+        # /context・/goal などは直後に <local-command-stdout> が続かないことがある
+        L = Lines().user("<command-name>/context</command-name>\n<command-message>context</command-message>\n"
+                         "<command-args></command-args>").assistant("コンテキストの内訳")
+        L.user("<command-name>/goal</command-name>\n<command-args>来週まで</command-args>").assistant()
+        self.w.write(L)
+        self.assertEqual(self.w.list()["count"], 0)
+        M = Lines().user("<command-name>/skill-doctor</command-name>").assistant().user("本題").assistant()
+        self.w.write(M)
+        self.w.current = self.w.start_send_session()
+        items = self.w.list()["items"]
+        self.assertEqual([(i["session_id"], i["prompts"], i["title"]) for i in items], [(M.sid, 1, "本題")])
 
     def test_only_builtins_is_hidden(self):
         L = Lines()
@@ -386,6 +410,22 @@ class SessionGuardTest(Base):
         self.assertEqual(o.getvalue(), "")
 
 
+class PendingVersionTest(Base):
+    def test_old_pending_format_is_not_used(self):
+        self.w.write(Lines().user("指示").assistant())
+        self.w.list()
+        p = self.w.pending()
+        p["v"] = 2
+        agentlog.write_json_atomic(os.path.join(self.w.data, "pending.json"), p)
+        code, out, err = self.w.run("status")
+        self.assertEqual(json.loads(out), {"pending": False})
+        code, out, err = self.w.run("send", "--exclude", "none")
+        self.assertEqual(code, agentlog.EXIT_USAGE)
+        self.assertIn("出し直して", err)
+        self.assertEqual(self.w.list()["count"], 1)            # 一覧を出し直せば新しい形になる
+        self.assertEqual(self.w.pending()["v"], agentlog.PENDING_VERSION)
+
+
 class StateFileTest(Base):
     def test_unreadable_state_fails_and_is_kept(self):
         self.w.write(Lines().user("指示").assistant())
@@ -423,6 +463,70 @@ class SymlinkTest(Base):
         self.assertEqual([it["session_id"] for it in res["items"]], [L.sid])
         self.assertNotIn("subagent_files", res["items"][0])
         self.assertEqual(self.w.pending()["items"][0]["subs"], [])
+
+
+class GroupCutTest(Base):
+    def sizes(self):
+        state = agentlog.load_state(os.path.join(self.w.tmp, "send-to-nobu-probe"), time.time())
+        items, scans = agentlog.build_list(state, self.w.current, {}, {})
+        return state, items, scans
+
+    def test_share_group_is_kept_or_moved_together(self):
+        now = time.time()
+        title = "題" * 150
+        a = Lines(base=now - 50000).user("元の会話").assistant().meta("custom-title", customTitle="A" + title)
+        x1 = Lines(base=now - 40000).user("無関係 1").assistant().meta("custom-title", customTitle="X1" + title)
+        x2 = Lines(base=now - 30000).user("無関係 2").assistant().meta("custom-title", customTitle="X2" + title)
+        b = Lines(base=now - 20000).copy_from(a).user("分岐").assistant().meta("custom-title", customTitle="B" + title)
+        x3 = Lines(base=now - 10000).user("無関係 3").assistant().meta("custom-title", customTitle="X3" + title)
+        for L in (a, x1, x2, b, x3):
+            self.w.write(L)
+        state, items, scans = self.sizes()
+        self.assertEqual([it["session_id"] for it in items], [a.sid, x1.sid, x2.sid, b.sid, x3.sid])
+        three = len(json.dumps(agentlog.render_list(items, scans, [0, 3, 4], 1, True, state)[0], ensure_ascii=False))
+        saved = agentlog.LIST_OUTPUT_MAX
+        agentlog.LIST_OUTPUT_MAX = three + 20   # 3 件ぶんしか入らない
+        try:
+            res = self.w.list()
+        finally:
+            agentlog.LIST_OUTPUT_MAX = saved
+        # 新しい順に 3 件（X2・B・X3）で切ると B だけが残り A が次回に回る。まとまりで回すので A・B・X3 を出す
+        self.assertEqual([it["session_id"] for it in res["items"]], [a.sid, b.sid, x3.sid])
+        self.assertEqual(res["remaining"], 2)
+        self.assertEqual(res["items"][0]["shares_history_with"], [2])
+        self.assertFalse(any(it.get("default_excluded") for it in res["items"]))
+
+    def test_one_group_too_big_is_shown_partly_and_excluded_by_default(self):
+        now = time.time()
+        root = Lines(base=now - 50000).user("元の会話").assistant()
+        forks = [root]
+        for i in range(4):
+            f = Lines(base=now - 40000 + i * 5000).copy_from(root).user("分岐 %d" % i).assistant()
+            f.meta("custom-title", customTitle="分岐 %d " % i + "題" * 150)
+            forks.append(f)
+        for L in forks:
+            self.w.write(L)
+        state, items, scans = self.sizes()
+        two = len(json.dumps(agentlog.render_list(items, scans, [3, 4], 1, True, state, frozenset([3, 4]))[0],
+                             ensure_ascii=False))
+        saved = agentlog.LIST_OUTPUT_MAX
+        agentlog.LIST_OUTPUT_MAX = two + 20
+        try:
+            res = self.w.list()
+        finally:
+            agentlog.LIST_OUTPUT_MAX = saved
+        self.assertEqual([it["session_id"] for it in res["items"]], [forks[3].sid, forks[4].sid])
+        self.assertEqual(res["remaining"], 3)
+        for it in res["items"]:
+            self.assertTrue(it["default_excluded"])
+            self.assertTrue(it["shares_history_with_later"])
+        # 送らないのが既定。--include しても --confirm-shared が無ければ止まる
+        code, out, err = self.w.run("send", "--exclude", "none", "--include", "1")
+        self.assertEqual(code, agentlog.EXIT_CONFIRM_SHARED)
+        self.assertIn("次回に回した会話", err)
+        code, out, err = self.w.run("send", "--exclude", "none")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["excluded_count"], 2)
 
 
 class SameNumbersTest(Base):
@@ -599,6 +703,17 @@ class NudgeTest(Base):
             self.assertIsNotNone(self.nudge(self.local_ts(1, 10)))   # 変わっていない会話は読まない
         finally:
             agentlog.scan_session = saved
+
+    def test_cache_from_an_older_rule_is_rescanned(self):
+        L = Lines().user("x").bash("/usr/bin/python3 /p/agentlog.py status --data-dir d").assistant()
+        path = self.w.write(L)
+        st = os.stat(path)
+        os.makedirs(self.w.data)
+        stale = {L.sid: {"size": st.st_size, "mtime": int(st.st_mtime),
+                         "facts": {"prompts": 1, "first": "human", "agentlog": False, "sdk_only": False,
+                                   "last_ts": time.time()}}}
+        agentlog.write_json_atomic(os.path.join(self.w.data, "scan-cache.json"), stale)
+        self.assertIsNone(self.nudge(time.time()))   # 古い判定のキャッシュを信じず、読み直して隠す
 
     def test_counts_grown_decided_sessions(self):
         L = Lines().user("指示").assistant()
