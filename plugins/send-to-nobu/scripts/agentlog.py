@@ -7,7 +7,7 @@ python3 3.9 の標準ライブラリだけで動く（macOS の /usr/bin/python3
 サブコマンド:
   nudge  SessionStart フック。未送信の会話があれば 1 日 1 回だけ 1 行知らせる
   status いまの会話に有効な一覧の控えがあるか（スキルが一覧モードか送信モードかを決める）
-  checked 確認係の結果（ok / caution）を控えに書く。書かれなかった会話は送るとき既定で外す
+  checked 確認係の結果（ok / caution）を控えに書く。書かれなかった会話は今回は送らず、未決定のまま残す
   list   未送信の会話のうち 1 ラウンド分（最大 15 件）の一覧を出し、控えを保存する。
          各会話の本文（本人の指示・AI の返事。伏せてから）を確認係が読むファイルにし、ツールの結果は機械で数える
   send   控えに沿って、画像の base64 を外す → 秘密を伏せる → gzip → 引換券でアップロード → 送信票
@@ -1588,7 +1588,7 @@ def cmd_list(args, out):
 
 
 def cmd_checked(args, out):
-    """確認係の結果を控えに書く。ok / caution と書かれなかった会話は「確認できなかった」で、送るとき既定で外す。"""
+    """確認係の結果を控えに書く。ok / caution と書かれなかった会話は「確認できなかった」で、今回は送らない（未決定のまま）。"""
     data_dir = resolve_data_dir(args.data_dir)
     sid = session_id_from_env()
     require_send_session(sid)
@@ -2038,27 +2038,30 @@ def cmd_send(args, out, stdin):
         raise Fail("まだ本人の返事が無い。一覧を見せて、返事を待ってから送って", EXIT_NOT_ANSWERED)
 
     items = {int(it["n"]): it for it in pending["items"]}
-    excluded = parse_numbers(args.exclude, items, "exclude")
+    explicit = parse_numbers(args.exclude, items, "exclude")
     included = parse_numbers(args.include, items, "include") if args.include is not None else set()
-    if excluded & included:
-        raise Fail("同じ番号が --exclude と --include の両方にある: %s" % ",".join(map(str, sorted(excluded & included))),
+    if explicit & included:
+        raise Fail("同じ番号が --exclude と --include の両方にある: %s" % ",".join(map(str, sorted(explicit & included))),
                    EXIT_USAGE)
-    # 前に外した会話の続き・前に外した会話を引き継いだ会話は、--include で明示されない限り外す
-    # 前に外した会話の続き・前に外した会話を引き継いだ会話・確認係が確認できなかった会話は、
-    # --include で明示されない限り外す
+    # 確認係が確認できなかった会話は、--include で明示されない限り今回は送らない。
+    # 本人の判断ではない（技術的な失敗）ので「外した」とは記録せず、未決定のまま次の一覧でもう一度確認係にかける
     unconfirmed = {n for n, it in items.items() if it.get("checked") not in ("ok", "caution")}
-    default_excluded = unconfirmed | {n for n, it in items.items()
-                                      if it.get("previously_excluded") or it.get("contains_excluded_copy")}
-    excluded |= (default_excluded - included)
-    send_items = [items[n] for n in sorted(items) if n not in excluded]
+    deferred = unconfirmed - included - explicit
+    # 前に外した会話の続き・前に外した会話を引き継いだ会話は、--include で明示されない限り外す（外したと記録する）
+    default_excluded = {n for n, it in items.items()
+                        if it.get("previously_excluded") or it.get("contains_excluded_copy")}
+    excluded = explicit | ((default_excluded - included) - deferred)
+    not_sent = excluded | deferred
+    send_items = [items[n] for n in sorted(items) if n not in not_sent]
     excluded_items = [items[n] for n in sorted(excluded)]
+    remaining_after = int(pending.get("remaining") or 0) + len(deferred)
 
     if not args.confirm_shared:
         cut = [it["n"] for it in send_items if it.get("group_cut")]
         if cut:
             raise Fail("%s 番は、大きすぎて一覧に出しきれなかった会話と同じ履歴を含む。送るとその中身も届く。"
                        "了承なら --confirm-shared を付けてやり直す" % "、".join(map(str, cut)), EXIT_CONFIRM_SHARED)
-        pairs = sorted({(it["n"], m) for it in send_items for m in it.get("shares", []) if m in excluded})
+        pairs = sorted({(it["n"], m) for it in send_items for m in it.get("shares", []) if m in not_sent})
         if pairs:
             desc = "、".join("%d 番と %d 番" % pr for pr in pairs)
             raise Fail("%s は同じ履歴を共有している。外した方の中身も、送る方から届く。"
@@ -2069,14 +2072,14 @@ def cmd_send(args, out, stdin):
         raise Fail("感想が長すぎる（%d 文字まで）" % NOTE_MAX, EXIT_USAGE)
 
     if not send_items and not note:
-        # 全部外して感想もない日: サーバーには何も送らず、外したことだけ覚える
+        # 送るものも感想もない日: サーバーには何も送らず、外したことだけ覚える
         record_decisions(data_dir, now, [], excluded_items, sid, False)
         remove_quietly(pending_path(data_dir))
         clear_reviews(data_dir)
         out.write(json.dumps({"submission_id": None, "sent_count": 0, "excluded_count": len(excluded_items),
-                              "excluded_unconfirmed": len(unconfirmed - included),
+                              "deferred_unconfirmed": len(deferred),
                               "subagent_count": 0, "bytes": 0, "redactions": 0, "omitted": 0,
-                              "remaining": int(pending.get("remaining") or 0)}, ensure_ascii=False) + "\n")
+                              "remaining": remaining_after}, ensure_ascii=False) + "\n")
         return 0
 
     if not args.code or not api_base:
@@ -2133,12 +2136,12 @@ def cmd_send(args, out, stdin):
         "submission_id": res.get("submission_id"),
         "sent_count": len(packed),
         "excluded_count": len(excluded_items),
-        "excluded_unconfirmed": len(unconfirmed - included),
+        "deferred_unconfirmed": len(deferred),
         "subagent_count": sum(len(p["sent"]["subagents"]) for p in packed),
         "bytes": sum(f["bytes"] for f in files),
         "redactions": sum(p["sent"]["redactions"] for p in packed),
         "omitted": sum(p["omitted"] for p in packed),
-        "remaining": int(pending.get("remaining") or 0),
+        "remaining": remaining_after,
     }
     out.write(json.dumps(result, ensure_ascii=False) + "\n")
     return 0
@@ -2157,7 +2160,7 @@ def build_parser():
     data_dir(sub.add_parser("nudge", help="未送信の会話があれば 1 日 1 回知らせる（フック用）"))
     data_dir(sub.add_parser("status", help="いまの会話に有効な一覧の控えがあるか"))
 
-    sp = sub.add_parser("checked", help="確認係の結果を控えに書く（書かれなかった会話は既定で外す）")
+    sp = sub.add_parser("checked", help="確認係の結果を控えに書く（書かれなかった会話は今回は送らない）")
     data_dir(sp)
     sp.add_argument("--ok", default=None, help="問題なしの番号（カンマ区切り）か none")
     sp.add_argument("--caution", default=None, help="気をつけた方がいい番号（カンマ区切り）か none")

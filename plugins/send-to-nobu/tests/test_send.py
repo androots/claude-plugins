@@ -253,20 +253,53 @@ class UnconfirmedTest(SendBase):
         return self.w.list()
 
     def test_nothing_is_sent_without_the_checkers_result(self):
-        self.three()
+        r1 = self.three()
         code, out, err = self.send(check=False)                           # 確認係の結果を書いていない
         self.assertEqual(code, 0, err)
         res = json.loads(out)
-        self.assertEqual((res["sent_count"], res["excluded_count"], res["excluded_unconfirmed"]), (0, 3, 3))
+        self.assertEqual((res["sent_count"], res["excluded_count"], res["deferred_unconfirmed"], res["remaining"]),
+                         (0, 0, 3, 3))
         self.assertEqual(self.srv.upload_calls, 0)
+        self.assertEqual({k for k in self.w.state()["sessions"] if k != self.w.current}, set())   # 何も記録しない
+        # 同じ会話の次のラウンドで、同じ 3 件がもう一度出て確認係にかかる
+        r2 = self.w.list()
+        self.assertEqual([it["session_id"] for it in r2["items"]], [it["session_id"] for it in r1["items"]])
+        self.assertTrue(all(it["review"] for it in r2["items"]))
+        self.assertNotEqual(r2["review_dir"], r1["review_dir"])
 
-    def test_unconfirmed_is_excluded_unless_included(self):
-        self.three()
+    def test_unconfirmed_is_deferred_not_excluded(self):
+        r1 = self.three()
+        unconfirmed_sid = r1["items"][2]["session_id"]
         self.assertEqual(self.w.check(ok="1", caution="2"), {"unconfirmed": [3]})
         code, out, err = self.send(check=False)
         self.assertEqual(code, 0, err)
         res = json.loads(out)
-        self.assertEqual((res["sent_count"], res["excluded_count"], res["excluded_unconfirmed"]), (2, 1, 1))
+        self.assertEqual((res["sent_count"], res["excluded_count"], res["deferred_unconfirmed"], res["remaining"]),
+                         (2, 0, 1, 1))
+        self.assertEqual(self.srv.finish_bodies[0]["excluded_count"], 0)   # 外したとは送らない
+        self.assertNotIn(unconfirmed_sid, self.w.state()["sessions"])     # 未決定のまま
+        self.srv.finished = False
+        # 同じ会話でもう一度 /send-to-nobu → 未確認だった会話が出て、確認係にかかる（前に外した印は付かない）
+        r2 = self.w.list()
+        self.assertEqual([it["session_id"] for it in r2["items"]], [unconfirmed_sid])
+        self.assertEqual(r2["items"][0]["review"], [["01-1.txt"]])
+        self.assertNotIn("default_excluded", r2["items"][0])
+        self.w.check()                                                     # 今度は確認できた
+        code, out, err = self.send(check=False)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["sent_count"], 1)
+        self.assertEqual(self.w.state()["sessions"][unconfirmed_sid]["d"], "sent")
+
+    def test_explicitly_excluded_unconfirmed_is_recorded_as_excluded(self):
+        r1 = self.three()
+        self.w.check(ok="1,2")
+        code, out, err = self.send(exclude="3", check=False)             # 本人が外すと言った
+        self.assertEqual(code, 0, err)
+        res = json.loads(out)
+        self.assertEqual((res["sent_count"], res["excluded_count"], res["deferred_unconfirmed"], res["remaining"]),
+                         (2, 1, 0, 0))
+        self.assertEqual(self.w.state()["sessions"][r1["items"][2]["session_id"]]["d"], "excluded")
+        self.assertEqual(self.w.list()["count"], 0)
 
     def test_include_sends_an_unconfirmed_conversation(self):
         self.three()
