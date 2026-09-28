@@ -51,3 +51,12 @@ Claude Code で順に打つ。
 ### 動く環境
 
 Mac。macOS の `/usr/bin/python3`（コマンドライン デベロッパツール）を使う。入っていなければ、初回の `/send-to-nobu` で macOS がインストールを案内する。
+
+---
+
+## 開発メモ（androots 内向け）
+
+- サーバーとの取り決め（MCP ツール・HTTP API・GCS の置き場所）は、非公開リポジトリ `androots/ai-iinkai` の `mcp-hub/README.md`「agent-log-inbox」節の「契約（v2）」が正。変えるときはサーバーと同時に直す
+- テスト: `cd plugins/send-to-nobu && /usr/bin/python3 -m unittest`（macOS の Python 3.9 で通ること。標準ライブラリだけ）
+- 形式の確認: `claude plugin validate --strict .` と `claude plugin validate --strict plugins/send-to-nobu`
+- 利用者に更新を届けるには `plugins/send-to-nobu/.claude-plugin/plugin.json` の `version` を上げる（上げないと届かない）
