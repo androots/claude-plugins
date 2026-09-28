@@ -513,6 +513,32 @@ class RoundTest(Base):
         self.assertEqual(sorted(k for k in decided if k in sids), sorted(sids))
         self.assertTrue(all(decided[k]["d"] == "excluded" for k in sids))
 
+    def test_unconfirmed_goes_to_the_back_of_the_next_rounds(self):
+        now = time.time()
+        sids = []
+        for i in range(35):
+            L = Lines(base=now - 90000 + i * 2000).user("会話 %02d の指示" % i).assistant()
+            self.w.write(L)
+            sids.append(L.sid)
+        r1 = self.w.list()
+        self.assertEqual([it["session_id"] for it in r1["items"]], sids[20:])
+        self.w.check(ok="none")                                        # 15 番（一番新しい）は確認できなかった
+        code, out, err = self.w.run("send", "--exclude", "1-14")
+        self.assertEqual(code, 0, err)
+        res = json.loads(out)
+        self.assertEqual((res["excluded_count"], res["deferred_unconfirmed"], res["remaining"]), (14, 1, 21))
+        self.assertNotIn(sids[34], self.w.state()["sessions"])         # 記録は付けない
+        r2 = self.w.list()                                              # 同じ会話の次のラウンド
+        ids2 = [it["session_id"] for it in r2["items"]]
+        self.assertEqual(ids2, sids[5:20])                             # 未確認は後ろに回す（先頭に出続けない）
+        self.assertEqual(r2["remaining"], 6)
+        self.w.check(ok="none")
+        code, out, err = self.w.run("send", "--exclude", "1-15")
+        self.assertEqual(code, 0, err)
+        r3 = self.w.list()                                              # ほかが尽きたら出る
+        self.assertEqual([it["session_id"] for it in r3["items"]], sids[:5] + [sids[34]])
+        self.assertEqual(r3["remaining"], 0)
+
     def test_share_groups_are_never_split(self):
         now = time.time()
         root = Lines(base=now - 90000).user("元の会話").assistant()

@@ -317,13 +317,34 @@ class UnconfirmedTest(SendBase):
         code, out, err = self.w.run("checked", "--ok", "1", session=other)
         self.assertEqual(code, agentlog.EXIT_USAGE)                          # 別の会話の控えには書けない
 
-    def test_queued_reply_opens_the_gate(self):
+    def test_queued_text_does_not_open_the_gate(self):
+        # 一覧のターンの最中に打った文（queued）は、一覧を見る前かもしれないので返事にしない
         self.three()
         self.w.check()
         self.w.append(self.w.session_file(), Lines(sid=self.w.current).meta(
             "attachment", attachment={"type": "queued_command", "commandMode": "prompt", "prompt": "なし"}))
         code, out, err = self.send(check=False, reply=False)
+        self.assertEqual(code, agentlog.EXIT_NOT_ANSWERED)
+        self.assertEqual(self.srv.upload_calls, 0)
+        self.w.reply("なし")                                            # ターンが終わってから打った返事
+        code, out, err = self.send(check=False, reply=False)
         self.assertEqual(code, 0, err)
+
+    def test_shared_history_with_an_unconfirmed_conversation_has_its_own_wording(self):
+        a = Lines(base=time.time() - 7200).user("元の会話").assistant()
+        b = Lines(base=time.time() - 3600).copy_from(a).user("分岐").assistant()
+        self.w.write(a)
+        self.w.write(b)
+        self.w.list()
+        self.w.check(ok="1")                                            # 2 は確認できなかった
+        code, out, err = self.send(check=False)
+        self.assertEqual(code, agentlog.EXIT_CONFIRM_SHARED)
+        self.assertIn("確認できなかった方（2 番）は今回送らない", err)
+        self.assertNotIn("外した方の中身", err)
+        code, out, err = self.send(check=False, extra=["--confirm-shared"])
+        self.assertEqual(code, 0, err)
+        res = json.loads(out)
+        self.assertEqual((res["sent_count"], res["excluded_count"], res["deferred_unconfirmed"]), (1, 0, 1))
 
 
 class GateTest(SendBase):

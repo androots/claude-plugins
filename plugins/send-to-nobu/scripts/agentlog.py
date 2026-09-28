@@ -818,15 +818,17 @@ def has_turn_after(path, offset):
 
 
 def reply_after(path, offset):
-    """offset 以降に本人の返事（人の指示、または引数付きの送信コマンド）があるか。"""
+    """offset 以降に本人の返事（人の指示、または引数付きの送信コマンド）があるか。
+
+    作業中に打った文（queued_command）は数えない。ターンの途中で渡された位置に書かれるので、一覧のターンの
+    最中（一覧を見る前）に打った文でもここに現れる。ターンが終わってから打った文はふつうの user 行になる。
+    """
     with open_nofollow(path) as fh:
         fh.seek(offset)
         for raw in fh:
             d = parse_line(raw)
             if d is None:
                 continue
-            if queued_prompt(d):
-                return True
             kind, text = classify(d)
             if kind == "human" or (kind == "send" and _command_args(text)):
                 return True
@@ -1147,6 +1149,7 @@ def build_list(state, current, excluded_store, cache):
             "total_bytes": st.st_size + sig[1],
             "shares_idx": sorted(shares.get(idx, ())),
             "previously_excluded": bool((rec and rec.get("d") == "excluded") or sid in excluded_store),
+            "deferred_before": sid in (state.get("deferred") or {}),
             "contains_excluded_copy": any(
                 (excluded_hashes.get(uuid_hash(u), set()) - {sid}) for u in s.head_uuids),
         })
@@ -1179,8 +1182,10 @@ def select_round(items):
 
     同じ履歴のまとまりは分けない。新しいまとまりから ROUND_SIZE 件まで詰める（入らないまとまりは飛ばして、
     もっと古い小さなまとまりで埋める）。一番新しいまとまりだけで ROUND_SIZE を超えるなら、そのまとまりだけ。
+    前回確認できなかった会話を含むまとまりは後ろに回す（ほかの未決定が尽きたら出る）。
     """
     groups = share_groups(items)
+    groups.sort(key=lambda g: any(items[i].get("deferred_before") for i in g))  # 安定ソート: 新しい順は保つ
     if not groups:
         return []
     if len(groups[0]) > ROUND_SIZE:
@@ -1482,7 +1487,8 @@ def render_round(items, shown, state, remaining, reviews, compact=False, cut=Fal
         if rev.get("error"):
             row["review_error"] = True
         rows.append(row)
-        p = {k: v for k, v in it.items() if k not in ("prompt_count", "total_bytes", "last_ts", "shares_idx")}
+        p = {k: v for k, v in it.items()
+         if k not in ("prompt_count", "total_bytes", "last_ts", "shares_idx", "deferred_before")}
         p.update({"n": n, "shares": shares, "group_cut": cut})
         pend.append(p)
     result = {LIST_MARKER: 1}
@@ -1954,10 +1960,20 @@ def conversation_record(state, sid):
     return rec if isinstance(rec, dict) else {}
 
 
-def record_decisions(data_dir, now, packed, excluded_items, sid, note_sent):
-    """送った / 外したを、判断した時点（一覧の時点）の位置で状態に記録する。この会話のラウンド数と感想の有無も。"""
+def record_decisions(data_dir, now, packed, excluded_items, sid, note_sent, deferred_items=()):
+    """送った / 外したを、判断した時点（一覧の時点）の位置で状態に記録する。この会話のラウンド数と感想の有無も。
+
+    確認できなかった会話（deferred_items）は判断を記録せず、次の一覧でラウンドの後ろに回す印だけ付ける。
+    """
     state = load_state(data_dir, now)
     sessions = state["sessions"]
+    deferred = dict(state.get("deferred") or {})
+    for it in deferred_items:
+        deferred[it["session_id"]] = now
+    for it in list(excluded_items) + [p["item"] for p in packed]:
+        deferred.pop(it["session_id"], None)
+    state["deferred"] = {k: v for k, v in deferred.items()
+                         if isinstance(v, (int, float)) and now - v < 30 * 86400}
     convs = state.get("conversations") if isinstance(state.get("conversations"), dict) else {}
     conv = dict(convs.get(sid) or {})
     conv["rounds"] = int(conv.get("rounds") or 0) + 1
@@ -2061,11 +2077,21 @@ def cmd_send(args, out, stdin):
         if cut:
             raise Fail("%s 番は、大きすぎて一覧に出しきれなかった会話と同じ履歴を含む。送るとその中身も届く。"
                        "了承なら --confirm-shared を付けてやり直す" % "、".join(map(str, cut)), EXIT_CONFIRM_SHARED)
-        pairs = sorted({(it["n"], m) for it in send_items for m in it.get("shares", []) if m in not_sent})
-        if pairs:
-            desc = "、".join("%d 番と %d 番" % pr for pr in pairs)
-            raise Fail("%s は同じ履歴を共有している。外した方の中身も、送る方から届く。"
-                       "了承なら --confirm-shared を付けてやり直す（止めるなら両方外す）" % desc, EXIT_CONFIRM_SHARED)
+        pairs_ex = sorted({(it["n"], m) for it in send_items for m in it.get("shares", []) if m in excluded})
+        pairs_def = sorted({(it["n"], m) for it in send_items for m in it.get("shares", [])
+                            if m in deferred and m not in excluded})
+        if pairs_ex or pairs_def:
+            msgs = []
+            if pairs_ex:
+                msgs.append("%s は同じ履歴を共有している。外した方の中身も、送る方から届く"
+                            % "、".join("%d 番と %d 番" % pr for pr in pairs_ex))
+            if pairs_def:
+                msgs.append("%s は同じ履歴を共有している。確認できなかった方（%s 番）は今回送らないが、"
+                            "その中身の一部は送る方から届く"
+                            % ("、".join("%d 番と %d 番" % pr for pr in pairs_def),
+                               "・".join(str(m) for m in sorted({m for _, m in pairs_def}))))
+            raise Fail("。".join(msgs) + "。了承なら --confirm-shared を付けてやり直す（止めるなら両方外す）",
+                       EXIT_CONFIRM_SHARED)
 
     note = mask_text(read_note(args, stdin))[0]
     if len(note) > NOTE_MAX:
@@ -2073,7 +2099,7 @@ def cmd_send(args, out, stdin):
 
     if not send_items and not note:
         # 送るものも感想もない日: サーバーには何も送らず、外したことだけ覚える
-        record_decisions(data_dir, now, [], excluded_items, sid, False)
+        record_decisions(data_dir, now, [], excluded_items, sid, False, [items[n] for n in sorted(deferred)])
         remove_quietly(pending_path(data_dir))
         clear_reviews(data_dir)
         out.write(json.dumps({"submission_id": None, "sent_count": 0, "excluded_count": len(excluded_items),
@@ -2123,7 +2149,7 @@ def cmd_send(args, out, stdin):
                 "note": note, "plugin_version": plugin_version()}
         res = api_post(api_base, "/v1/finish", body, code, retry_ok_codes=("already_finished",))
 
-        record_decisions(data_dir, now, packed, excluded_items, sid, bool(note))
+        record_decisions(data_dir, now, packed, excluded_items, sid, bool(note), [items[n] for n in sorted(deferred)])
         remove_quietly(pending_path(data_dir))
         clear_reviews(data_dir)
     finally:
