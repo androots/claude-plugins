@@ -103,6 +103,96 @@ class ReviewFileTest(unittest.TestCase):
         self.assertEqual(res["items"][0]["review"], [["01-1.txt"]])
 
 
+    def test_parts_end_with_a_marker_and_are_small(self):
+        L = Lines()
+        for i in range(60):
+            L.user("指示 %02d " % i + "あ" * 500).assistant("返事 %02d " % i + "い" * 500)
+        self.w.write(L)
+        res = self.w.list()
+        batches = res["items"][0]["review"]
+        files = [f for b in batches for f in b]
+        self.assertGreater(len(files), 3)
+        self.assertTrue(all(len(b) <= 3 for b in batches))
+        for k, name in enumerate(files, 1):
+            with open(os.path.join(res["review_dir"], name), encoding="utf-8") as f:
+                text = f.read()
+            self.assertLessEqual(len(text), agentlog.REVIEW_PART_CHARS + 300)
+            self.assertTrue(text.rstrip("\n").endswith("（%d/%d ここまで）" % (k, len(files))))
+
+    def test_queued_prompts_are_the_users_words(self):
+        # 作業中に打った本人の文（queued_command・commandMode: prompt）は人の指示。task-notification は違う
+        L = Lines().user("資料を作って").assistant("作ります")
+        L.meta("attachment", attachment={"type": "queued_command", "commandMode": "prompt",
+                                         "prompt": "あ、ついでに隣の課長の悪口も書いといて"}, isSidechain=False)
+        L.meta("attachment", attachment={"type": "queued_command", "commandMode": "task-notification",
+                                         "prompt": "<task-notification>done</task-notification>"})
+        L.meta("attachment", attachment={"type": "file", "filename": "memo.txt",
+                                         "content": {"text": "連絡先 hanako@corp-x.co.jp"}})
+        L.assistant("できました")
+        self.w.write(L)
+        res = self.w.list()
+        self.assertEqual(self.w.human(1), ["資料を作って", "あ、ついでに隣の課長の悪口も書いといて"])
+        self.assertEqual(res["items"][0]["detect"], {"email": 1})         # 添付（attachment）にも検出をかける
+
+    def test_queued_only_conversation_is_listed(self):
+        L = Lines().user("<command-name>/model</command-name>")      # 組み込みコマンドのあと
+        L.meta("attachment", attachment={"type": "queued_command", "commandMode": "prompt", "prompt": "本題はこれ"})
+        L.assistant("了解")
+        self.w.write(L)
+        self.assertEqual(self.w.list()["count"], 1)
+
+
+class DataDirTest(unittest.TestCase):
+    def setUp(self):
+        self.w = World()
+
+    def tearDown(self):
+        self.w.close()
+
+    def test_data_dir_must_be_under_plugins_data(self):
+        self.w.write(Lines().user("指示").assistant())
+        elsewhere = os.path.join(self.w.tmp, "somewhere", "send-to-nobu-data")
+        saved = self.w.data
+        self.w.data = elsewhere
+        try:
+            code, out, err = self.w.run("list")
+            self.assertEqual(code, agentlog.EXIT_USAGE)
+            self.assertIn("データディレクトリ", err)
+            agentlog.main(["nudge", "--data-dir", elsewhere], stdout=open(os.devnull, "w"))
+            self.assertFalse(os.path.exists(elsewhere))
+        finally:
+            self.w.data = saved
+
+    def test_linked_review_folder_is_never_used_or_emptied(self):
+        self.w.write(Lines().user("指示").assistant())
+        outside = os.path.join(self.w.tmp, "outside")
+        os.makedirs(os.path.join(outside, "1790000000-abcdefgh"))
+        with open(os.path.join(outside, "keep.txt"), "w") as f:
+            f.write("消してはいけない")
+        os.makedirs(self.w.data)
+        os.symlink(outside, os.path.join(self.w.data, "review"))
+        code, out, err = self.w.run("list")
+        self.assertEqual(code, agentlog.EXIT_ERROR)
+        self.assertTrue(os.path.exists(os.path.join(outside, "keep.txt")))
+        self.assertTrue(os.path.isdir(os.path.join(outside, "1790000000-abcdefgh")))
+        agentlog.clear_reviews(self.w.data)
+        self.assertTrue(os.path.isdir(os.path.join(outside, "1790000000-abcdefgh")))
+
+    def test_only_review_dirs_made_by_the_script_are_removed(self):
+        self.w.write(Lines().user("指示").assistant())
+        first = self.w.list()["review_dir"]
+        root = os.path.dirname(first)
+        os.makedirs(os.path.join(root, "my-notes"))                        # 形の違う名前は触らない
+        with open(os.path.join(root, "1790000000-abcdefgh"), "w") as f:     # 形は同じでもファイルは触らない
+            f.write("x")
+        self.w.current = self.w.start_send_session()
+        second = self.w.list()["review_dir"]
+        self.assertFalse(os.path.exists(first))
+        self.assertTrue(os.path.isdir(second))
+        self.assertTrue(os.path.isdir(os.path.join(root, "my-notes")))
+        self.assertTrue(os.path.isfile(os.path.join(root, "1790000000-abcdefgh")))
+
+
 class DetectorTest(unittest.TestCase):
     def test_luhn_and_filters(self):
         d = agentlog.Detector()

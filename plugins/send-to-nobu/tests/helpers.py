@@ -142,14 +142,15 @@ class World(object):
     def __init__(self):
         self.tmp = tempfile.mkdtemp(prefix="stn-test-")
         self.projects = os.path.join(self.tmp, "projects")
-        self.data = os.path.join(self.tmp, "send-to-nobu-data")
+        self.data = os.path.join(self.tmp, "plugins", "data", "send-to-nobu-data")   # 設定ディレクトリの形に合わせる
         os.makedirs(self.projects)
-        self.saved_projects = agentlog.PROJECTS_DIR
+        self.saved_projects = (agentlog.CONFIG_DIR, agentlog.PROJECTS_DIR)
+        agentlog.CONFIG_DIR = self.tmp
         agentlog.PROJECTS_DIR = self.projects
         self.current = self.start_send_session()
 
     def close(self):
-        agentlog.PROJECTS_DIR = self.saved_projects
+        agentlog.CONFIG_DIR, agentlog.PROJECTS_DIR = self.saved_projects
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def project_dir(self, name="-Users-alice-work-billing"):
@@ -247,6 +248,20 @@ class World(object):
     def human(self, n):
         """n 番の会話で、確認係に「本人の指示」として渡る本文。"""
         return [t for who, t in self.review_blocks(n) if who == "本人"]
+
+    def check(self, ok="all", caution=None, session=None):
+        """確認係の結果を控えに書く（既定は全部 ok）。"""
+        p = self.pending()
+        n = len(p["items"]) if p else 0
+        args = ["checked"]
+        if ok is not None:
+            args += ["--ok", ("1-%d" % n if n else "none") if ok == "all" else ok]
+        if caution is not None:
+            args += ["--caution", caution]
+        code, out, err = self.run(*args, session=session)
+        if code != 0:
+            raise AssertionError("checked failed: %s" % err)
+        return json.loads(out)
 
     def state(self):
         return agentlog.read_json(os.path.join(self.data, "state.json"), None)

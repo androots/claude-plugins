@@ -36,7 +36,12 @@ class SendBase(unittest.TestCase):
         self.srv.close()
         self.w.close()
 
-    def send(self, exclude="none", note=None, code=None, extra=(), **kw):
+    def send(self, exclude="none", note=None, code=None, extra=(), check=True, **kw):
+        """送る。既定では先に確認係の結果（全部 ok）を控えに書く（確認できなかった会話は既定で外れるため）。"""
+        p = self.w.pending()
+        if check and p and p.get("session") == (kw.get("session") or self.w.current) and p["items"] \
+                and not any(it.get("checked") for it in p["items"]):
+            self.w.check(session=kw.get("session"))
         args = ["send", "--exclude", exclude, "--code", code or FakeInbox.CODE, "--api-base", self.srv.base]
         if note is not None:
             args += ["--note-file", "-"]
@@ -238,6 +243,54 @@ class RoundSendTest(SendBase):
         self.assertEqual(self.w.list()["count"], 0)
         sent = {o.split("/")[-1].split(".")[0] for o in self.srv.objects}
         self.assertEqual(sent, set(sids) - {sids[5]})
+
+
+class UnconfirmedTest(SendBase):
+    def three(self):
+        now = time.time()
+        for i in range(3):
+            self.w.write(Lines(base=now - 9000 + i * 1000).user("会話 %d" % i).assistant())
+        return self.w.list()
+
+    def test_nothing_is_sent_without_the_checkers_result(self):
+        self.three()
+        code, out, err = self.send(check=False)                           # 確認係の結果を書いていない
+        self.assertEqual(code, 0, err)
+        res = json.loads(out)
+        self.assertEqual((res["sent_count"], res["excluded_count"], res["excluded_unconfirmed"]), (0, 3, 3))
+        self.assertEqual(self.srv.upload_calls, 0)
+
+    def test_unconfirmed_is_excluded_unless_included(self):
+        self.three()
+        self.assertEqual(self.w.check(ok="1", caution="2"), {"unconfirmed": [3]})
+        code, out, err = self.send(check=False)
+        self.assertEqual(code, 0, err)
+        res = json.loads(out)
+        self.assertEqual((res["sent_count"], res["excluded_count"], res["excluded_unconfirmed"]), (2, 1, 1))
+
+    def test_include_sends_an_unconfirmed_conversation(self):
+        self.three()
+        self.w.check(ok="1,2")
+        code, out, err = self.send(check=False, extra=["--include", "3"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["sent_count"], 3)
+
+    def test_checked_rejects_bad_input(self):
+        self.three()
+        for args in (["--ok", "1", "--caution", "1"], ["--ok", "4"], ["--ok", ""], ["--caution", "2-1"]):
+            code, out, err = self.w.run("checked", *args)
+            self.assertEqual(code, agentlog.EXIT_USAGE, args)
+        other = self.w.start_send_session()
+        code, out, err = self.w.run("checked", "--ok", "1", session=other)
+        self.assertEqual(code, agentlog.EXIT_USAGE)                          # 別の会話の控えには書けない
+
+    def test_queued_reply_opens_the_gate(self):
+        self.three()
+        self.w.check()
+        self.w.append(self.w.session_file(), Lines(sid=self.w.current).meta(
+            "attachment", attachment={"type": "queued_command", "commandMode": "prompt", "prompt": "なし"}))
+        code, out, err = self.send(check=False, reply=False)
+        self.assertEqual(code, 0, err)
 
 
 class GateTest(SendBase):
@@ -514,19 +567,21 @@ class SafetyTest(SendBase):
     def test_sigterm_removes_the_temp_dir(self):
         a, pa, b, pb = self.two_sessions()
         self.w.list()
+        self.w.check()
         self.w.reply("なし")
         self.srv.put_delay = 5.0
         runner = textwrap.dedent("""
             import sys
             sys.path.insert(0, %r)
             import agentlog
+            agentlog.CONFIG_DIR = %r
             agentlog.PROJECTS_DIR = %r
             agentlog.ALLOWED_API_BASES = (%r,)
             agentlog.ALLOWED_PUT_PREFIXES = (%r,)
             agentlog._OPENER = agentlog.build_opener(use_proxy=False)
             sys.exit(agentlog.main(["send", "--exclude", "none", "--code", %r, "--api-base", %r,
                                     "--data-dir", %r]))
-        """) % (os.path.dirname(agentlog.__file__), self.w.projects, self.srv.base, self.srv.base + "/put/",
+        """) % (os.path.dirname(agentlog.__file__), self.w.tmp, self.w.projects, self.srv.base, self.srv.base + "/put/",
                 FakeInbox.CODE, self.srv.base, self.w.data)
         env = dict(os.environ, CLAUDE_CODE_SESSION_ID=self.w.current)
         proc = subprocess.Popen([sys.executable, "-c", runner], env=env, stdout=subprocess.PIPE,

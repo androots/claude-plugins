@@ -589,6 +589,7 @@ class RoundTest(Base):
         shown = {self.w.pending()["items"][i]["session_id"] for i in range(r1["count"])}
         self.assertEqual(shown, {L.sid for L in group[-r1["count"]:]})   # 新しい方から出した分だけ控える
         self.assertTrue(all(it["group_cut"] for it in r1["items"]))
+        self.w.check()
         code, out, err = self.w.run("send", "--exclude", "none")
         self.assertEqual(code, agentlog.EXIT_CONFIRM_SHARED)
         self.assertIn("出しきれなかった", err)
