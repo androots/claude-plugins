@@ -12,6 +12,7 @@ import http.server
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -219,12 +220,33 @@ class World(object):
                 os.environ["CLAUDE_CODE_SESSION_ID"] = saved_env
         return code, out.getvalue(), err.getvalue()
 
-    def list(self, preview=True, **kw):
-        args = ["list"] + (["--preview"] if preview else [])
-        code, out, err = self.run(*args, **kw)
+    def list(self, **kw):
+        code, out, err = self.run("list", **kw)
         if code != 0:
             raise AssertionError("list failed: %s" % err)
         return json.loads(out)
+
+    def review_blocks(self, n):
+        """いまの一覧の n 番の確認用ファイルを読み、[(話し手, 本文)] にする。"""
+        out = self.pending()["output"]
+        item = [it for it in out["items"] if it["n"] == n][0]
+        lines = []
+        for batch in item["review"]:
+            for name in batch:
+                with open(os.path.join(out["review_dir"], name), encoding="utf-8") as f:
+                    lines += [l for l in f.read().split("\n") if not l.startswith("# ")]
+        blocks = []
+        for line in lines:
+            m = re.match(r"^【(本人|AI|サブエージェントへの指示|サブエージェント)】$", line)
+            if m:
+                blocks.append([m.group(1), []])
+            elif blocks:
+                blocks[-1][1].append(line)
+        return [(who, "\n".join(body).strip()) for who, body in blocks]
+
+    def human(self, n):
+        """n 番の会話で、確認係に「本人の指示」として渡る本文。"""
+        return [t for who, t in self.review_blocks(n) if who == "本人"]
 
     def state(self):
         return agentlog.read_json(os.path.join(self.data, "state.json"), None)

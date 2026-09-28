@@ -223,11 +223,11 @@ class RoundSendTest(SendBase):
         self.assertTrue(r2["note_already_sent"])        # 2 ラウンド目は感想を聞かない
         # 別の会話（翌日）では 1 ラウンド目から・感想も聞く
         other = self.w.start_send_session()
-        code, out, err = self.w.run("list", "--preview", session=other)
+        code, out, err = self.w.run("list", session=other)
         r_other = json.loads(out)
         self.assertEqual(r_other["round"], 1)
         self.assertNotIn("note_already_sent", r_other)
-        code, out, err = self.w.run("list", "--preview")   # もとの会話に戻る（控えは別の会話に移った）
+        code, out, err = self.w.run("list")   # もとの会話に戻る（控えは別の会話に移った）
         r2 = json.loads(out)
         self.assertEqual((r2["count"], r2["round"]), (5, 2))
         self.assertEqual([it["session_id"] for it in r2["items"]], sids[:5])

@@ -62,9 +62,9 @@ class ListTest(Base):
         self.assertEqual(it["n"], 1)
         self.assertEqual(it["session_id"], L.sid)
         self.assertEqual(it["title"], "請求 集計 9月")  # custom-title が ai-title に勝つ
-        self.assertEqual(it["project"], "~/work/billing")
-        self.assertEqual(it["prompts"], 3)
-        self.assertEqual(it["preview"], ["請求書の集計をしたい", "CSV を読み込んで", "月ごとに合計して"])
+        self.assertEqual(self.w.pending()["items"][0]["project"], "~/work/billing")
+        self.assertEqual(self.w.human(1), ["請求書の集計をしたい", "CSV を読み込んで", "月ごとに合計して"])
+        self.assertNotIn("preview", it)
         self.assertNotIn("shares_history_with", it)
         p = self.w.pending()
         self.assertEqual(p["session"], self.w.current)
@@ -81,11 +81,6 @@ class ListTest(Base):
         self.assertEqual(items[a.sid]["title"], "最後の AI の題")
         self.assertEqual(items[b.sid]["title"], ("とても長い最初の指示。" + "あ" * 60)[:40])
 
-    def test_without_preview(self):
-        self.w.write(Lines().user("指示").assistant())
-        res = self.w.list(preview=False)
-        self.assertNotIn("preview", res["items"][0])
-
     def test_compact(self):
         L = Lines().user("最初の指示").assistant()
         L.system("compact_boundary", compactMetadata={"trigger": "auto", "preTokens": 1000})
@@ -94,8 +89,7 @@ class ListTest(Base):
         L.user("圧縮後の指示").assistant()
         self.w.write(L)
         it = self.w.list()["items"][0]
-        self.assertEqual(it["prompts"], 2)
-        self.assertEqual(it["preview"], ["最初の指示", "圧縮後の指示"])
+        self.assertEqual(self.w.human(1), ["最初の指示", "圧縮後の指示"])
 
     def test_fork_shares_history_both_ways(self):
         a = Lines().user("元の会話").assistant().user("続き").assistant()
@@ -131,7 +125,7 @@ class ListTest(Base):
         L.user("二つ目", at=now - 5000).assistant(at=now - 4000)
         self.w.write(L)
         it = self.w.list()["items"][0]
-        self.assertEqual(it["preview"], ["一つ目", "二つ目"])  # 並べ替えない
+        self.assertEqual(self.w.human(1), ["一つ目", "二つ目"])  # 並べ替えない
         self.assertEqual(self.w.pending()["items"][0]["last_activity"],
                          agentlog.iso_utc(agentlog.parse_ts(iso(now - 50))))
 
@@ -188,12 +182,12 @@ class ListTest(Base):
         L = Lines().user(cmd).user(out).user("本題の指示").assistant()
         self.w.write(L)
         it = self.w.list()["items"][0]
-        self.assertEqual(it["prompts"], 1)
+        self.assertEqual(self.w.human(1), ["本題の指示"])
         self.assertEqual(it["title"], "本題の指示")
 
     def test_list_output_and_pending_carry_the_marker(self):
         self.w.write(Lines().user("指示").assistant())
-        code, out, err = self.w.run("list", "--preview")
+        code, out, err = self.w.run("list")
         self.assertEqual(json.loads(out)[agentlog.LIST_MARKER], 1)
         self.assertEqual(self.w.pending()[agentlog.LIST_MARKER], 1)
 
@@ -222,7 +216,8 @@ class ListTest(Base):
         self.w.write(M)
         self.w.current = self.w.start_send_session()
         items = self.w.list()["items"]
-        self.assertEqual([(i["session_id"], i["prompts"], i["title"]) for i in items], [(M.sid, 1, "本題")])
+        self.assertEqual([(i["session_id"], i["title"]) for i in items], [(M.sid, "本題")])
+        self.assertEqual(self.w.human(1), ["本題"])
 
     def test_only_builtins_is_hidden(self):
         L = Lines()
@@ -238,8 +233,7 @@ class ListTest(Base):
         L.user("スキル本文", isMeta=True).assistant()
         self.w.write(L)
         it = self.w.list()["items"][0]
-        self.assertEqual(it["prompts"], 1)
-        self.assertEqual(it["preview"], ["/deck 来週の資料"])
+        self.assertEqual(self.w.human(1), ["/deck 来週の資料"])
 
     def test_non_human_lines(self):
         L = Lines().user("最初の指示").assistant().tool_result()
@@ -260,8 +254,7 @@ class ListTest(Base):
         L.assistant()
         self.w.write(L)
         it = self.w.list()["items"][0]
-        self.assertEqual(it["preview"], ["最初の指示", "本当の指示", "!ls", "人が打った", "ブロックの指示"])
-        self.assertEqual(it["prompts"], 5)
+        self.assertEqual(self.w.human(1), ["最初の指示", "本当の指示", "!ls", "人が打った", "ブロックの指示"])
 
     def test_peer_and_notifications_only_is_hidden(self):
         L = Lines().user("ピアから", origin={"kind": "peer"}).assistant()
@@ -288,8 +281,10 @@ class ListTest(Base):
         self.assertEqual(rels, ["agent-a1b2.jsonl", "agent-a1b2.meta.json",
                                 "workflows/wf_abc-123/agent-c3.jsonl", "workflows/wf_abc-123/journal.jsonl"])
         it = self.w.list()["items"][0]
-        self.assertEqual(it["subagent_files"], 4)
-        self.assertEqual(it["prompts"], 1)  # サブエージェントの指示は数えない
+        self.assertEqual(self.w.pending()["items"][0]["sub_n"], 4)
+        self.assertEqual(self.w.human(1), ["調べて"])  # サブエージェントの指示は本人の指示にしない
+        who = [w for w, _ in self.w.review_blocks(1)]
+        self.assertEqual(who.count("サブエージェントへの指示"), 2)   # 入れ子も含めて確認係には渡す（journal は本文なし）
         self.assertEqual([r for r, _ in self.w.pending()["items"][0]["subs"]], rels)
 
     def test_invalid_utf8(self):
@@ -300,8 +295,8 @@ class ListTest(Base):
         L.raw(b"{not json at all")
         self.w.write(L)
         it = self.w.list()["items"][0]
-        self.assertEqual(it["prompts"], 2)
-        self.assertIn("�", it["preview"][1])
+        self.assertEqual(len(self.w.human(1)), 2)
+        self.assertIn("�", self.w.human(1)[1])
 
     def test_partial_last_line_is_not_read(self):
         L = Lines().user("指示").assistant()
@@ -332,8 +327,8 @@ class ListTest(Base):
         # 後で触られたら出す（別の日の新しい会話で）
         self.w.append(path, Lines(sid=L.sid).user("また使った").assistant())
         self.w.current = self.w.start_send_session()
-        it = self.w.list()["items"][0]
-        self.assertEqual(it["prompts"], 2)
+        self.w.list()
+        self.assertEqual(self.w.human(1), ["古い会話", "また使った"])
 
     def test_old_session_opened_and_closed_is_hidden(self):
         old = time.time() - 10 * 86400
@@ -342,32 +337,39 @@ class ListTest(Base):
         self.w.append(path, Lines(sid=L.sid).meta("last-prompt", lastPrompt="x").meta("mode", mode="default"))
         self.assertEqual(self.w.list()["count"], 0)
 
-    def test_preview_is_limited(self):
+    def test_whole_conversation_goes_to_the_checker(self):
+        # 抜粋ではなく全部: 関係ない話の途中の一言も確認係に渡る
         L = Lines()
         for i in range(40):
-            L.user("指示 %02d " % i + "長" * 300).assistant()
+            L.user("指示 %02d " % i + "長" * 300).assistant("返事 %02d" % i)
+        L.user("ところで同僚の田中さんって本当に仕事ができないよね").assistant("そうなんですね")
+        for i in range(40, 60):
+            L.user("指示 %02d" % i).assistant()
         self.w.write(L)
-        it = self.w.list()["items"][0]
-        self.assertEqual(len(it["preview"]), 15)
-        self.assertEqual(it["preview_omitted"], 25)
-        self.assertTrue(all(len(p) <= 160 for p in it["preview"]))
-        self.assertTrue(it["preview"][0].startswith("指示 00"))
-        self.assertTrue(it["preview"][-1].startswith("指示 39"))
+        res = self.w.list()
+        human = self.w.human(1)
+        self.assertEqual(len(human), 61)
+        self.assertTrue(human[0].startswith("指示 00 長長"))
+        self.assertIn("ところで同僚の田中さんって本当に仕事ができないよね", human)
+        self.assertEqual(sum(1 for w, _ in self.w.review_blocks(1) if w == "AI"), 61)
+        self.assertNotIn("preview", res["items"][0])
 
-    def test_round_output_fits_by_shrinking_previews(self):
-        now = time.time()
-        for i in range(12):
-            L = Lines(base=now - 50000 + i * 900)
-            for j in range(15):
-                L.user("指示 %02d " % j + "長" * 200).assistant()
-            L.meta("custom-title", customTitle="題" * 150)
-            self.w.write(L)
-        code, out, err = self.w.run("list", "--preview")
-        self.assertEqual(code, 0, err)
-        self.assertLessEqual(len(out.strip()), agentlog.LIST_OUTPUT_MAX)
-        res = json.loads(out)
-        self.assertEqual((res["count"], res["remaining"]), (12, 0))
-        self.assertLess(len(res["items"][0]["preview"]), 15)
+    def test_big_conversation_is_split_into_parts_and_checkers(self):
+        L = Lines()
+        for i in range(400):
+            L.user("指示 %03d " % i + "あ" * 900).assistant("返事 %03d " % i + "い" * 900)
+        self.w.write(L)
+        res = self.w.list()
+        batches = res["items"][0]["review"]
+        files = [f for b in batches for f in b]
+        self.assertGreater(len(files), agentlog.REVIEW_PARTS_PER_CHECKER)          # 大きいので分割
+        self.assertTrue(all(len(b) <= agentlog.REVIEW_PARTS_PER_CHECKER for b in batches))
+        for name in files:
+            with open(os.path.join(res["review_dir"], name), encoding="utf-8") as f:
+                text = f.read()
+            self.assertLessEqual(len(text), agentlog.REVIEW_PART_CHARS + 300)
+            self.assertTrue(all(len(line) <= agentlog.REVIEW_LINE_CHARS for line in text.split("\n")))
+        self.assertEqual(len(self.w.human(1)), 400)
 
 
 class SessionGuardTest(Base):
@@ -375,7 +377,7 @@ class SessionGuardTest(Base):
         L = Lines().user("ふつうの作業").assistant().user(SEND_CMD).user("スキル本文", isMeta=True)
         self.w.write(L, project=World.SEND_PROJECT)
         self.w.write(Lines().user("ほかの会話").assistant())
-        for argv in (["status"], ["list", "--preview"], ["send", "--exclude", "none"]):
+        for argv in (["status"], ["list"], ["send", "--exclude", "none"]):
             code, out, err = self.w.run(*argv, session=L.sid)
             self.assertEqual(code, agentlog.EXIT_NOT_SEND_SESSION, argv)
             self.assertEqual(out, "")
@@ -554,7 +556,7 @@ class RoundTest(Base):
         older = [Lines(base=now - 99000 + i * 10).user("古い単独 %d" % i).assistant() for i in range(3)]
         for L in group + older:
             self.w.write(L)
-        code, out, err = self.w.run("list", "--preview")
+        code, out, err = self.w.run("list")
         self.assertEqual(code, 0, err)
         self.assertLessEqual(len(out.strip()), agentlog.LIST_OUTPUT_MAX)
         r1 = json.loads(out)
@@ -576,7 +578,7 @@ class RoundTest(Base):
         saved = agentlog.LIST_OUTPUT_MAX
         agentlog.LIST_OUTPUT_MAX = 700      # 短い行でも全部は入らない
         try:
-            code, out, err = self.w.run("list", "--preview")
+            code, out, err = self.w.run("list")
         finally:
             agentlog.LIST_OUTPUT_MAX = saved
         self.assertEqual(code, 0, err)
@@ -601,7 +603,7 @@ class RoundTest(Base):
         saved = agentlog.LIST_OUTPUT_MAX
         agentlog.LIST_OUTPUT_MAX = 6000     # 抜粋 0 でも入らないが、短い行なら全部入る
         try:
-            code, out, err = self.w.run("list", "--preview")
+            code, out, err = self.w.run("list")
         finally:
             agentlog.LIST_OUTPUT_MAX = saved
         r1 = json.loads(out)
@@ -639,7 +641,7 @@ class DecisionTest(Base):
         it = self.w.list()["items"][0]
         self.assertTrue(it["previously_excluded"])
         self.assertTrue(it["default_excluded"])
-        self.assertEqual(it["prompts"], 2)
+        self.assertEqual(self.w.human(1), ["指示", "続き"])
 
     def test_excluded_copy_flag(self):
         a = Lines().user("外したい相談").assistant().user("続き").assistant()
@@ -670,7 +672,7 @@ class DecisionTest(Base):
         self.w.subagent(path, "agent-b2.jsonl", Lines().user("サブ 2").assistant())
         self.w.append(path, Lines(sid=L.sid).meta("last-prompt", lastPrompt="x"), mtime=time.time() + 5)
         it = self.w.list()["items"][0]
-        self.assertEqual(it["subagent_files"], 2)
+        self.assertEqual(self.w.pending()["items"][0]["sub_n"], 2)
 
     def test_nothing_sent_records_exclusion(self):
         L = Lines().user("指示").assistant()
