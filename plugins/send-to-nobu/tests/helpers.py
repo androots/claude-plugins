@@ -2,6 +2,7 @@
 """テスト用の合成フィクスチャと、契約どおりに振る舞う偽サーバー。
 
 本物の会話ログは使わない。行の形（キー名・type・origin.kind など）だけを実データに合わせてある。
+テスト用の差し替え（会話ログの場所・いまの時刻・送り先）は CLI ではなくモジュールの変数で行う。
 """
 
 import datetime
@@ -25,6 +26,14 @@ import agentlog  # noqa: E402
 
 HOME = os.path.expanduser("~")
 CWD = os.path.join(HOME, "work", "billing")
+SEND_CMD = "<command-message>send-to-nobu</command-message>\n<command-name>/send-to-nobu</command-name>"
+SEND_CMD_NS = ("<command-message>send-to-nobu:send-to-nobu</command-message>\n"
+               "<command-name>/send-to-nobu:send-to-nobu</command-name>")
+
+
+def send_cmd(args=""):
+    """/send-to-nobu の行（引数があれば <command-args> 付き）。"""
+    return SEND_CMD + ("\n<command-args>%s</command-args>" % args if args else "")
 
 
 def iso(ts):
@@ -35,13 +44,19 @@ def new_uuid():
     return str(uuidlib.uuid4())
 
 
+def read_bytes(path):
+    with open(path, "rb") as f:
+        return f.read()
+
+
 class Lines(object):
     """会話 1 本ぶんの行を組み立てる。時刻は base から 1 分ずつ進む（明示もできる）。"""
 
-    def __init__(self, sid=None, base=None, cwd=CWD):
+    def __init__(self, sid=None, base=None, cwd=CWD, entrypoint="cli"):
         self.sid = sid or new_uuid()
         self.base = base if base is not None else time.time() - 3600
         self.cwd = cwd
+        self.entrypoint = entrypoint
         self.rows = []
         self.parent = None
         self.tick = 0
@@ -56,7 +71,7 @@ class Lines(object):
         uid = uid or new_uuid()
         row = {"parentUuid": self.parent, "isSidechain": False, "type": typ,
                "message": {"role": typ, "content": content}, "uuid": uid, "timestamp": self._ts(at),
-               "userType": "external", "entrypoint": "cli", "cwd": self.cwd, "sessionId": self.sid,
+               "userType": "external", "entrypoint": self.entrypoint, "cwd": self.cwd, "sessionId": self.sid,
                "version": "2.1.283", "gitBranch": "main"}
         row.update(extra)
         self.rows.append(row)
@@ -71,6 +86,11 @@ class Lines(object):
 
     def assistant(self, text="了解", **kw):
         return self._msg("assistant", [{"type": "text", "text": text}], **kw)
+
+    def bash(self, command, **kw):
+        """assistant が Bash ツールを呼んだ行。"""
+        return self._msg("assistant", [{"type": "tool_use", "id": "toolu_" + new_uuid()[:8], "name": "Bash",
+                                        "input": {"command": command}}], **kw)
 
     def tool_result(self, text="ok", **kw):
         return self._msg("user", [{"type": "tool_result", "tool_use_id": "toolu_1", "content": text}],
@@ -111,16 +131,24 @@ class Lines(object):
 
 
 class World(object):
-    """一時ディレクトリに projects/ とデータディレクトリを作り、CLI を中で呼ぶ。"""
+    """一時ディレクトリに projects/ とデータディレクトリを作り、CLI を中で呼ぶ。
+
+    いまの会話（self.current）は「最初の指示が /send-to-nobu」の会話として projects/ に置く。
+    """
+
+    SEND_PROJECT = "-Users-alice"
 
     def __init__(self):
         self.tmp = tempfile.mkdtemp(prefix="stn-test-")
         self.projects = os.path.join(self.tmp, "projects")
         self.data = os.path.join(self.tmp, "send-to-nobu-data")
-        self.current = new_uuid()
         os.makedirs(self.projects)
+        self.saved_projects = agentlog.PROJECTS_DIR
+        agentlog.PROJECTS_DIR = self.projects
+        self.current = self.start_send_session()
 
     def close(self):
+        agentlog.PROJECTS_DIR = self.saved_projects
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def project_dir(self, name="-Users-alice-work-billing"):
@@ -151,16 +179,44 @@ class World(object):
             f.write(data)
         return p
 
-    def run(self, *argv, stdin="", session=None, now=None):
-        argv = list(argv) + ["--data-dir", self.data, "--projects-dir", self.projects]
-        if session is not None:
-            argv += ["--session", session]
-        if argv[0] in ("status", "list", "send") and "--session" not in argv:
-            argv += ["--session", self.current]
+    def start_send_session(self):
+        """新しい会話で /send-to-nobu を打った状態を作る。会話 ID を返す。"""
+        L = Lines(base=time.time() - 120).user(send_cmd()).user("スキル本文", isMeta=True).assistant("確認する")
+        self.write(L, project=self.SEND_PROJECT)
+        return L.sid
+
+    def session_file(self, sid=None):
+        return os.path.join(self.projects, self.SEND_PROJECT, (sid or self.current) + ".jsonl")
+
+    def reply(self, text="なし", sid=None, plain=False):
+        """本人の返事を、いまの会話に足す（既定は /send-to-nobu <返事> の形）。"""
+        path = self.session_file(sid)
+        if os.path.exists(path):
+            self.append(path, Lines(sid=sid or self.current).user(text if plain else send_cmd(text)))
+
+    def run(self, *argv, stdin="", session=None, now=None, reply=True):
+        """CLI をこのプロセスの中で呼ぶ。会話 ID は env だけ、時刻は agentlog._now の差し替え。"""
+        argv = list(argv) + ["--data-dir", self.data]
+        sid = self.current if session is None else session
+        if argv[0] == "send" and reply and sid:
+            self.reply("返事", sid=sid)
+        saved_env = os.environ.get("CLAUDE_CODE_SESSION_ID")
+        saved_now = agentlog._now
+        if sid:
+            os.environ["CLAUDE_CODE_SESSION_ID"] = sid
+        else:
+            os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
         if now is not None:
-            argv += ["--now", str(now)]
+            agentlog._now = lambda: now
         out, err = io.StringIO(), io.StringIO()
-        code = agentlog.main(argv, stdin=io.StringIO(stdin), stdout=out, stderr=err)
+        try:
+            code = agentlog.main(argv, stdin=io.StringIO(stdin), stdout=out, stderr=err)
+        finally:
+            agentlog._now = saved_now
+            if saved_env is None:
+                os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+            else:
+                os.environ["CLAUDE_CODE_SESSION_ID"] = saved_env
         return code, out.getvalue(), err.getvalue()
 
     def list(self, preview=True, **kw):
@@ -186,17 +242,21 @@ class FakeInbox(object):
     CODE = "abcdefghijklmnopqrstuvwxyz"
 
     def __init__(self):
-        self.objects = {}          # object -> {"body", "sha256", "content_type"}
+        self.objects = {}          # object -> {"body", "sha256"}
         self.issued = {}           # token -> {"object", "headers"}
         self.upload_batches = []   # 1 回の /v1/uploads で来た件数
+        self.upload_calls = 0
+        self.uploads_status = None  # 例: (400, "invalid_argument")
+        self.uploads_redirect = False
+        self.put_url_base = None   # 署名 URL の先頭を差し替える（許可されていない先を返す試験）
         self.put_attempts = {}     # object -> 回数
-        self.fail_put = {}         # object の rel/sid を含む文字列 -> 先頭何回 503 にするか
+        self.put_delay = 0.0
+        self.fail_put = {}         # object に含まれる文字列 -> 先頭何回 503 にするか
         self.forbid_put = set()    # ここに含まれる文字列を持つ object は 403
         self.finish_bodies = []
         self.finish_lose_first = False
-        self.uploads_status = None   # 例: (400, "invalid_argument")
-        self.upload_calls = 0
         self.finished = False
+        self.redirect_hits = 0
         self.lock = threading.Lock()
         inbox = self
 
@@ -213,7 +273,10 @@ class FakeInbox(object):
                 self.wfile.write(data)
 
             def _err(self, status, code, details=None):
-                self._json(status, {"error": {"code": code, "message": "テスト用のエラー", "details": details or []}})
+                body = {"error": {"code": code, "message": "テスト用のエラー"}}
+                if details:
+                    body["error"]["details"] = details
+                self._json(status, body)
 
             def _body(self):
                 n = int(self.headers.get("Content-Length") or 0)
@@ -221,11 +284,20 @@ class FakeInbox(object):
 
             def do_POST(self):
                 body = self._body()
+                if self.path.startswith("/elsewhere"):
+                    inbox.redirect_hits += 1
+                    return self._json(200, {"uploads": []})
                 if self.headers.get("Authorization") != "Bearer " + inbox.CODE:
                     return self._err(401, "unauthorized")
                 req = json.loads(body.decode())
                 if self.path == "/v1/uploads":
                     inbox.upload_calls += 1
+                    if inbox.uploads_redirect:
+                        self.send_response(307)
+                        self.send_header("Location", "http://127.0.0.1:%d/elsewhere" % inbox.port)
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
                     if inbox.uploads_status:
                         return self._err(*inbox.uploads_status)
                     return self._uploads(req)
@@ -235,7 +307,7 @@ class FakeInbox(object):
 
             def _uploads(self, req):
                 files = req.get("files") or []
-                if len(files) > 200:
+                if len(files) > 200 or any(set(f) != {"session_id", "rel", "bytes", "sha256"} for f in files):
                     return self._err(400, "invalid_argument")
                 inbox.upload_batches.append(len(files))
                 out = []
@@ -247,14 +319,16 @@ class FakeInbox(object):
                                "x-goog-content-length-range": "%d,%d" % (f["bytes"], f["bytes"])}
                     with inbox.lock:
                         inbox.issued[token] = {"object": obj, "headers": headers}
+                    base = inbox.put_url_base or "http://127.0.0.1:%d" % inbox.port
                     out.append({"session_id": f["session_id"], "rel": f["rel"], "object": obj, "method": "PUT",
-                                "url": "http://127.0.0.1:%d/put/%s?X-Goog-Signature=x" % (inbox.port, token),
-                                "headers": headers})
+                                "url": "%s/put/%s?X-Goog-Signature=x" % (base, token), "headers": headers})
                 self._json(200, {"uploads": out})
 
             def do_PUT(self):
                 token = self.path.split("/put/", 1)[-1].split("?", 1)[0]
                 body = self._body()
+                if inbox.put_delay:
+                    time.sleep(inbox.put_delay)
                 with inbox.lock:
                     issued = inbox.issued.get(token)
                 if not issued:
@@ -283,6 +357,8 @@ class FakeInbox(object):
             def _finish(self, req):
                 if inbox.finished:
                     return self._err(409, "already_finished")
+                if set(req) != {"sent", "excluded_count", "note", "plugin_version"}:
+                    return self._err(400, "invalid_argument")
                 sent = req.get("sent") or []
                 if not sent and not req.get("note"):
                     return self._err(400, "invalid_argument")
@@ -319,3 +395,19 @@ class FakeInbox(object):
 
     def object_lines(self, obj):
         return gzip.decompress(self.objects[obj]["body"])
+
+
+class Patched(object):
+    """偽サーバー向けに agentlog の送り先・待ち時間・通信を差し替える（テストコードからだけ）。"""
+
+    def __init__(self, inbox):
+        self.saved = (agentlog.ALLOWED_API_BASES, agentlog.ALLOWED_PUT_PREFIXES, agentlog.BACKOFF_BASE,
+                      agentlog._OPENER)
+        agentlog.ALLOWED_API_BASES = (inbox.base,)
+        agentlog.ALLOWED_PUT_PREFIXES = (inbox.base + "/put/",)
+        agentlog.BACKOFF_BASE = 0.001
+        agentlog._OPENER = agentlog.build_opener(use_proxy=False)  # OS のプロキシ設定を使わない
+
+    def restore(self):
+        (agentlog.ALLOWED_API_BASES, agentlog.ALLOWED_PUT_PREFIXES, agentlog.BACKOFF_BASE,
+         agentlog._OPENER) = self.saved

@@ -10,6 +10,9 @@ python3 3.9 の標準ライブラリだけで動く（macOS の /usr/bin/python3
   list   未送信の会話の一覧を出し、控えを保存する（--preview で人の指示の抜粋）
   send   控えに沿って、画像の base64 を外す → 秘密を伏せる → gzip → 引換券でアップロード → 送信票
 
+status / list / send は「いまの会話の最初の人の指示が /send-to-nobu」の会話でしか動かない。
+いまの会話 ID は env の CLAUDE_CODE_SESSION_ID だけから取る。
+
 出力は AI が読む前提の短い JSON（stdout）。エラーは stderr に 1 行 + 非 0 終了。
 本物の会話本文を stdout に出すのは `list --preview` のマスク済み抜粋だけ。
 """
@@ -25,6 +28,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import ssl
 import stat
 import sys
@@ -47,13 +51,13 @@ DAY_START_HOUR = 6          # nudge の日の区切り（ローカル時刻）
 PENDING_TTL = 6 * 3600      # 一覧の控えの有効期限
 HEAD_LINES = 200            # 分岐コピーの判定に使う先頭の行数
 PREVIEW_MAX = 15            # 1 会話あたりの抜粋の最大数
+PREVIEW_LEVELS = (15, 10, 6, 3, 1)  # 出力が大きいときは抜粋をこの順に減らす
 PREVIEW_CHARS = 160         # 抜粋 1 つの最大文字数
-PREVIEW_BUDGET = 24000      # 一覧全体の抜粋の文字数の目安（会話が多い日は 1 会話あたりを減らす）
+LIST_OUTPUT_MAX = 20000     # 一覧の出力全体の上限（Bash ツールの 30,000 文字で切れないように）
 TITLE_FALLBACK_CHARS = 40
 TITLE_MAX = 200
 PROJECT_MAX = 300
 NOTE_MAX = 20000
-NUDGE_HEAD_BYTES = 1024 * 1024  # nudge が「送信用の会話か」を見るために読む先頭の量
 NUDGE_TAIL_BYTES = 256 * 1024
 
 UPLOAD_BATCH = 100
@@ -61,14 +65,21 @@ PUT_WORKERS = 4
 RETRIES = 3                 # 最初の 1 回 + リトライ 3 回
 BACKOFF_BASE = 1.0          # 1, 2, 4 秒（テストでは小さくする）
 RETRYABLE_PUT_STATUS = {408, 429}
+GZIP_LEVEL = 6
+
 # 送り先はこれだけ（引数や env では広げられない。テストはコードから差し替える）
 ALLOWED_API_BASES = ("https://agent-log-inbox-mcp.androots.co.jp",)
-GZIP_LEVEL = 6
+ALLOWED_PUT_PREFIXES = ("https://storage.googleapis.com/",)
+
+# 会話ログの場所。None なら $CLAUDE_CONFIG_DIR/projects か ~/.claude/projects（テストはコードから差し替える）
+PROJECTS_DIR = None
 
 EXIT_ERROR = 1
 EXIT_USAGE = 2
 EXIT_CONFIRM_SHARED = 3
 EXIT_UNAUTHORIZED = 4
+EXIT_NOT_ANSWERED = 5
+EXIT_NOT_SEND_SESSION = 6
 
 
 class Fail(Exception):
@@ -78,6 +89,11 @@ class Fail(Exception):
         super().__init__(message)
         self.message = message
         self.code = code
+
+
+def _now():
+    """いまの時刻（テストで差し替える）。"""
+    return time.time()
 
 
 # ---------------------------------------------------------------- 時刻・入出力
@@ -98,9 +114,7 @@ def parse_ts(value):
         frac = float("0." + m.group(1))
         rest = rest[m.end():]
     offset = 0
-    if rest in ("", "Z", "z"):
-        pass
-    else:
+    if rest not in ("", "Z", "z"):
         m = re.match(r"^([+-])(\d{2}):?(\d{2})$", rest)
         if not m:
             return None
@@ -173,27 +187,30 @@ def plugin_version():
     return v if isinstance(v, str) else "0.0.0"
 
 
-def projects_dir(override=None):
-    if override:
-        return override
+def projects_dir():
+    if PROJECTS_DIR:
+        return PROJECTS_DIR
     base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
     return os.path.join(base, "projects")
 
 
 def resolve_data_dir(arg):
-    """データディレクトリは --data-dir で受け取る。env の CLAUDE_PLUGIN_DATA は読まない
-    （Bash ツールの env には他プラグインの値が漏れていることがある）。"""
-    if not arg:
-        return os.path.join(os.path.expanduser("~"), ".claude", "send-to-nobu")
-    path = os.path.abspath(os.path.expanduser(arg))
+    """データディレクトリは --data-dir で受け取る（スキルとフックが ${CLAUDE_PLUGIN_DATA} を渡す）。
+    env の CLAUDE_PLUGIN_DATA は読まない（Bash ツールの env には他プラグインの値が漏れていることがある）。"""
+    if not arg or not arg.strip():
+        raise Fail("--data-dir がない", EXIT_USAGE)
+    path = os.path.abspath(os.path.expanduser(arg.strip()))
     # 置換されずに他プラグインのディレクトリを指したときに、そこへ書かないための歯止め
     if "send-to-nobu" not in os.path.basename(path.rstrip(os.sep)):
         raise Fail("--data-dir がこのプラグインのディレクトリではない: %s" % os.path.basename(path), EXIT_USAGE)
     return path
 
 
-def current_session(arg):
-    return arg or os.environ.get("CLAUDE_CODE_SESSION_ID") or None
+def session_id_from_env():
+    sid = (os.environ.get("CLAUDE_CODE_SESSION_ID") or "").strip()
+    if not sid:
+        raise Fail("いまの会話 ID（CLAUDE_CODE_SESSION_ID）が無い。Claude Code の中で /send-to-nobu から使って", EXIT_USAGE)
+    return sid
 
 
 def home_short(path):
@@ -205,6 +222,79 @@ def home_short(path):
     if path.startswith(home + os.sep):
         return "~" + path[len(home):]
     return path
+
+
+# ---------------------------------------------------------------- ファイルを安全に開く
+
+
+def open_nofollow(path):
+    """シンボリックリンクを追わずに、ふつうのファイルだけを開く。"""
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("not a regular file: %s" % os.path.basename(path))
+        return os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _real_projects():
+    return os.path.realpath(projects_dir())
+
+
+def check_main_path(path, sid):
+    """会話ファイルが projects/<dir>/<sid>.jsonl そのもの（途中にリンクが無い・ふつうのファイル）か。"""
+    if not isinstance(path, str) or not UUID_RE.match(sid or ""):
+        raise Fail("会話の控えが壊れている。/send-to-nobu で一覧を出し直して")
+    name = os.path.basename(path)
+    proj = os.path.basename(os.path.dirname(path))
+    expected = os.path.join(_real_projects(), proj, name)
+    try:
+        st = os.lstat(path)
+    except OSError:
+        raise Fail("会話ファイルが見つからない。/send-to-nobu で一覧を出し直して")
+    if name != sid + ".jsonl" or os.path.realpath(path) != expected or not stat.S_ISREG(st.st_mode):
+        raise Fail("会話ファイルの場所がおかしい（リンクなど）ので送らない")
+    return expected
+
+
+def session_dir_of(main_path):
+    """会話ディレクトリ <sid>/。リンクや projects の外なら None。"""
+    d = main_path[:-len(".jsonl")]
+    try:
+        st = os.lstat(d)
+    except OSError:
+        return None
+    if not stat.S_ISDIR(st.st_mode):
+        return None
+    if os.path.realpath(d) != os.path.join(os.path.realpath(os.path.dirname(main_path)), os.path.basename(d)):
+        return None
+    return d
+
+
+def check_rel(rel):
+    segs = rel.split("/") if isinstance(rel, str) else []
+    if (not segs or len(segs) > MAX_REL_DEPTH or any(not SEG_RE.match(s) or s in (".", "..") for s in segs)
+            or not (rel.endswith(".jsonl") or rel.endswith(".json"))):
+        return None
+    return segs
+
+
+def sub_path(session_dir, rel):
+    """サブエージェントのファイル。途中にリンクが無い・ふつうのファイルのときだけパスを返す。"""
+    segs = check_rel(rel)
+    if session_dir is None or segs is None:
+        return None
+    p = os.path.join(session_dir, "subagents", *segs)
+    expected = os.path.join(os.path.realpath(session_dir), "subagents", *segs)
+    try:
+        st = os.lstat(p)
+    except OSError:
+        return None
+    if not stat.S_ISREG(st.st_mode) or os.path.realpath(p) != expected:
+        return None
+    return p
 
 
 # ---------------------------------------------------------------- 秘密のマスク
@@ -337,6 +427,13 @@ def _is_json(raw):
         return False
 
 
+def _dumps_line(obj):
+    try:
+        return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    except UnicodeEncodeError:  # 対になっていないサロゲートは \u エスケープで書く
+        return json.dumps(obj, separators=(",", ":")).encode("ascii")
+
+
 def mask_blob(raw):
     """JSON 1 つぶん（JSONL の 1 行、または .json ファイル全体）の秘密を伏せる。
 
@@ -356,557 +453,10 @@ def mask_blob(raw):
     obj = _loads_lenient(body)
     counts = {}
     obj = _mask_obj(obj, counts)
-    return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + ending, counts
+    return _dumps_line(obj) + ending, counts
 
 
-# ---------------------------------------------------------------- 会話の読み方
-
-
-def parse_line(raw):
-    """JSONL の 1 行 → dict。読めない行は None。"""
-    try:
-        d = _loads_lenient(raw)
-    except ValueError:
-        return None
-    return d if isinstance(d, dict) else None
-
-
-_SEND_CMD_RE = re.compile(r"<command-name>/?send-to-nobu(?::send-to-nobu)?</command-name>")
-_SR_PREFIX_RE = re.compile(r"^\s*(?:<system-reminder>.*?</system-reminder>\s*)+", re.S)
-_NOT_HUMAN_PREFIXES = (
-    "[Request interrupted by user",
-    "<task-notification>",
-    "<bash-stdout>",
-    "<bash-stderr>",
-    "<local-command-stdout>",
-    "<local-command-stderr>",
-)
-_LOCAL_STDOUT_PREFIXES = ("<local-command-stdout>", "<local-command-stderr>")
-
-
-def user_text(d):
-    """user 行のテキスト。テキストが無い（tool_result だけ・画像だけ）なら None。"""
-    m = d.get("message")
-    if not isinstance(m, dict):
-        return None
-    c = m.get("content")
-    if isinstance(c, str):
-        return c
-    if isinstance(c, list):
-        parts = [b.get("text") for b in c
-                 if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str)]
-        if parts:
-            return "\n".join(parts)
-    return None
-
-
-def classify(d):
-    """メインの会話の user 行を分類する。
-
-    戻り値 (種類, テキスト)。種類は
-      send  … 送信コマンド（/send-to-nobu）
-      human … 人の指示
-      cmd   … 先頭が <command-name>。次の user 行が <local-command-stdout> なら組み込みコマンド
-      None  … 人の指示ではない
-    """
-    if d.get("type") != "user" or d.get("isSidechain") is True:
-        return None, None
-    text = user_text(d)
-    if text is None:
-        return None, None
-    # 送信コマンドの判定は、ほかの除外より先にやる
-    if _SEND_CMD_RE.search(text):
-        return "send", text
-    if d.get("isMeta") is True or d.get("isCompactSummary") is True:
-        return None, None
-    origin = d.get("origin")
-    if isinstance(origin, dict) and origin.get("kind") not in (None, "human"):
-        return None, None
-    t = text
-    if t.lstrip().startswith("<system-reminder>"):
-        t = _SR_PREFIX_RE.sub("", t, count=1)
-    t = t.strip()
-    if not t or t.startswith(_NOT_HUMAN_PREFIXES):
-        return None, None
-    if t.startswith("<command-name>"):
-        return "cmd", t
-    return "human", t
-
-
-def _is_local_stdout(d):
-    t = user_text(d)
-    return isinstance(t, str) and t.lstrip().startswith(_LOCAL_STDOUT_PREFIXES)
-
-
-_TAG_RE = {
-    name: re.compile(r"<%s>(.*?)</%s>" % (name, name), re.S)
-    for name in ("command-name", "command-args", "bash-input")
-}
-
-
-def display_text(text):
-    """抜粋・タイトル用に整える（スキル呼び出しは `/name 引数` の形に）。マスク前。"""
-    head = text.lstrip()
-    if head.startswith(("<command-message>", "<command-name>")):
-        m = _TAG_RE["command-name"].search(text)
-        if m:
-            a = _TAG_RE["command-args"].search(text)
-            return (m.group(1).strip() + " " + (a.group(1).strip() if a else "")).strip()
-    if head.startswith("<bash-input>"):
-        m = _TAG_RE["bash-input"].search(text)
-        if m:
-            return "!" + m.group(1).strip()
-    return text
-
-
-def squash(text, limit):
-    t = re.sub(r"\s+", " ", text).strip()
-    return t if len(t) <= limit else t[:limit - 1] + "…"
-
-
-class Scan(object):
-    """会話ファイル 1 本を読んだ結果。"""
-
-    def __init__(self):
-        self.prompt_count = 0
-        self.first_prompts = []
-        self.last_prompts = collections.deque(maxlen=PREVIEW_MAX)
-        self.first_kind = None      # 最初に出てきた「人の指示 or 送信コマンド」
-        self.custom_title = None
-        self.ai_title = None
-        self.cwd = None
-        self.last_ts = None         # user / assistant 行の時刻の最大（並べ替えない・切らない）
-        self.uuids = set()
-        self.head_uuids = set()
-        self.end = 0                # 読み終えた位置（書きかけの最終行は含めない）
-
-    def add_prompt(self, text):
-        if self.first_kind is None:
-            self.first_kind = "human"
-        self.prompt_count += 1
-        if len(self.first_prompts) < PREVIEW_MAX:
-            self.first_prompts.append(text)
-        self.last_prompts.append(text)
-
-    def title(self):
-        """最後の custom-title > 最後の ai-title > 最初の人の指示の先頭 40 文字。マスクしてから切る。"""
-        if self.custom_title and self.custom_title.strip():
-            t, limit = self.custom_title, TITLE_MAX
-        elif self.ai_title and self.ai_title.strip():
-            t, limit = self.ai_title, TITLE_MAX
-        elif self.first_prompts:
-            t, limit = display_text(self.first_prompts[0]), TITLE_FALLBACK_CHARS
-        else:
-            return ""
-        return re.sub(r"\s+", " ", mask_text(t)[0]).strip()[:limit]
-
-    def prompts_for_preview(self, limit):
-        """先頭寄り + 末尾寄りで最大 limit 個（並びは会話の順）。"""
-        if self.prompt_count <= limit:
-            return list(self.first_prompts[:self.prompt_count])
-        head = (limit * 2 + 2) // 3
-        tail = limit - head
-        tail_items = list(self.last_prompts)[-tail:] if tail else []
-        return self.first_prompts[:head] + tail_items
-
-
-def scan_session(path, head_bytes=None, stop_at_first=False):
-    """会話ファイルを先頭から読む。head_bytes があればそのくらいまで。"""
-    s = Scan()
-    pending_cmd = None
-    with open(path, "rb") as fh:
-        for i, raw in enumerate(fh):
-            if head_bytes is not None and s.end >= head_bytes:
-                break
-            d = parse_line(raw)
-            if not raw.endswith(b"\n") and d is None:
-                break  # 書きかけの最終行
-            s.end += len(raw)
-            if d is None:
-                continue
-            u = d.get("uuid")
-            if isinstance(u, str):
-                s.uuids.add(u)
-                if i < HEAD_LINES:
-                    s.head_uuids.add(u)
-            t = d.get("type")
-            if t in ("user", "assistant"):
-                ts = parse_ts(d.get("timestamp"))
-                if ts is not None and (s.last_ts is None or ts > s.last_ts):
-                    s.last_ts = ts
-                if s.cwd is None and isinstance(d.get("cwd"), str):
-                    s.cwd = d["cwd"]
-            elif t == "custom-title" and isinstance(d.get("customTitle"), str):
-                s.custom_title = d["customTitle"]
-            elif t == "ai-title" and isinstance(d.get("aiTitle"), str):
-                s.ai_title = d["aiTitle"]
-            if t != "user" or d.get("isSidechain") is True:
-                continue
-            if pending_cmd is not None:
-                if _is_local_stdout(d):
-                    pending_cmd = None  # 組み込みコマンド（/model /mcp など）
-                    continue
-                s.add_prompt(pending_cmd)
-                pending_cmd = None
-            kind, text = classify(d)
-            if kind == "send":
-                if s.first_kind is None:
-                    s.first_kind = "send"
-            elif kind == "cmd":
-                pending_cmd = text
-            elif kind == "human":
-                s.add_prompt(text)
-            if stop_at_first and s.first_kind is not None:
-                return s
-    if pending_cmd is not None:
-        s.add_prompt(pending_cmd)
-    return s
-
-
-def has_turn_after(path, offset):
-    """offset 以降に user / assistant 行があるか（閉じただけで足されたメタ行は数えない）。"""
-    try:
-        size = os.path.getsize(path)
-    except OSError:
-        return False
-    if size < offset:
-        return True  # 書き直された
-    with open(path, "rb") as fh:
-        fh.seek(offset)
-        for raw in fh:
-            if not raw.endswith(b"\n"):
-                break
-            d = parse_line(raw)
-            if d is not None and d.get("type") in ("user", "assistant"):
-                return True
-    return False
-
-
-def tail_last_ts(path, size):
-    """末尾だけ読んで、最後の user / assistant 行の時刻を返す（nudge 用の軽い版）。"""
-    start = max(0, size - NUDGE_TAIL_BYTES)
-    with open(path, "rb") as fh:
-        fh.seek(start)
-        data = fh.read(size - start)
-    lines = data.split(b"\n")
-    if start > 0:
-        lines = lines[1:]
-    best = None
-    for raw in lines:
-        d = parse_line(raw) if raw.strip() else None
-        if d is not None and d.get("type") in ("user", "assistant"):
-            ts = parse_ts(d.get("timestamp"))
-            if ts is not None and (best is None or ts > best):
-                best = ts
-    return best
-
-
-def subagent_files(session_dir):
-    """<session>/subagents/ 以下の送る対象（.jsonl と .json）。[(rel, path, size)]。
-
-    入れ子（workflows/wf_*/…）・.meta.json・journal.jsonl も含む。tool-results/ などは送らない。
-    """
-    root = os.path.join(session_dir, "subagents")
-    out = []
-    if not os.path.isdir(root) or os.path.islink(root):
-        return out
-    for dp, dns, fns in os.walk(root):
-        rel_dir = os.path.relpath(dp, root)
-        parts = [] if rel_dir == "." else rel_dir.split(os.sep)
-        dns[:] = sorted(d for d in dns if SEG_RE.match(d) and d not in (".", "..")
-                        and len(parts) + 2 <= MAX_REL_DEPTH)
-        for fn in sorted(fns):
-            if not (fn.endswith(".jsonl") or fn.endswith(".json")):
-                continue
-            if not SEG_RE.match(fn) or fn in (".", ".."):
-                continue
-            segs = parts + [fn]
-            if len(segs) > MAX_REL_DEPTH:
-                continue
-            p = os.path.join(dp, fn)
-            try:
-                st = os.lstat(p)
-            except OSError:
-                continue
-            if not stat.S_ISREG(st.st_mode):
-                continue
-            out.append(("/".join(segs), p, st.st_size))
-    return out
-
-
-def sub_signature(files):
-    return [len(files), sum(f[2] for f in files)]
-
-
-def iter_sessions(pdir):
-    """projects/*/<uuid>.jsonl を列挙する。同じ会話 ID が複数あれば新しい方。"""
-    found = {}
-    try:
-        projects = list(os.scandir(pdir))
-    except OSError:
-        return []
-    for pe in projects:
-        try:
-            if not pe.is_dir(follow_symlinks=False):
-                continue
-            entries = list(os.scandir(pe.path))
-        except OSError:
-            continue
-        for e in entries:
-            name = e.name
-            if not name.endswith(".jsonl") or not UUID_RE.match(name[:-6]):
-                continue
-            try:
-                st = e.stat(follow_symlinks=False)
-            except OSError:
-                continue
-            if not stat.S_ISREG(st.st_mode):
-                continue
-            sid = name[:-6]
-            if sid not in found or st.st_mtime > found[sid][1].st_mtime:
-                found[sid] = (e.path, st)
-    return [(sid, p, st) for sid, (p, st) in found.items()]
-
-
-def uuid_hash(u):
-    return hashlib.sha256(u.encode("utf-8")).hexdigest()[:12]
-
-
-# ---------------------------------------------------------------- 状態
-
-
-def state_path(data_dir):
-    return os.path.join(data_dir, "state.json")
-
-
-def pending_path(data_dir):
-    return os.path.join(data_dir, "pending.json")
-
-
-def excluded_path(data_dir):
-    return os.path.join(data_dir, "excluded-uuids.json")
-
-
-def load_state(data_dir, now):
-    """状態を読む。無ければ「いま − 7 日」を基準に作って保存する。"""
-    st = read_json(state_path(data_dir), None)
-    if not isinstance(st, dict) or not isinstance(st.get("baseline"), (int, float)):
-        st = {"v": 1, "baseline": now - FIRST_RUN_DAYS * 86400, "sessions": {}}
-        write_json_atomic(state_path(data_dir), st)
-    if not isinstance(st.get("sessions"), dict):
-        st["sessions"] = {}
-    return st
-
-
-def _stat_unchanged(rec, st):
-    return rec.get("size") == st.st_size and rec.get("mtime") == int(st.st_mtime)
-
-
-def candidates(state, pdir, current):
-    """未送信かもしれない会話。(sid, path, stat, 前回の判断 or None)。
-
-    判断済みの会話は「判断時の位置より後ろに user / assistant 行が増えた」か
-    「サブエージェントが増えた」ときだけ。判断していない会話は基準以降に触られたものだけ。
-    """
-    sessions = state["sessions"]
-    baseline = state["baseline"]
-    out = []
-    for sid, path, st in iter_sessions(pdir):
-        if sid == current:
-            continue
-        rec = sessions.get(sid)
-        if isinstance(rec, dict):
-            if _stat_unchanged(rec, st):
-                continue
-            if not has_turn_after(path, int(rec.get("offset", 0))):
-                sig = sub_signature(subagent_files(path[:-len(".jsonl")]))
-                if sig == [rec.get("sub_n", 0), rec.get("sub_bytes", 0)]:
-                    continue
-            out.append((sid, path, st, rec))
-        elif st.st_mtime >= baseline:
-            out.append((sid, path, st, None))
-    return out
-
-
-# ---------------------------------------------------------------- nudge
-
-
-def count_unsent_fast(state, pdir, current):
-    """stat と状態の比較 + 先頭・末尾の少しだけで数える（起動を遅らせない）。"""
-    n = 0
-    for sid, path, st, rec in candidates(state, pdir, current):
-        if rec is not None:
-            n += 1
-            continue
-        s = scan_session(path, head_bytes=NUDGE_HEAD_BYTES, stop_at_first=True)
-        if s.first_kind == "send":
-            continue  # 送信用の会話
-        if s.first_kind is None and s.end < NUDGE_HEAD_BYTES:
-            continue  # 最後まで読んでも人の指示が無い
-        # 先頭で決まらない大きな会話（自動の作業が長く続いてから人の指示が来る等）は数えておく
-        last = tail_last_ts(path, st.st_size)
-        if (last if last is not None else st.st_mtime) < state["baseline"]:
-            continue  # 古い会話を開いて閉じただけ
-        n += 1
-    return n
-
-
-def cmd_nudge(args, out):
-    try:
-        now = args.now if args.now is not None else time.time()
-        data_dir = resolve_data_dir(args.data_dir)
-        state = load_state(data_dir, now)
-        today = day_key(now)
-        if state.get("nudged_day") == today:
-            return 0
-        n = count_unsent_fast(state, projects_dir(args.projects_dir), current_session(None))
-        if n <= 0:
-            return 0
-        msg = "未送信の会話が %d 件 → /send-to-nobu で のぶろう に送れます" % n
-        out.write(json.dumps({"systemMessage": msg}, ensure_ascii=False) + "\n")
-        fresh = read_json(state_path(data_dir), state)
-        if not isinstance(fresh, dict):
-            fresh = state
-        fresh["nudged_day"] = today
-        write_json_atomic(state_path(data_dir), fresh)
-    except Exception:
-        pass  # 起動を邪魔しない
-    return 0
-
-
-# ---------------------------------------------------------------- list
-
-
-def build_list(state, pdir, current, excluded_store):
-    """一覧の中身を作る。(items, scans)。items は控えにそのまま入る形。"""
-    rows = []
-    for sid, path, st, rec in candidates(state, pdir, current):
-        try:
-            s = scan_session(path)
-        except OSError:
-            continue
-        if s.prompt_count == 0 or s.first_kind == "send":
-            continue
-        last = s.last_ts if s.last_ts is not None else st.st_mtime
-        if rec is None and last < state["baseline"]:
-            continue  # 基準より前の会話を開いて閉じただけ
-        subs = subagent_files(path[:-len(".jsonl")])
-        rows.append((last, sid, path, st, rec, s, subs))
-    rows.sort(key=lambda r: (r[0], r[1]))
-
-    # 分岐コピー: 一方の先頭 200 行の uuid が、もう一方のどこかに出てくる
-    head_index = collections.defaultdict(set)
-    for idx, row in enumerate(rows):
-        for u in row[5].head_uuids:
-            head_index[u].add(idx)
-    shares = collections.defaultdict(set)
-    for idx, row in enumerate(rows):
-        for u in row[5].uuids:
-            for other in head_index.get(u, ()):
-                if other != idx:
-                    shares[idx].add(other)
-                    shares[other].add(idx)
-    excluded_hashes = {}
-    for esid, hashes in excluded_store.items():
-        for h in hashes:
-            excluded_hashes.setdefault(h, set()).add(esid)
-
-    items = []
-    for idx, (last, sid, path, st, rec, s, subs) in enumerate(rows):
-        n = idx + 1
-        sig = sub_signature(subs)
-        item = {
-            "n": n,
-            "session_id": sid,
-            "path": path,
-            "offset": s.end,
-            "size": st.st_size,
-            "mtime": int(st.st_mtime),
-            "sub_n": sig[0],
-            "sub_bytes": sig[1],
-            "title": s.title(),
-            "project": squash(mask_text(home_short(s.cwd))[0], PROJECT_MAX),
-            "last_activity": iso_utc(last),
-            "last_ts": last,
-            "prompt_count": s.prompt_count,
-            "total_bytes": st.st_size + sig[1],
-            "shares": sorted(o + 1 for o in shares.get(idx, ())),
-            "previously_excluded": bool(rec and rec.get("d") == "excluded"),
-            "contains_excluded_copy": any(
-                (excluded_hashes.get(uuid_hash(u), set()) - {sid}) for u in s.head_uuids),
-        }
-        items.append(item)
-    return items, [r[5] for r in rows]
-
-
-def cmd_list(args, out):
-    now = args.now if args.now is not None else time.time()
-    data_dir = resolve_data_dir(args.data_dir)
-    state = load_state(data_dir, now)
-    current = current_session(args.session)
-    excluded_store = read_json(excluded_path(data_dir), {})
-    if not isinstance(excluded_store, dict):
-        excluded_store = {}
-    items, scans = build_list(state, projects_dir(args.projects_dir), current, excluded_store)
-
-    pending = {"v": 1, "session": current, "created_at": iso_utc(now), "created_ts": now,
-               "items": [{k: v for k, v in it.items() if k not in ("prompt_count", "total_bytes", "last_ts")}
-                         for it in items]}
-    write_json_atomic(pending_path(data_dir), pending)
-
-    per_item = PREVIEW_MAX
-    if items:
-        per_item = max(3, min(PREVIEW_MAX, PREVIEW_BUDGET // (len(items) * PREVIEW_CHARS)))
-    shown = []
-    for it, s in zip(items, scans):
-        row = {
-            "n": it["n"],
-            "session_id": it["session_id"],
-            "title": it["title"],
-            "project": it["project"],
-            "updated": local_short(it["last_ts"]),
-            "size": human_size(it["total_bytes"]),
-            "prompts": it["prompt_count"],
-        }
-        if it["sub_n"]:
-            row["subagent_files"] = it["sub_n"]
-        if it["previously_excluded"]:
-            row["previously_excluded"] = True
-        if it["contains_excluded_copy"]:
-            row["contains_excluded_copy"] = True
-        if it["shares"]:
-            row["shares_history_with"] = it["shares"]
-        if args.preview:
-            picked = s.prompts_for_preview(per_item)
-            row["preview"] = [squash(mask_text(display_text(t))[0], PREVIEW_CHARS) for t in picked]
-            if s.prompt_count > len(picked):
-                row["preview_omitted"] = s.prompt_count - len(picked)
-        shown.append(row)
-    result = {"count": len(shown), "items": shown}
-    if not state["sessions"]:
-        result["first_run"] = True
-        result["since"] = local_short(state["baseline"])
-    out.write(json.dumps(result, ensure_ascii=False) + "\n")
-    return 0
-
-
-# ---------------------------------------------------------------- pack
-
-
-class _HashWriter(object):
-    """書いたバイト列の sha256 を取りながらファイルに書く。"""
-
-    def __init__(self, fh):
-        self.fh = fh
-        self.h = hashlib.sha256()
-
-    def write(self, b):
-        self.h.update(b)
-        return self.fh.write(b)
-
-    def flush(self):
-        self.fh.flush()
-
+# ---------------------------------------------------------------- 画像・文書の base64 を外す
 
 _MEDIA_TYPE_RE = re.compile(r"^[a-z]+/[A-Za-z0-9.+-]+$")
 _OMITTED_PREFIX = "[OMITTED:"
@@ -968,11 +518,7 @@ def omit_blob(raw):
     _omit_obj(obj, counter)
     if not counter[0]:
         return raw, 0
-    try:
-        out = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    except UnicodeEncodeError:  # 対になっていないサロゲートは \u エスケープで書く
-        out = json.dumps(obj, separators=(",", ":")).encode("ascii")
-    return out + ending, counter[0]
+    return _dumps_line(obj) + ending, counter[0]
 
 
 def transform_blob(raw):
@@ -982,18 +528,739 @@ def transform_blob(raw):
     return line, counts, omitted
 
 
-def pack_jsonl(src, dst):
-    """JSONL を 1 行ずつ変換して gzip（mtime=0 で sha256 を安定させる）。書きかけの最終行は含めない。
+# ---------------------------------------------------------------- 会話の読み方
 
+
+def parse_line(raw):
+    """JSONL の 1 行 → dict。読めない行は None。"""
+    try:
+        d = _loads_lenient(raw)
+    except ValueError:
+        return None
+    return d if isinstance(d, dict) else None
+
+
+_SEND_CMD_RE = re.compile(r"<command-name>/?send-to-nobu(?::send-to-nobu)?</command-name>")
+_SR_PREFIX_RE = re.compile(r"^\s*(?:<system-reminder>.*?</system-reminder>\s*)+", re.S)
+_AGENTLOG_RUN_RE = re.compile(r"agentlog\.py[\"']?\s+(?:list|send)\b")
+_NOT_HUMAN_PREFIXES = (
+    "[Request interrupted by user",
+    "<task-notification>",
+    "<bash-stdout>",
+    "<bash-stderr>",
+    "<local-command-stdout>",
+    "<local-command-stderr>",
+)
+_LOCAL_STDOUT_PREFIXES = ("<local-command-stdout>", "<local-command-stderr>")
+_TAG_RE = {
+    name: re.compile(r"<%s>(.*?)</%s>" % (name, name), re.S)
+    for name in ("command-name", "command-args", "bash-input")
+}
+
+
+def user_text(d):
+    """user 行のテキスト。テキストが無い（tool_result だけ・画像だけ）なら None。"""
+    m = d.get("message")
+    if not isinstance(m, dict):
+        return None
+    c = m.get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        parts = [b.get("text") for b in c
+                 if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str)]
+        if parts:
+            return "\n".join(parts)
+    return None
+
+
+def classify(d):
+    """メインの会話の user 行を分類する。
+
+    戻り値 (種類, テキスト)。種類は
+      send  … 送信コマンド（/send-to-nobu）
+      human … 人の指示
+      cmd   … 先頭が <command-name>。次の user 行が <local-command-stdout> なら組み込みコマンド
+      None  … 人の指示ではない
+    """
+    if d.get("type") != "user" or d.get("isSidechain") is True:
+        return None, None
+    text = user_text(d)
+    if text is None:
+        return None, None
+    # 送信コマンドの判定は、ほかの除外より先にやる
+    if _SEND_CMD_RE.search(text):
+        return "send", text
+    if d.get("isMeta") is True or d.get("isCompactSummary") is True:
+        return None, None
+    origin = d.get("origin")
+    if isinstance(origin, dict) and origin.get("kind") not in (None, "human"):
+        return None, None
+    t = text
+    if t.lstrip().startswith("<system-reminder>"):
+        t = _SR_PREFIX_RE.sub("", t, count=1)
+    t = t.strip()
+    if not t or t.startswith(_NOT_HUMAN_PREFIXES):
+        return None, None
+    if t.startswith("<command-name>"):
+        return "cmd", t
+    return "human", t
+
+
+def _is_local_stdout(d):
+    t = user_text(d)
+    return isinstance(t, str) and t.lstrip().startswith(_LOCAL_STDOUT_PREFIXES)
+
+
+def _command_args(text):
+    m = _TAG_RE["command-args"].search(text or "")
+    return m.group(1).strip() if m else ""
+
+
+def _ran_agentlog(d):
+    """assistant 行が Bash で agentlog.py list / send を実行しているか。"""
+    m = d.get("message")
+    content = m.get("content") if isinstance(m, dict) else None
+    if not isinstance(content, list):
+        return False
+    for b in content:
+        if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") == "Bash":
+            inp = b.get("input")
+            cmd = inp.get("command") if isinstance(inp, dict) else None
+            if isinstance(cmd, str) and _AGENTLOG_RUN_RE.search(cmd):
+                return True
+    return False
+
+
+def display_text(text):
+    """抜粋・タイトル用に整える（スキル呼び出しは `/name 引数` の形に）。マスク前。"""
+    head = text.lstrip()
+    if head.startswith(("<command-message>", "<command-name>")):
+        m = _TAG_RE["command-name"].search(text)
+        if m:
+            return (m.group(1).strip() + " " + _command_args(text)).strip()
+    if head.startswith("<bash-input>"):
+        m = _TAG_RE["bash-input"].search(text)
+        if m:
+            return "!" + m.group(1).strip()
+    return text
+
+
+def squash(text, limit):
+    t = re.sub(r"\s+", " ", text).strip()
+    return t if len(t) <= limit else t[:limit - 1] + "…"
+
+
+class Scan(object):
+    """会話ファイル 1 本を読んだ結果。light なら一覧に出すかの判定に要るものだけ。"""
+
+    def __init__(self, light=False):
+        self.light = light
+        self.prompt_count = 0
+        self.first_prompts = []
+        self.last_prompts = collections.deque(maxlen=PREVIEW_MAX)
+        self.first_kind = None      # 最初に出てきた「人の指示 or 送信コマンド」
+        self.custom_title = None
+        self.ai_title = None
+        self.cwd = None
+        self.last_ts = None         # user / assistant 行の時刻の最大（並べ替えない・切らない）
+        self.uuids = set()
+        self.head_uuids = set()
+        self.end = 0                # 読み終えた位置（書きかけの最終行は含めない）
+        self.ran_agentlog = False   # agentlog.py list / send を実行した跡
+        self.saw_sdk = False        # entrypoint: sdk-cli の行
+        self.saw_other_entry = False
+
+    def add_prompt(self, text):
+        if self.first_kind is None:
+            self.first_kind = "human"
+        self.prompt_count += 1
+        if self.light:
+            return
+        if len(self.first_prompts) < PREVIEW_MAX:
+            self.first_prompts.append(text)
+        self.last_prompts.append(text)
+
+    def facts(self):
+        """一覧に出すかを決める事実（nudge のキャッシュにもそのまま入る）。"""
+        return {"prompts": self.prompt_count, "first": self.first_kind, "agentlog": self.ran_agentlog,
+                "sdk_only": self.saw_sdk and not self.saw_other_entry, "last_ts": self.last_ts}
+
+    def title(self):
+        """最後の custom-title > 最後の ai-title > 最初の人の指示の先頭 40 文字。マスクしてから切る。"""
+        if self.custom_title and self.custom_title.strip():
+            t, limit = self.custom_title, TITLE_MAX
+        elif self.ai_title and self.ai_title.strip():
+            t, limit = self.ai_title, TITLE_MAX
+        elif self.first_prompts:
+            t, limit = display_text(self.first_prompts[0]), TITLE_FALLBACK_CHARS
+        else:
+            return ""
+        return re.sub(r"\s+", " ", mask_text(t)[0]).strip()[:limit]
+
+    def prompts_for_preview(self, limit):
+        """先頭寄り + 末尾寄りで最大 limit 個（並びは会話の順）。"""
+        if limit <= 0:
+            return []
+        if self.prompt_count <= limit:
+            return list(self.first_prompts[:self.prompt_count])
+        head = (limit * 2 + 2) // 3
+        tail = limit - head
+        tail_items = list(self.last_prompts)[-tail:] if tail else []
+        return self.first_prompts[:head] + tail_items
+
+
+def listable(facts, rec, baseline, mtime):
+    """一覧に出す会話か（list と nudge で同じ判定）。"""
+    if not facts["prompts"] or facts["first"] == "send" or facts["agentlog"] or facts["sdk_only"]:
+        return False
+    if rec is None:
+        last = facts["last_ts"] if facts["last_ts"] is not None else mtime
+        if last < baseline:
+            return False  # 基準より前の会話を開いて閉じただけ
+    return True
+
+
+def scan_session(path, light=False, stop_at_first=False):
+    """会話ファイルを先頭から読む。"""
+    s = Scan(light=light)
+    pending_cmd = None
+    with open_nofollow(path) as fh:
+        for i, raw in enumerate(fh):
+            d = parse_line(raw)
+            if not raw.endswith(b"\n") and d is None:
+                break  # 書きかけの最終行
+            s.end += len(raw)
+            if d is None:
+                continue
+            u = d.get("uuid")
+            if not light and isinstance(u, str):
+                s.uuids.add(u)
+                if i < HEAD_LINES:
+                    s.head_uuids.add(u)
+            t = d.get("type")
+            if t in ("user", "assistant"):
+                ts = parse_ts(d.get("timestamp"))
+                if ts is not None and (s.last_ts is None or ts > s.last_ts):
+                    s.last_ts = ts
+                if s.cwd is None and isinstance(d.get("cwd"), str):
+                    s.cwd = d["cwd"]
+                ep = d.get("entrypoint")
+                if ep == "sdk-cli":
+                    s.saw_sdk = True
+                elif isinstance(ep, str):
+                    s.saw_other_entry = True
+                if t == "assistant" and not s.ran_agentlog and _ran_agentlog(d):
+                    s.ran_agentlog = True
+            elif t == "custom-title" and isinstance(d.get("customTitle"), str):
+                s.custom_title = d["customTitle"]
+            elif t == "ai-title" and isinstance(d.get("aiTitle"), str):
+                s.ai_title = d["aiTitle"]
+            if t != "user" or d.get("isSidechain") is True:
+                continue
+            if pending_cmd is not None:
+                if _is_local_stdout(d):
+                    pending_cmd = None  # 組み込みコマンド（/model /mcp など）
+                    continue
+                s.add_prompt(pending_cmd)
+                pending_cmd = None
+            kind, text = classify(d)
+            if kind == "send":
+                if s.first_kind is None:
+                    s.first_kind = "send"
+            elif kind == "cmd":
+                pending_cmd = text
+            elif kind == "human":
+                s.add_prompt(text)
+            if stop_at_first and s.first_kind is not None:
+                return s
+    if pending_cmd is not None:
+        s.add_prompt(pending_cmd)
+    return s
+
+
+def has_turn_after(path, offset):
+    """offset 以降に user / assistant 行があるか（閉じただけで足されたメタ行は数えない）。"""
+    try:
+        with open_nofollow(path) as fh:
+            size = os.fstat(fh.fileno()).st_size
+            if size < offset:
+                return True  # 書き直された
+            fh.seek(offset)
+            for raw in fh:
+                if not raw.endswith(b"\n"):
+                    break
+                d = parse_line(raw)
+                if d is not None and d.get("type") in ("user", "assistant"):
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def reply_after(path, offset):
+    """offset 以降に本人の返事（人の指示、または引数付きの送信コマンド）があるか。"""
+    with open_nofollow(path) as fh:
+        fh.seek(offset)
+        for raw in fh:
+            d = parse_line(raw)
+            if d is None:
+                continue
+            kind, text = classify(d)
+            if kind == "human" or (kind == "send" and _command_args(text)):
+                return True
+    return False
+
+
+def subagent_files(session_dir):
+    """<session>/subagents/ 以下の送る対象（.jsonl と .json）。[(rel, path, size)]。
+
+    入れ子（workflows/wf_*/…）・.meta.json・journal.jsonl も含む。tool-results/ などは送らない。
+    リンクはたどらない。
+    """
+    out = []
+    if session_dir is None:
+        return out
+    root = os.path.join(session_dir, "subagents")
+    try:
+        if not stat.S_ISDIR(os.lstat(root).st_mode):
+            return out
+    except OSError:
+        return out
+    for dp, dns, fns in os.walk(root):
+        rel_dir = os.path.relpath(dp, root)
+        parts = [] if rel_dir == "." else rel_dir.split(os.sep)
+        dns[:] = sorted(d for d in dns if SEG_RE.match(d) and d not in (".", "..")
+                        and not os.path.islink(os.path.join(dp, d)) and len(parts) + 2 <= MAX_REL_DEPTH)
+        for fn in sorted(fns):
+            rel = "/".join(parts + [fn])
+            if check_rel(rel) is None:
+                continue
+            p = os.path.join(dp, fn)
+            try:
+                st = os.lstat(p)
+            except OSError:
+                continue
+            if stat.S_ISREG(st.st_mode):
+                out.append((rel, p, st.st_size))
+    return out
+
+
+def sub_signature(files):
+    return [len(files), sum(f[-1] for f in files)]
+
+
+def iter_sessions(pdir):
+    """projects/*/<uuid>.jsonl を列挙する（リンクは追わない）。同じ会話 ID が複数あれば新しい方。"""
+    found = {}
+    try:
+        projects = list(os.scandir(pdir))
+    except OSError:
+        return []
+    for pe in projects:
+        try:
+            if not pe.is_dir(follow_symlinks=False):
+                continue
+            entries = list(os.scandir(pe.path))
+        except OSError:
+            continue
+        for e in entries:
+            name = e.name
+            if not name.endswith(".jsonl") or not UUID_RE.match(name[:-6]):
+                continue
+            try:
+                st = e.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if not stat.S_ISREG(st.st_mode):
+                continue
+            sid = name[:-6]
+            if sid not in found or st.st_mtime > found[sid][1].st_mtime:
+                found[sid] = (e.path, st)
+    return [(sid, p, st) for sid, (p, st) in found.items()]
+
+
+def find_session_path(sid):
+    """いまの会話のファイル projects/*/<sid>.jsonl。"""
+    pdir = projects_dir()
+    best = None
+    try:
+        projects = list(os.scandir(pdir))
+    except OSError:
+        return None
+    for pe in projects:
+        try:
+            if not pe.is_dir(follow_symlinks=False):
+                continue
+            p = os.path.join(pe.path, sid + ".jsonl")
+            st = os.lstat(p)
+        except OSError:
+            continue
+        if stat.S_ISREG(st.st_mode) and (best is None or st.st_mtime > best[1]):
+            best = (p, st.st_mtime)
+    return best[0] if best else None
+
+
+def require_send_session(sid):
+    """いまの会話の最初の人の指示が /send-to-nobu であること（普通の会話の途中では使わせない）。"""
+    path = find_session_path(sid)
+    s = scan_session(path, light=True, stop_at_first=True) if path else None
+    if s is None or s.first_kind != "send":
+        raise Fail("この会話では使えない。新しい会話を始めて、最初に /send-to-nobu と打ってね", EXIT_NOT_SEND_SESSION)
+    return path
+
+
+def uuid_hash(u):
+    return hashlib.sha256(u.encode("utf-8")).hexdigest()[:12]
+
+
+# ---------------------------------------------------------------- 状態
+
+
+def state_path(data_dir):
+    return os.path.join(data_dir, "state.json")
+
+
+def pending_path(data_dir):
+    return os.path.join(data_dir, "pending.json")
+
+
+def excluded_path(data_dir):
+    return os.path.join(data_dir, "excluded-uuids.json")
+
+
+def cache_path(data_dir):
+    return os.path.join(data_dir, "scan-cache.json")
+
+
+def load_state(data_dir, now):
+    """状態を読む。無ければ「いま − 7 日」を基準に作る。あるのに読めなければ失敗（黙って作り直さない）。"""
+    path = state_path(data_dir)
+    if not os.path.lexists(path):
+        st = {"v": 1, "baseline": now - FIRST_RUN_DAYS * 86400, "sessions": {}}
+        write_json_atomic(path, st)
+        return st
+    st = read_json(path, None)
+    if (not isinstance(st, dict) or not isinstance(st.get("baseline"), (int, float))
+            or not isinstance(st.get("sessions"), dict)):
+        raise Fail("状態ファイル（state.json）が読めない。消さずに のぶろう に知らせて")
+    return st
+
+
+def load_excluded_store(data_dir):
+    path = excluded_path(data_dir)
+    if not os.path.lexists(path):
+        return {}
+    store = read_json(path, None)
+    if not isinstance(store, dict):
+        raise Fail("外した会話の記録（excluded-uuids.json）が読めない。消さずに のぶろう に知らせて")
+    return store
+
+
+def load_cache(data_dir):
+    c = read_json(cache_path(data_dir), {})
+    return c if isinstance(c, dict) else {}
+
+
+def _stat_unchanged(rec, st):
+    return rec.get("size") == st.st_size and rec.get("mtime") == int(st.st_mtime)
+
+
+def candidates(state, pdir, current):
+    """未送信かもしれない会話。(sid, path, stat, 前回の判断 or None)。
+
+    判断済みの会話は「判断時の位置より後ろに user / assistant 行が増えた」か
+    「サブエージェントが増えた」ときだけ。判断していない会話は基準以降に触られたものだけ。
+    """
+    sessions = state["sessions"]
+    baseline = state["baseline"]
+    out = []
+    for sid, path, st in iter_sessions(pdir):
+        if sid == current:
+            continue
+        rec = sessions.get(sid)
+        if isinstance(rec, dict):
+            if _stat_unchanged(rec, st):
+                continue
+            if not has_turn_after(path, int(rec.get("offset", 0))):
+                sig = sub_signature(subagent_files(session_dir_of(path)))
+                if sig == [rec.get("sub_n", 0), rec.get("sub_bytes", 0)]:
+                    continue
+            out.append((sid, path, st, rec))
+        elif st.st_mtime >= baseline:
+            out.append((sid, path, st, None))
+    return out
+
+
+def cached_facts(cache, sid, path, st):
+    """(size, mtime) が同じならキャッシュの事実を使う。違えば読み直してキャッシュを更新する。"""
+    c = cache.get(sid)
+    if isinstance(c, dict) and c.get("size") == st.st_size and c.get("mtime") == int(st.st_mtime) \
+            and isinstance(c.get("facts"), dict):
+        return c["facts"]
+    facts = scan_session(path, light=True).facts()
+    cache[sid] = {"size": st.st_size, "mtime": int(st.st_mtime), "facts": facts}
+    return facts
+
+
+# ---------------------------------------------------------------- nudge
+
+
+def cmd_nudge(args, out):
+    try:
+        if not args.data_dir or not args.data_dir.strip():
+            return 0  # 置換されなかった。~/.claude などに落ちない
+        data_dir = resolve_data_dir(args.data_dir)
+        now = _now()
+        state = load_state(data_dir, now)
+        today = day_key(now)
+        if state.get("nudged_day") == today:
+            return 0
+        current = (os.environ.get("CLAUDE_CODE_SESSION_ID") or "").strip() or None
+        old_cache = load_cache(data_dir)
+        cache = {}
+        n = 0
+        for sid, path, st, rec in candidates(state, projects_dir(), current):
+            if sid in old_cache:
+                cache[sid] = old_cache[sid]
+            try:
+                facts = cached_facts(cache, sid, path, st)
+            except OSError:
+                continue
+            if listable(facts, rec, state["baseline"], st.st_mtime):
+                n += 1
+        if cache != old_cache:
+            write_json_atomic(cache_path(data_dir), cache)
+        if n <= 0:
+            return 0
+        msg = "未送信の会話が %d 件 → 新しい会話で /send-to-nobu と打つと のぶろう に送れます" % n
+        out.write(json.dumps({"systemMessage": msg}, ensure_ascii=False) + "\n")
+        fresh = read_json(state_path(data_dir), None)
+        if isinstance(fresh, dict):
+            fresh["nudged_day"] = today
+            write_json_atomic(state_path(data_dir), fresh)
+    except Exception:
+        pass  # 起動を邪魔しない
+    return 0
+
+
+# ---------------------------------------------------------------- status
+
+
+def valid_pending(data_dir, current, now):
+    """同じ会話 ID・6 時間以内の一覧の控え。無ければ None。"""
+    p = read_json(pending_path(data_dir), None)
+    if not isinstance(p, dict) or not isinstance(p.get("items"), list) or p.get("session") != current:
+        return None
+    created = p.get("created_ts")
+    if not isinstance(created, (int, float)) or now - created > PENDING_TTL or now < created - 300:
+        return None
+    return p
+
+
+def cmd_status(args, out):
+    data_dir = resolve_data_dir(args.data_dir)
+    sid = session_id_from_env()
+    require_send_session(sid)
+    p = valid_pending(data_dir, sid, _now())
+    out.write(json.dumps({"pending": True, "count": len(p["items"])} if p else {"pending": False}) + "\n")
+    return 0
+
+
+# ---------------------------------------------------------------- list
+
+
+def build_list(state, current, excluded_store, cache):
+    """一覧に出せる会話をすべて集める（古い順）。(items, scans)。"""
+    rows = []
+    for sid, path, st, rec in candidates(state, projects_dir(), current):
+        try:
+            s = scan_session(path)
+        except OSError:
+            continue
+        facts = s.facts()
+        cache[sid] = {"size": st.st_size, "mtime": int(st.st_mtime), "facts": facts}
+        if not listable(facts, rec, state["baseline"], st.st_mtime):
+            continue
+        last = s.last_ts if s.last_ts is not None else st.st_mtime
+        subs = subagent_files(session_dir_of(path))
+        rows.append((last, sid, path, st, rec, s, subs))
+    rows.sort(key=lambda r: (r[0], r[1]))
+
+    # 分岐コピー: 一方の先頭 200 行の uuid が、もう一方のどこかに出てくる
+    head_index = collections.defaultdict(set)
+    for idx, row in enumerate(rows):
+        for u in row[5].head_uuids:
+            head_index[u].add(idx)
+    shares = collections.defaultdict(set)
+    for idx, row in enumerate(rows):
+        for u in row[5].uuids:
+            for other in head_index.get(u, ()):
+                if other != idx:
+                    shares[idx].add(other)
+                    shares[other].add(idx)
+    excluded_hashes = {}
+    for esid, hashes in excluded_store.items():
+        for h in (hashes if isinstance(hashes, list) else []):
+            excluded_hashes.setdefault(h, set()).add(esid)
+
+    items = []
+    for idx, (last, sid, path, st, rec, s, subs) in enumerate(rows):
+        sig = sub_signature(subs)
+        items.append({
+            "session_id": sid,
+            "path": path,
+            "offset": s.end,
+            "size": st.st_size,
+            "mtime": int(st.st_mtime),
+            "subs": [[rel, size] for rel, _, size in subs],
+            "sub_n": sig[0],
+            "sub_bytes": sig[1],
+            "title": s.title(),
+            "project": squash(mask_text(home_short(s.cwd))[0], PROJECT_MAX),
+            "last_activity": iso_utc(last),
+            "last_ts": last,
+            "prompt_count": s.prompt_count,
+            "total_bytes": st.st_size + sig[1],
+            "shares_idx": sorted(shares.get(idx, ())),
+            "previously_excluded": bool((rec and rec.get("d") == "excluded") or sid in excluded_store),
+            "contains_excluded_copy": any(
+                (excluded_hashes.get(uuid_hash(u), set()) - {sid}) for u in s.head_uuids),
+        })
+    return items, [r[5] for r in rows]
+
+
+def render_list(items, scans, first, level, preview, state):
+    """items[first:] を 1 から番号を振り直して出力と控えの形にする。"""
+    shown = list(range(first, len(items)))
+    number = {idx: k + 1 for k, idx in enumerate(shown)}
+    rows, pend = [], []
+    for idx in shown:
+        it, s = items[idx], scans[idx]
+        n = number[idx]
+        shares = sorted(number[o] for o in it["shares_idx"] if o in number)
+        default_excluded = it["previously_excluded"] or it["contains_excluded_copy"]
+        row = {"n": n, "session_id": it["session_id"], "title": it["title"], "project": it["project"],
+               "updated": local_short(it["last_ts"]), "size": human_size(it["total_bytes"]),
+               "prompts": it["prompt_count"]}
+        if it["sub_n"]:
+            row["subagent_files"] = it["sub_n"]
+        if it["previously_excluded"]:
+            row["previously_excluded"] = True
+        if it["contains_excluded_copy"]:
+            row["contains_excluded_copy"] = True
+        if default_excluded:
+            row["default_excluded"] = True
+        if shares:
+            row["shares_history_with"] = shares
+        if preview:
+            picked = s.prompts_for_preview(level)
+            row["preview"] = [squash(mask_text(display_text(t))[0], PREVIEW_CHARS) for t in picked]
+            if s.prompt_count > len(picked):
+                row["preview_omitted"] = s.prompt_count - len(picked)
+        rows.append(row)
+        p = {k: v for k, v in it.items() if k not in ("prompt_count", "total_bytes", "last_ts", "shares_idx")}
+        p.update({"n": n, "shares": shares})
+        pend.append(p)
+    result = {"count": len(rows), "items": rows}
+    if first:
+        result["remaining"] = first
+    if not state["sessions"]:
+        result["first_run"] = True
+        result["since"] = local_short(state["baseline"])
+    return result, pend
+
+
+def fit_list(items, scans, preview, state):
+    """出力が LIST_OUTPUT_MAX 文字に収まるように、まず抜粋を減らし、それでも多ければ古い会話から次回に回す。"""
+    def size(result):
+        return len(json.dumps(result, ensure_ascii=False))
+
+    levels = PREVIEW_LEVELS if preview else (0,)
+    for level in levels:
+        result, pend = render_list(items, scans, 0, level, preview, state)
+        if size(result) <= LIST_OUTPUT_MAX:
+            return result, pend
+    first = 1
+    while first < len(items):
+        result, pend = render_list(items, scans, first, levels[-1], preview, state)
+        if size(result) <= LIST_OUTPUT_MAX:
+            break
+        first += 1
+    for level in levels:
+        result, pend = render_list(items, scans, first, level, preview, state)
+        if size(result) <= LIST_OUTPUT_MAX:
+            return result, pend
+    return result, pend
+
+
+def file_size(path):
+    with open_nofollow(path) as fh:
+        return os.fstat(fh.fileno()).st_size
+
+
+def cmd_list(args, out):
+    data_dir = resolve_data_dir(args.data_dir)
+    sid = session_id_from_env()
+    cur_path = require_send_session(sid)
+    now = _now()
+    state = load_state(data_dir, now)
+    store = load_excluded_store(data_dir)
+
+    pending = valid_pending(data_dir, sid, now)
+    if pending and isinstance(pending.get("output"), dict):
+        # 同じ会話の中では同じ一覧・同じ番号を返す（返事の待ち受けはここから数え直す）
+        pending["session_size"] = file_size(cur_path)
+        write_json_atomic(pending_path(data_dir), pending)
+        out.write(json.dumps(pending["output"], ensure_ascii=False) + "\n")
+        return 0
+
+    old_cache = load_cache(data_dir)
+    cache = dict(old_cache)
+    items, scans = build_list(state, sid, store, cache)
+    result, pend_items = fit_list(items, scans, args.preview, state)
+    if cache != old_cache:
+        write_json_atomic(cache_path(data_dir), cache)
+    pending = {"v": 2, "session": sid, "created_at": iso_utc(now), "created_ts": now,
+               "session_size": file_size(cur_path), "items": pend_items, "output": result}
+    write_json_atomic(pending_path(data_dir), pending)
+    out.write(json.dumps(result, ensure_ascii=False) + "\n")
+    return 0
+
+
+# ---------------------------------------------------------------- pack
+
+
+class _HashWriter(object):
+    """書いたバイト列の sha256 を取りながらファイルに書く。"""
+
+    def __init__(self, fh):
+        self.fh = fh
+        self.h = hashlib.sha256()
+
+    def write(self, b):
+        self.h.update(b)
+        return self.fh.write(b)
+
+    def flush(self):
+        self.fh.flush()
+
+
+def pack_jsonl(src, dst, limit):
+    """JSONL を先頭から limit バイトまで、1 行ずつ変換して gzip（mtime=0 で sha256 を安定させる）。
+
+    limit をまたぐ行と書きかけの最終行は含めない（一覧の時点より後ろは送らない）。
     戻り値 {"bytes": gzip 後, "sha256", "counts": 伏せた件数, "omitted": 外した件数, "end": 読んだ位置}。
     """
     counts = {}
     omitted = 0
     end = 0
-    with open(src, "rb") as fin, open(dst, "wb") as fout:
+    with open_nofollow(src) as fin, open(dst, "wb") as fout:
         w = _HashWriter(fout)
         with gzip.GzipFile(filename="", mode="wb", fileobj=w, mtime=0, compresslevel=GZIP_LEVEL) as gz:
             for raw in fin:
+                if end + len(raw) > limit:
+                    break
                 if not raw.endswith(b"\n") and parse_line(raw) is None:
                     break
                 line, c, o = transform_blob(raw)
@@ -1006,10 +1273,12 @@ def pack_jsonl(src, dst):
     return {"bytes": os.path.getsize(dst), "sha256": digest, "counts": counts, "omitted": omitted, "end": end}
 
 
-def pack_json(src, dst):
-    """.json（1 つの JSON）を丸ごと変換して gzip。"""
-    with open(src, "rb") as f:
-        raw = f.read()
+def pack_json(src, dst, limit):
+    """.json（1 つの JSON）を一覧の時点のサイズまで読んで変換して gzip。読めなければ None（送らない）。"""
+    with open_nofollow(src) as f:
+        raw = f.read(limit)
+    if len(raw) != limit or not _is_json(raw):
+        return None
     data, counts, omitted = transform_blob(raw)
     gz = gzip.compress(data, compresslevel=GZIP_LEVEL, mtime=0)
     with open(dst, "wb") as f:
@@ -1019,30 +1288,32 @@ def pack_json(src, dst):
 
 
 def pack_session(item, tmp):
-    """送る会話 1 本（本体 + サブエージェント）を一時ディレクトリに固める。"""
-    path = item["path"]
-    try:
-        st = os.stat(path)
-    except OSError:
-        raise Fail("会話ファイルが見つからない（%d 番）。/send-to-nobu で一覧を出し直して" % item["n"])
+    """送る会話 1 本を、一覧の時点の中身（本体は offset まで・サブエージェントは当時のファイルとサイズまで）で固める。"""
     sid = item["session_id"]
-    subs = subagent_files(path[:-len(".jsonl")])
+    path = check_main_path(item.get("path"), sid)
+    if os.lstat(path).st_size < int(item["offset"]):
+        raise Fail("会話ファイルが一覧のあとで書き換わった（%d 番）。/send-to-nobu で一覧を出し直して" % item["n"])
     base = os.path.join(tmp, sid)
     os.makedirs(base)
-    main = pack_jsonl(path, base + ".jsonl.gz")
+    main = pack_jsonl(path, base + ".jsonl.gz", int(item["offset"]))
     counts = dict(main["counts"])
     omitted = main["omitted"]
     files = [{"session_id": sid, "rel": None, "bytes": main["bytes"], "sha256": main["sha256"],
               "local": base + ".jsonl.gz"}]
     sub_meta = []
-    for i, (rel, p, _size) in enumerate(subs):
+    sdir = session_dir_of(path)
+    for i, (rel, size) in enumerate(item.get("subs") or []):
+        p = sub_path(sdir, rel)
+        if p is None:
+            continue  # 消えた・リンクになった
         dst = os.path.join(base, "%04d.gz" % i)
-        r = (pack_jsonl if rel.endswith(".jsonl") else pack_json)(p, dst)
+        r = (pack_jsonl if rel.endswith(".jsonl") else pack_json)(p, dst, int(size))
+        if r is None:
+            continue
         _merge_counts(counts, r["counts"])
         omitted += r["omitted"]
         files.append({"session_id": sid, "rel": rel, "bytes": r["bytes"], "sha256": r["sha256"], "local": dst})
         sub_meta.append({"rel": rel, "bytes": r["bytes"], "sha256": r["sha256"]})
-    sig = sub_signature(subs)
     return {
         "item": item,
         "files": files,
@@ -1056,8 +1327,9 @@ def pack_session(item, tmp):
             "redactions": sum(counts.values()),
             "subagents": sub_meta,
         },
-        "record": {"offset": main["end"], "size": st.st_size, "mtime": int(st.st_mtime),
-                   "sub_n": sig[0], "sub_bytes": sig[1]},
+        # 続き（一覧のあとに増えた分）は翌日の一覧に出る
+        "record": {"offset": main["end"], "size": item["size"], "mtime": item["mtime"],
+                   "sub_n": item["sub_n"], "sub_bytes": item["sub_bytes"]},
         "counts": counts,
         "omitted": omitted,
     }
@@ -1095,10 +1367,24 @@ def _ssl_context():
     return ctx
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """リダイレクトは追わない（引換券やファイルが別のホストに渡らないように）。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def build_opener(use_proxy=True):
+    handlers = [_NoRedirect(), urllib.request.HTTPSHandler(context=_ssl_context())]
+    if not use_proxy:
+        handlers.append(urllib.request.ProxyHandler({}))
+    return urllib.request.build_opener(*handlers)
+
+
 def _open(req, timeout):
     global _OPENER
     if _OPENER is None:
-        _OPENER = urllib.request.build_opener(urllib.request.HTTPSHandler(context=_ssl_context()))
+        _OPENER = build_opener()
     return _OPENER.open(req, timeout=timeout)
 
 
@@ -1138,6 +1424,8 @@ def api_post(api_base, path, body, code, ok_codes=()):
             if e.code >= 500 and attempt < RETRIES:
                 _backoff(attempt)
                 continue
+            if 300 <= e.code < 400:
+                message = "サーバーが別の場所へ飛ばそうとしたので止めた"
             if e.code == 401 or api_code == "unauthorized":
                 message = "引換券が使えない（期限切れか使用済み）。start_submission からやり直して"
             raise ApiError(e.code, api_code, "%s（%s %d %s）" % (message or "サーバーが受け付けなかった",
@@ -1153,7 +1441,7 @@ def api_post(api_base, path, body, code, ok_codes=()):
 
 def put_file(upload, local, size):
     """署名 URL に PUT する。headers はそのまま付ける。ファイルからストリーミング。
-    GCS の案内どおり 408・429・5xx と通信エラーはリトライ。"""
+    GCS の案内どおり 408・429・5xx と通信エラーはリトライ。リダイレクトは追わない。"""
     headers = dict(upload.get("headers") or {})
     headers["Content-Length"] = str(size)
     method = upload.get("method") or "PUT"
@@ -1202,38 +1490,46 @@ def check_api_base(api_base):
     return base
 
 
+def check_put_url(url):
+    if not isinstance(url, str) or not any(url.startswith(p) for p in ALLOWED_PUT_PREFIXES):
+        raise Fail("サーバーが返したアップロード先が決まった場所ではないので止めた")
+
+
 # ---------------------------------------------------------------- send
 
 
-def parse_exclude(text, numbers):
-    t = unicodedata.normalize("NFKC", (text or "")).strip().lower()
-    if t in ("", "none", "なし", "無し", "ない", "0"):
+def parse_numbers(text, numbers, what):
+    """番号の並び（1,3 / 1 3 / 2-4）。none / なし は空。読めない・逆順・一覧にない番号はエラー（失敗側に倒す）。"""
+    t = unicodedata.normalize("NFKC", text or "").strip()
+    if t.lower() == "none" or t == "なし":
         return set()
+    if not t:
+        raise Fail("--%s が空。番号をカンマ区切りで（なければ none）" % what, EXIT_USAGE)
     out = set()
-    for tok in re.split(r"[\s,、，;/]+", t):
+    for tok in re.split(r"[\s,、]+", t):
         if not tok:
             continue
-        m = re.match(r"^(\d+)(?:-(\d+))?$", tok)
+        m = re.fullmatch(r"(\d+)(?:-(\d+))?", tok)
         if not m:
-            raise Fail("--exclude は番号をカンマ区切りで（なければ none）: %s" % tok, EXIT_USAGE)
-        lo = int(m.group(1))
-        hi = int(m.group(2) or lo)
+            raise Fail("--%s が読めない: %s（番号をカンマ区切りで。なければ none）" % (what, tok), EXIT_USAGE)
+        lo, hi = int(m.group(1)), int(m.group(2) or m.group(1))
+        if hi < lo:
+            raise Fail("--%s の範囲が逆順: %s" % (what, tok), EXIT_USAGE)
         for n in range(lo, hi + 1):
             if n not in numbers:
                 raise Fail("%d 番は一覧にない" % n, EXIT_USAGE)
             out.add(n)
+    if not out:
+        raise Fail("--%s が読めない（番号をカンマ区切りで。なければ none）" % what, EXIT_USAGE)
     return out
 
 
 def read_note(args, stdin):
-    if not args.note_file:
+    if args.note_file is None:
         return ""
-    if args.note_file == "-":
-        data = stdin.read()
-    else:
-        with open(args.note_file, "r", encoding="utf-8", errors="replace") as f:
-            data = f.read()
-    return data.strip()
+    if args.note_file != "-":
+        raise Fail("--note-file は - （標準入力）だけ", EXIT_USAGE)
+    return stdin.read().strip()
 
 
 def load_pending(data_dir, current, now):
@@ -1253,7 +1549,8 @@ def excluded_uuid_hashes(item):
     out = set()
     limit = int(item.get("offset", 0))
     try:
-        with open(item["path"], "rb") as fh:
+        path = check_main_path(item.get("path"), item.get("session_id"))
+        with open_nofollow(path) as fh:
             pos = 0
             for raw in fh:
                 pos += len(raw)
@@ -1262,18 +1559,16 @@ def excluded_uuid_hashes(item):
                 d = parse_line(raw)
                 if d is not None and isinstance(d.get("uuid"), str):
                     out.add(uuid_hash(d["uuid"]))
-    except OSError:
+    except (OSError, Fail):
         pass
     return sorted(out)
 
 
 def record_decisions(data_dir, now, packed, excluded_items):
-    """送った / 外したを、判断した時点の位置で状態に記録する。"""
+    """送った / 外したを、判断した時点（一覧の時点）の位置で状態に記録する。"""
     state = load_state(data_dir, now)
     sessions = state["sessions"]
-    store = read_json(excluded_path(data_dir), {})
-    if not isinstance(store, dict):
-        store = {}
+    store = load_excluded_store(data_dir)
     at = iso_utc(now)
     for p in packed:
         rec = dict(p["record"])
@@ -1288,14 +1583,70 @@ def record_decisions(data_dir, now, packed, excluded_items):
     write_json_atomic(state_path(data_dir), state)
 
 
+_CLEANUP_DIRS = []
+
+
+def _on_signal(signum, frame):
+    """SIGTERM などで止められても一時ディレクトリを消す。"""
+    for d in list(_CLEANUP_DIRS):
+        shutil.rmtree(d, ignore_errors=True)
+    os._exit(128 + signum)
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def sweep_old_packs(data_dir, now):
+    """前回の送信が途中で止まって残った一時ディレクトリを消す。"""
+    try:
+        names = os.listdir(data_dir)
+    except OSError:
+        return
+    for name in names:
+        if not name.startswith("pack-"):
+            continue
+        p = os.path.join(data_dir, name)
+        m = re.match(r"^pack-(\d+)-", name)
+        try:
+            old = now - os.lstat(p).st_mtime > 86400
+        except OSError:
+            continue
+        if old or not m or not _pid_alive(int(m.group(1))):
+            shutil.rmtree(p, ignore_errors=True)
+
+
 def cmd_send(args, out, stdin):
-    now = args.now if args.now is not None else time.time()
     data_dir = resolve_data_dir(args.data_dir)
-    api_base = check_api_base(args.api_base) if args.api_base else None
-    current = current_session(args.session)
-    pending = load_pending(data_dir, current, now)
+    sid = session_id_from_env()
+    cur_path = require_send_session(sid)
+    api_base = check_api_base(args.api_base) if args.api_base is not None else None
+    if args.note_file is not None and args.note_file != "-":
+        raise Fail("--note-file は - （標準入力）だけ", EXIT_USAGE)
+    now = _now()
+    load_state(data_dir, now)
+    load_excluded_store(data_dir)
+    pending = load_pending(data_dir, sid, now)
+
+    # 一覧を出したあとに本人の返事が無ければ送らない（同じターンで勝手に送らせない）
+    if not reply_after(cur_path, int(pending.get("session_size") or 0)):
+        raise Fail("まだ本人の返事が無い。一覧を見せて、返事を待ってから送って", EXIT_NOT_ANSWERED)
+
     items = {int(it["n"]): it for it in pending["items"]}
-    excluded = parse_exclude(args.exclude, items)
+    excluded = parse_numbers(args.exclude, items, "exclude")
+    included = parse_numbers(args.include, items, "include") if args.include is not None else set()
+    if excluded & included:
+        raise Fail("同じ番号が --exclude と --include の両方にある: %s" % ",".join(map(str, sorted(excluded & included))),
+                   EXIT_USAGE)
+    # 前に外した会話の続き・前に外した会話を引き継いだ会話は、--include で明示されない限り外す
+    default_excluded = {n for n, it in items.items() if it.get("previously_excluded") or it.get("contains_excluded_copy")}
+    excluded |= (default_excluded - included)
     send_items = [items[n] for n in sorted(items) if n not in excluded]
     excluded_items = [items[n] for n in sorted(excluded)]
 
@@ -1306,10 +1657,9 @@ def cmd_send(args, out, stdin):
             raise Fail("%s は同じ履歴を共有している。外した方の中身も、送る方から届く。"
                        "了承なら --confirm-shared を付けてやり直す（止めるなら両方外す）" % desc, EXIT_CONFIRM_SHARED)
 
-    note = read_note(args, stdin)
+    note = mask_text(read_note(args, stdin))[0]
     if len(note) > NOTE_MAX:
         raise Fail("感想が長すぎる（%d 文字まで）" % NOTE_MAX, EXIT_USAGE)
-    note = mask_text(note)[0]
 
     if not send_items and not note:
         # 全部外して感想もない日: サーバーには何も送らず、外したことだけ覚える
@@ -1324,7 +1674,17 @@ def cmd_send(args, out, stdin):
         raise Fail("--code と --api-base がない。start_submission で受け取って", EXIT_USAGE)
     code = args.code.strip()
 
-    tmp = tempfile.mkdtemp(prefix="pack-", dir=data_dir)
+    sweep_old_packs(data_dir, now)
+    tmp = tempfile.mkdtemp(prefix="pack-%d-" % os.getpid(), dir=data_dir)
+    _CLEANUP_DIRS.append(tmp)
+    saved = {}
+    for signame in ("SIGTERM", "SIGHUP"):
+        signum = getattr(signal, signame, None)
+        if signum is not None:
+            try:
+                saved[signum] = signal.signal(signum, _on_signal)
+            except ValueError:  # メインスレッド以外
+                pass
     try:
         packed = [pack_session(it, tmp) for it in send_items]
         files = [f for p in packed for f in p["files"]]
@@ -1343,6 +1703,7 @@ def cmd_send(args, out, stdin):
             u = uploads.get((f["session_id"], f["rel"]))
             if not u or not u.get("url"):
                 raise Fail("サーバーからアップロード先が返ってこなかった")
+            check_put_url(u["url"])
             jobs.append((u, f["local"], f["bytes"]))
         put_all(jobs)
 
@@ -1354,6 +1715,9 @@ def cmd_send(args, out, stdin):
         remove_quietly(pending_path(data_dir))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+        _CLEANUP_DIRS.remove(tmp)
+        for signum, handler in saved.items():
+            signal.signal(signum, handler)
 
     result = {
         "submission_id": res.get("submission_id"),
@@ -1368,22 +1732,6 @@ def cmd_send(args, out, stdin):
     return 0
 
 
-# ---------------------------------------------------------------- status
-
-
-def cmd_status(args, out):
-    """いまの会話に、有効な一覧の控え（同じ会話 ID・6 時間以内）があるか。スキルのモード分けに使う。"""
-    now = args.now if args.now is not None else time.time()
-    data_dir = resolve_data_dir(args.data_dir)
-    try:
-        p = load_pending(data_dir, current_session(args.session), now)
-        res = {"pending": True, "count": len(p["items"])}
-    except Fail:
-        res = {"pending": False}
-    out.write(json.dumps(res) + "\n")
-    return 0
-
-
 # ---------------------------------------------------------------- main
 
 
@@ -1391,31 +1739,24 @@ def build_parser():
     p = argparse.ArgumentParser(prog="agentlog.py", description="send-to-nobu の処理")
     sub = p.add_subparsers(dest="cmd")
 
-    def common(sp):
+    def data_dir(sp):
         sp.add_argument("--data-dir", default=None, help="状態を置くディレクトリ（${CLAUDE_PLUGIN_DATA}）")
-        sp.add_argument("--projects-dir", default=None, help=argparse.SUPPRESS)
-        sp.add_argument("--now", type=float, default=None, help=argparse.SUPPRESS)
 
-    sp = sub.add_parser("nudge", help="未送信の会話があれば 1 日 1 回知らせる（フック用）")
-    common(sp)
-
-    sp = sub.add_parser("status", help="いまの会話に有効な一覧の控えがあるか")
-    common(sp)
-    sp.add_argument("--session", default=None, help="いまの会話 ID（省略時は CLAUDE_CODE_SESSION_ID）")
+    data_dir(sub.add_parser("nudge", help="未送信の会話があれば 1 日 1 回知らせる（フック用）"))
+    data_dir(sub.add_parser("status", help="いまの会話に有効な一覧の控えがあるか"))
 
     sp = sub.add_parser("list", help="未送信の会話の一覧")
-    common(sp)
+    data_dir(sp)
     sp.add_argument("--preview", action="store_true", help="人の指示の抜粋（マスク済み）も出す")
-    sp.add_argument("--session", default=None, help="いまの会話 ID（省略時は CLAUDE_CODE_SESSION_ID）")
 
     sp = sub.add_parser("send", help="一覧の控えに沿って送る")
-    common(sp)
+    data_dir(sp)
     sp.add_argument("--code", default=None, help="start_submission の upload_code")
     sp.add_argument("--exclude", required=True, help="外す番号（カンマ区切り）か none")
-    sp.add_argument("--note-file", default=None, help="感想のファイル（- で標準入力）")
+    sp.add_argument("--include", default=None, help="既定で外す会話のうち、送る番号")
+    sp.add_argument("--note-file", default=None, help="感想は標準入力から（- だけ）")
     sp.add_argument("--api-base", default=None, help="start_submission の api_base")
     sp.add_argument("--confirm-shared", action="store_true", help="履歴を共有する会話の片方だけ外すのを了承済み")
-    sp.add_argument("--session", default=None, help="いまの会話 ID（省略時は CLAUDE_CODE_SESSION_ID）")
     return p
 
 
@@ -1423,8 +1764,9 @@ def main(argv=None, stdin=None, stdout=None, stderr=None):
     stdin = stdin if stdin is not None else sys.stdin
     stdout = stdout if stdout is not None else sys.stdout
     stderr = stderr if stderr is not None else sys.stderr
+    argv = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
-    if argv is not None and argv[:1] == ["nudge"]:
+    if argv[:1] == ["nudge"]:
         # フックは引数の不備でも起動を邪魔しない（usage も出さない）
         saved, sys.stderr = sys.stderr, open(os.devnull, "w")
         try:
@@ -1435,12 +1777,13 @@ def main(argv=None, stdin=None, stdout=None, stderr=None):
             sys.stderr.close()
             sys.stderr = saved
         return cmd_nudge(args, stdout)
-    args = parser.parse_args(argv)
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as e:
+        return e.code if isinstance(e.code, int) else EXIT_USAGE
     if args.cmd is None:
         parser.print_help(stderr)
         return EXIT_USAGE
-    if args.cmd == "nudge":
-        return cmd_nudge(args, stdout)
     try:
         if args.cmd == "status":
             return cmd_status(args, stdout)
@@ -1459,4 +1802,4 @@ def main(argv=None, stdin=None, stdout=None, stderr=None):
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(main())

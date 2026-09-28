@@ -1,56 +1,47 @@
 # -*- coding: utf-8 -*-
 """send: 偽サーバー（標準ライブラリの HTTP サーバー）で /v1/uploads・PUT・/v1/finish を往復する。"""
 
+import base64
 import glob
 import gzip
 import json
 import os
+import signal
+import subprocess
 import sys
+import textwrap
 import time
 import unittest
-import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from helpers import FakeInbox, Lines, World, agentlog  # noqa: E402
+from helpers import FakeInbox, Lines, Patched, World, agentlog, read_bytes  # noqa: E402
 
 ANTHROPIC = "sk-ant-api03-" + "Z9x8C7v6B5n4M3a2S1d0" * 4
-IMG = __import__("base64").b64encode(b"\x89PNG" + b"\x01" * 5996).decode()
-
-
-def read_bytes(path):
-    with open(path, "rb") as f:
-        return f.read()
-
-
 GITHUB = "ghp_" + "Q1w2E3r4T5y6U7i8O9p0A1s2D3f4G5h6J7k8"
+IMG = base64.b64encode(b"\x89PNG" + b"\x01" * 5996).decode()   # 6000 bytes
+NOTE = ("昨日の感想：MCP のログインで迷った。\n"
+        "質問: $HOME って何？ `echo $(date)` も \"引用\" も 'single' も && ; | > そのまま\n"
+        "```python\nprint(\"hello\")\n```\n"
+        "SEND_TO_NOBU_NOTE じゃない行\n")
 
 
-class SendTest(unittest.TestCase):
+class SendBase(unittest.TestCase):
     def setUp(self):
         self.w = World()
         self.srv = FakeInbox()
-        self.saved_backoff = agentlog.BACKOFF_BASE
-        agentlog.BACKOFF_BASE = 0.001
-        # テストでは OS のプロキシ設定を使わない
-        self.saved_opener = agentlog._OPENER
-        agentlog._OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        # 送り先の許可リストはテストコードからだけ差し替える
-        self.saved_allowed = agentlog.ALLOWED_API_BASES
-        agentlog.ALLOWED_API_BASES = (self.srv.base,)
+        self.patch = Patched(self.srv)
 
     def tearDown(self):
-        agentlog._OPENER = self.saved_opener
-        agentlog.ALLOWED_API_BASES = self.saved_allowed
-        agentlog.BACKOFF_BASE = self.saved_backoff
+        self.patch.restore()
         self.srv.close()
         self.w.close()
 
-    def send(self, exclude="none", note=None, code=None, extra=()):
+    def send(self, exclude="none", note=None, code=None, extra=(), **kw):
         args = ["send", "--exclude", exclude, "--code", code or FakeInbox.CODE, "--api-base", self.srv.base]
         if note is not None:
             args += ["--note-file", "-"]
         args += list(extra)
-        return self.w.run(*args, stdin=note or "")
+        return self.w.run(*args, stdin=note or "", **kw)
 
     def two_sessions(self):
         a = Lines(base=time.time() - 7200)
@@ -72,17 +63,20 @@ class SendTest(unittest.TestCase):
         base = "raw/androots/alice/claude-code/%s" % sid
         return base + ".jsonl.gz" if rel is None else base + "/subagents/%s.gz" % rel
 
+    def next_day(self):
+        self.w.current = self.w.start_send_session()
+
+
+class RoundTripTest(SendBase):
     def test_roundtrip(self):
         a, pa, b, pb = self.two_sessions()
         self.w.list()
-        note = "昨日の感想：MCP のログインで迷った。\n質問: $HOME って何？ `echo` も \"引用\" も そのまま\n"
-        code, out, err = self.send(note=note)
+        code, out, err = self.send(note=NOTE)
         self.assertEqual(code, 0, err)
         res = json.loads(out)
         self.assertEqual(res["submission_id"], "20260928T090312Z-1a2b3c4d")
         self.assertEqual((res["sent_count"], res["excluded_count"], res["subagent_count"]), (2, 0, 3))
-        self.assertEqual(res["redactions"], 2)
-        self.assertEqual(res["omitted"], 2)  # 画像ブロックと Read の結果の 2 か所
+        self.assertEqual((res["redactions"], res["omitted"]), (2, 2))
 
         # 本体: 変換した行（マスク 1 行・画像 1 行）以外はバイト一致
         orig = read_bytes(pa).splitlines(True)
@@ -96,49 +90,67 @@ class SendTest(unittest.TestCase):
         for ln in got:
             json.loads(ln)
         self.assertEqual(self.srv.object_lines(self.obj(b.sid)), read_bytes(pb))
-        # サブエージェント（入れ子・.meta.json）も届く
         self.assertNotIn(GITHUB.encode(), self.srv.object_lines(self.obj(a.sid, "agent-a1b2.jsonl")))
         self.assertEqual(json.loads(self.srv.object_lines(self.obj(a.sid, "agent-a1b2.meta.json")))["agentType"],
                          "Explore")
         self.assertIn(self.obj(a.sid, "workflows/wf_abc-123/agent-c3.jsonl"), self.srv.objects)
 
-        # 送信票に渡したもの
+        # 送信票に渡したもの（契約のキーだけ）
         fin = self.srv.finish_bodies[0]
-        self.assertEqual(fin["note"], note.strip())  # 本人の言葉のまま
+        self.assertEqual(fin["note"], NOTE.strip())  # 本人の言葉のまま（複数行・記号も）
         self.assertEqual(fin["excluded_count"], 0)
         self.assertEqual(fin["plugin_version"], agentlog.plugin_version())
         sa = [s for s in fin["sent"] if s["session_id"] == a.sid][0]
-        self.assertEqual(sa["title"], "請求書の集計")
-        self.assertEqual(sa["project"], "~/work/billing")
-        self.assertEqual(sa["redactions"], 2)  # 外した画像は数えない（契約は変えない）
         self.assertEqual(sorted(sa), ["bytes", "last_activity", "project", "redactions", "session_id", "sha256",
                                       "subagents", "title"])
+        self.assertEqual((sa["title"], sa["project"], sa["redactions"]), ("請求書の集計", "~/work/billing", 2))
         self.assertTrue(sa["last_activity"].endswith("Z"))
-        self.assertEqual(sorted(x["rel"] for x in sa["subagents"]),
-                         ["agent-a1b2.jsonl", "agent-a1b2.meta.json", "workflows/wf_abc-123/agent-c3.jsonl"])
 
-        # 状態の更新・控えと一時ディレクトリの削除
         st = self.w.state()["sessions"]
         self.assertEqual(st[a.sid]["d"], "sent")
         self.assertEqual(st[a.sid]["offset"], os.path.getsize(pa))
         self.assertIsNone(self.w.pending())
         self.assertEqual(glob.glob(os.path.join(self.w.data, "pack-*")), [])
-        self.assertEqual(self.w.list()["count"], 0)
 
-        # 閉じただけ（メタ行）は出ない・続きを書いたら出る
+        self.next_day()
+        self.assertEqual(self.w.list()["count"], 0)
         self.w.append(pa, Lines(sid=a.sid).meta("last-prompt", lastPrompt="x"), mtime=time.time() + 5)
+        self.next_day()
         self.assertEqual(self.w.list()["count"], 0)
         self.w.append(pb, Lines(sid=b.sid).user("続き").assistant())
+        self.next_day()
         items = self.w.list()["items"]
         self.assertEqual([it["session_id"] for it in items], [b.sid])
-        self.assertNotIn("previously_excluded", items[0])
+        self.assertNotIn("default_excluded", items[0])
+
+    def test_growth_after_the_list_is_not_sent(self):
+        a, pa, b, pb = self.two_sessions()
+        self.w.list()
+        main_before = read_bytes(pa)
+        sub_before = read_bytes(pa[:-6] + "/subagents/agent-a1b2.jsonl")
+        # 一覧を見たあとで、本体とサブエージェントが伸び、新しいサブエージェントもできた
+        self.w.append(pa, Lines(sid=a.sid).user("一覧のあとに書いた秘密の相談").assistant())
+        self.w.append(pa[:-6] + "/subagents/agent-a1b2.jsonl", Lines().user("あとから増えたサブ").assistant())
+        self.w.subagent(pa, "agent-new9.jsonl", Lines().user("新しいサブ").assistant())
+        code, out, err = self.send()
+        self.assertEqual(code, 0, err)
+        main_sent = self.srv.object_lines(self.obj(a.sid))
+        self.assertNotIn("一覧のあとに書いた".encode(), main_sent)
+        self.assertEqual(len(main_sent.splitlines()), len(main_before.splitlines()))
+        self.assertEqual(len(self.srv.object_lines(self.obj(a.sid, "agent-a1b2.jsonl")).splitlines()),
+                         len(sub_before.splitlines()))
+        self.assertNotIn(self.obj(a.sid, "agent-new9.jsonl"), self.srv.objects)
+        self.assertEqual(self.w.state()["sessions"][a.sid]["offset"], len(main_before))
+        # 続きは翌日の一覧に出る
+        self.next_day()
+        self.assertIn(a.sid, [it["session_id"] for it in self.w.list()["items"]])
 
     def test_gzip_is_stable(self):
         a, pa, b, pb = self.two_sessions()
         tmp = os.path.join(self.w.tmp, "g")
         os.makedirs(tmp)
-        s1 = agentlog.pack_jsonl(pa, os.path.join(tmp, "1.gz"))
-        s2 = agentlog.pack_jsonl(pa, os.path.join(tmp, "2.gz"))
+        s1 = agentlog.pack_jsonl(pa, os.path.join(tmp, "1.gz"), 10 ** 9)
+        s2 = agentlog.pack_jsonl(pa, os.path.join(tmp, "2.gz"), 10 ** 9)
         self.assertEqual((s1["bytes"], s1["sha256"]), (s2["bytes"], s2["sha256"]))
         with gzip.open(os.path.join(tmp, "1.gz")) as g:
             self.assertEqual(len(g.read().splitlines()), len(read_bytes(pa).splitlines()))
@@ -147,7 +159,7 @@ class SendTest(unittest.TestCase):
         a, pa, b, pb = self.two_sessions()
         items = self.w.list()["items"]
         n_a = [it["n"] for it in items if it["session_id"] == a.sid][0]
-        code, out, err = self.send(exclude=str(n_a), note="なし" and "")
+        code, out, err = self.send(exclude=str(n_a))
         self.assertEqual(code, 0, err)
         fin = self.srv.finish_bodies[0]
         self.assertEqual([s["session_id"] for s in fin["sent"]], [b.sid])
@@ -157,14 +169,6 @@ class SendTest(unittest.TestCase):
         self.assertFalse(any(a.sid in o for o in self.srv.objects))
         st = self.w.state()["sessions"]
         self.assertEqual((st[a.sid]["d"], st[b.sid]["d"]), ("excluded", "sent"))
-
-    def test_headers_are_passed_as_is(self):
-        self.two_sessions()
-        self.w.list()
-        code, out, err = self.send()
-        self.assertEqual(code, 0, err)
-        # 偽サーバーは署名対象ヘッダーが 1 つでも違うと 403 を返す。全部届いていれば一致している
-        self.assertEqual(len(self.srv.objects), 5)
 
     def test_batches_of_100(self):
         L = Lines().user("大量のサブエージェント").assistant()
@@ -178,6 +182,158 @@ class SendTest(unittest.TestCase):
         self.assertEqual(json.loads(out)["subagent_count"], 230)
         self.assertEqual(len(self.srv.objects), 231)
 
+    def test_note_only_when_nothing_to_send(self):
+        self.w.list()
+        code, out, err = self.send(note="今日は使わなかった。質問だけ: スキルって何？")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.srv.upload_batches, [])
+        fin = self.srv.finish_bodies[0]
+        self.assertEqual((fin["sent"], fin["excluded_count"]), ([], 0))
+
+    def test_all_excluded_with_note(self):
+        self.two_sessions()
+        self.w.list()
+        code, out, err = self.send(exclude="1,2", note="全部外したけど感想はある")
+        self.assertEqual(code, 0, err)
+        fin = self.srv.finish_bodies[0]
+        self.assertEqual((fin["sent"], fin["excluded_count"]), ([], 2))
+
+
+class GateTest(SendBase):
+    def test_send_without_a_reply_is_refused(self):
+        self.two_sessions()
+        self.w.list()
+        code, out, err = self.send(reply=False)
+        self.assertEqual(code, agentlog.EXIT_NOT_ANSWERED)
+        self.assertEqual(self.srv.upload_calls, 0)
+        # /send-to-nobu を引数なしで打ち直しただけでは返事にならない
+        self.w.reply("", plain=False)
+        code, out, err = self.send(reply=False)
+        self.assertEqual(code, agentlog.EXIT_NOT_ANSWERED)
+        # 普通の返事なら通る
+        self.w.reply("なし", plain=True)
+        code, out, err = self.send(reply=False)
+        self.assertEqual(code, 0, err)
+
+    def test_relisting_resets_the_gate(self):
+        self.two_sessions()
+        self.w.list()
+        self.w.reply("なし")
+        self.w.list()  # 同じ一覧をもう一度見せた → 返事はそこから数え直し
+        code, out, err = self.send(reply=False)
+        self.assertEqual(code, agentlog.EXIT_NOT_ANSWERED)
+
+
+class DefaultExcludedTest(SendBase):
+    def setup_previously_excluded(self):
+        a = Lines(base=time.time() - 7200).user("外したい相談").assistant()
+        pa = self.w.write(a)
+        self.w.list()
+        code, out, err = self.send(exclude="1")
+        self.assertEqual(code, 0, err)
+        self.srv.finished = False
+        self.w.append(pa, Lines(sid=a.sid).user("続き").assistant())
+        b = Lines(base=time.time() - 60).user("ふつうの会話").assistant()
+        self.w.write(b)
+        self.next_day()
+        items = {it["session_id"]: it for it in self.w.list()["items"]}
+        self.assertTrue(items[a.sid]["default_excluded"])
+        return a, b, items[a.sid]["n"], items[b.sid]["n"]
+
+    def test_previously_excluded_is_excluded_by_default(self):
+        a, b, na, nb = self.setup_previously_excluded()
+        code, out, err = self.send()
+        self.assertEqual(code, 0, err)
+        res = json.loads(out)
+        self.assertEqual((res["sent_count"], res["excluded_count"]), (1, 1))
+        self.assertFalse(any(a.sid in o for o in self.srv.objects))
+
+    def test_include_sends_it(self):
+        a, b, na, nb = self.setup_previously_excluded()
+        code, out, err = self.send(extra=["--include", str(na)])
+        self.assertEqual(code, 0, err)
+        self.assertIn(self.obj(a.sid), self.srv.objects)
+        self.assertEqual(json.loads(out)["sent_count"], 2)
+
+    def test_include_and_exclude_conflict(self):
+        a, b, na, nb = self.setup_previously_excluded()
+        code, out, err = self.send(exclude=str(na), extra=["--include", str(na)])
+        self.assertEqual(code, agentlog.EXIT_USAGE)
+        self.assertEqual(self.srv.upload_calls, 0)
+
+
+class ArgumentTest(SendBase):
+    def test_exclude_parsing_fails_closed(self):
+        self.two_sessions()
+        self.w.list()
+        for bad in ("3", "1,x", "0-5", "2-1", "", "  ", "無し", "0", "ない"):
+            code, out, err = self.send(exclude=bad)
+            self.assertEqual(code, agentlog.EXIT_USAGE, repr(bad))
+        self.assertEqual(self.srv.upload_calls, 0)
+        self.assertEqual(agentlog.parse_numbers("１、2", {1: 0, 2: 0}, "exclude"), {1, 2})
+        self.assertEqual(agentlog.parse_numbers("なし", {1: 0}, "exclude"), set())
+        self.assertEqual(agentlog.parse_numbers("NONE", {1: 0}, "exclude"), set())
+        self.assertEqual(agentlog.parse_numbers("1-2", {1: 0, 2: 0, 3: 0}, "exclude"), {1, 2})
+
+    def test_note_file_must_be_stdin(self):
+        self.w.list()
+        code, out, err = self.w.run("send", "--exclude", "none", "--note-file", "/etc/hosts", "--code", "x",
+                                    "--api-base", self.srv.base)
+        self.assertEqual(code, agentlog.EXIT_USAGE)
+        self.assertIn("--note-file", err)
+
+    def test_note_limit_is_checked_after_masking(self):
+        self.w.list()
+        note = "あ" * (agentlog.NOTE_MAX - 30) + ANTHROPIC  # 伏せる前は超える・伏せたあとは収まる
+        self.assertGreater(len(note), agentlog.NOTE_MAX)
+        code, out, err = self.send(note=note)
+        self.assertEqual(code, 0, err)
+        self.assertIn("[REDACTED:anthropic_key]", self.srv.finish_bodies[0]["note"])
+
+    def test_note_too_long(self):
+        self.w.list()
+        code, out, err = self.send(note="あ" * (agentlog.NOTE_MAX + 1))
+        self.assertEqual(code, agentlog.EXIT_USAGE)
+        self.assertEqual(self.srv.finish_bodies, [])
+
+    def test_api_base_allowlist(self):
+        self.two_sessions()
+        self.w.list()
+        for bad in ("https://evil.example.com", "http://agent-log-inbox-mcp.androots.co.jp",
+                    "https://agent-log-inbox-mcp.androots.co.jp.evil.com", self.srv.base + "/x", ""):
+            code, out, err = self.w.run("send", "--exclude", "none", "--code", FakeInbox.CODE, "--api-base", bad)
+            self.assertEqual(code, agentlog.EXIT_USAGE, bad)
+        self.assertEqual(self.srv.upload_calls, 0)
+        self.assertEqual(self.patch.saved[0], ("https://agent-log-inbox-mcp.androots.co.jp",))
+        self.assertEqual(self.patch.saved[1], ("https://storage.googleapis.com/",))
+
+
+class TransportTest(SendBase):
+    def test_headers_are_passed_as_is(self):
+        self.two_sessions()
+        self.w.list()
+        code, out, err = self.send()
+        self.assertEqual(code, 0, err)
+        # 偽サーバーは署名対象ヘッダーが 1 つでも違うと 403 を返す。全部届いていれば一致している
+        self.assertEqual(len(self.srv.objects), 5)
+
+    def test_redirect_is_not_followed(self):
+        self.two_sessions()
+        self.w.list()
+        self.srv.uploads_redirect = True
+        code, out, err = self.send()
+        self.assertEqual(code, agentlog.EXIT_ERROR)
+        self.assertEqual(self.srv.redirect_hits, 0)
+        self.assertIsNotNone(self.w.pending())
+
+    def test_put_url_must_be_allowed(self):
+        self.two_sessions()
+        self.w.list()
+        self.srv.put_url_base = "http://localhost:%d" % self.srv.port  # 許可リストに無い先
+        code, out, err = self.send()
+        self.assertEqual(code, agentlog.EXIT_ERROR)
+        self.assertEqual(self.srv.put_attempts, {})
+
     def test_put_retry(self):
         a, pa, b, pb = self.two_sessions()
         self.w.list()
@@ -187,7 +343,7 @@ class SendTest(unittest.TestCase):
         self.assertEqual(self.srv.put_attempts[self.obj(b.sid)], 3)
 
     def test_failure_keeps_state(self):
-        a, pa, b, pb = self.two_sessions()
+        self.two_sessions()
         self.w.list()
         before = self.w.state()
         self.srv.forbid_put = {"agent-c3"}
@@ -196,11 +352,10 @@ class SendTest(unittest.TestCase):
         self.assertEqual(out, "")
         self.assertIn("アップロードに失敗", err)
         self.assertEqual(len(err.strip().splitlines()), 1)
-        self.assertEqual(self.w.state(), before)            # 状態は更新しない（翌朝また出る）
-        self.assertIsNotNone(self.w.pending())               # 引換券を取り直せばやり直せる
+        self.assertEqual(self.w.state(), before)
+        self.assertIsNotNone(self.w.pending())
         self.assertEqual(self.srv.finish_bodies, [])
         self.assertEqual(glob.glob(os.path.join(self.w.data, "pack-*")), [])
-        self.assertEqual(self.w.list()["count"], 2)
 
     def test_permanent_5xx_gives_up(self):
         self.two_sessions()
@@ -210,63 +365,16 @@ class SendTest(unittest.TestCase):
         self.assertEqual(code, agentlog.EXIT_ERROR)
         self.assertEqual(max(self.srv.put_attempts.values()), agentlog.RETRIES + 1)
 
-    def test_note_only_when_nothing_to_send(self):
-        self.w.list()
-        code, out, err = self.send(note="今日は使わなかった。質問だけ: スキルって何？")
-        self.assertEqual(code, 0, err)
-        self.assertEqual(self.srv.upload_batches, [])
-        fin = self.srv.finish_bodies[0]
-        self.assertEqual((fin["sent"], fin["excluded_count"]), ([], 0))
-        self.assertEqual(json.loads(out)["sent_count"], 0)
-
-    def test_all_excluded_with_note(self):
-        a, pa, b, pb = self.two_sessions()
-        self.w.list()
-        code, out, err = self.send(exclude="1,2", note="全部外したけど感想はある")
-        self.assertEqual(code, 0, err)
-        fin = self.srv.finish_bodies[0]
-        self.assertEqual((fin["sent"], fin["excluded_count"]), ([], 2))
-
-    def test_shares_history_stops_until_confirmed(self):
-        a = Lines(base=time.time() - 7200).user("元の会話").assistant()
-        b = Lines(base=time.time() - 3600).copy_from(a).user("分岐").assistant()
-        self.w.write(a)
-        self.w.write(b)
-        items = self.w.list()["items"]
-        self.assertEqual(items[0]["shares_history_with"], [2])
-        code, out, err = self.send(exclude="1")
-        self.assertEqual(code, agentlog.EXIT_CONFIRM_SHARED)
-        self.assertIn("2 番と 1 番", err)
-        self.assertEqual(self.srv.upload_batches, [])
-        self.assertEqual(self.srv.finish_bodies, [])
-        code, out, err = self.send(exclude="1", extra=["--confirm-shared"])
-        self.assertEqual(code, 0, err)
-        self.assertEqual(json.loads(out)["sent_count"], 1)
-
-    def test_pending_guard(self):
+    def test_4xx_is_not_retried(self):
         self.two_sessions()
+        self.w.list()
+        self.srv.uploads_status = (400, "invalid_argument")
         code, out, err = self.send()
-        self.assertEqual(code, agentlog.EXIT_USAGE)
-        self.assertIn("/send-to-nobu", err)
-        self.w.list()
-        code, out, err = self.w.run("send", "--exclude", "none", "--code", "x", "--api-base", self.srv.base,
-                                    session="another-session")
-        self.assertEqual(code, agentlog.EXIT_USAGE)
-        code, out, err = self.w.run("send", "--exclude", "none", "--code", "x", "--api-base", self.srv.base,
-                                    now=time.time() + 7 * 3600)
-        self.assertEqual(code, agentlog.EXIT_USAGE)
-        self.assertIn("古い", err)
-        self.assertEqual(self.srv.upload_batches, [])
-
-    def test_exclude_parsing(self):
-        self.two_sessions()
-        self.w.list()
-        for bad in ("3", "1,x", "0-5"):
-            code, out, err = self.send(exclude=bad)
-            self.assertEqual(code, agentlog.EXIT_USAGE, bad)
-        self.assertEqual(agentlog.parse_exclude("１、2", {1: 0, 2: 0}), {1, 2})
-        self.assertEqual(agentlog.parse_exclude("なし", {1: 0}), set())
-        self.assertEqual(agentlog.parse_exclude("1-2", {1: 0, 2: 0, 3: 0}), {1, 2})
+        self.assertEqual(code, agentlog.EXIT_ERROR)
+        self.assertEqual(self.srv.upload_calls, 1)
+        self.srv.uploads_status = (500, "internal")
+        self.send()
+        self.assertEqual(self.srv.upload_calls, 1 + agentlog.RETRIES + 1)
 
     def test_unauthorized(self):
         self.two_sessions()
@@ -284,25 +392,13 @@ class SendTest(unittest.TestCase):
         code, out, err = self.send()
         self.assertEqual(code, 0, err)
         self.assertEqual(json.loads(out)["sent_count"], 2)
-        self.assertEqual(self.w.state()["sessions"] != {}, True)
 
     def test_already_finished_is_success(self):
         self.w.list()
-        self.srv.finished = True  # 送信票はもう置かれている
+        self.srv.finished = True
         code, out, err = self.send(note="感想")
         self.assertEqual(code, 0, err)
         self.assertIsNone(self.w.pending())
-
-    def test_4xx_is_not_retried(self):
-        self.two_sessions()
-        self.w.list()
-        self.srv.uploads_status = (400, "invalid_argument")
-        code, out, err = self.send()
-        self.assertEqual(code, agentlog.EXIT_ERROR)
-        self.assertEqual(self.srv.upload_calls, 1)
-        self.srv.uploads_status = (500, "internal")
-        code, out, err = self.send()
-        self.assertEqual(self.srv.upload_calls, 1 + agentlog.RETRIES + 1)
 
     def test_ssl_falls_back_to_system_bundle(self):
         import ssl
@@ -315,23 +411,87 @@ class SendTest(unittest.TestCase):
         self.assertGreater(ctx.cert_store_stats()["x509_ca"], 0)
         self.assertEqual(ctx.verify_mode, ssl.CERT_REQUIRED)
 
-    def test_api_base_allowlist(self):
-        self.two_sessions()
-        self.w.list()
-        for bad in ("https://evil.example.com", "http://agent-log-inbox-mcp.androots.co.jp",
-                    "https://agent-log-inbox-mcp.androots.co.jp.evil.com", self.srv.base + "/x"):
-            code, out, err = self.w.run("send", "--exclude", "none", "--code", FakeInbox.CODE, "--api-base", bad)
-            self.assertEqual(code, agentlog.EXIT_USAGE, bad)
-        self.assertEqual(self.srv.upload_calls, 0)
-        self.assertIsNotNone(self.w.pending())
-        # 本番の既定値
-        self.assertEqual(self.saved_allowed, ("https://agent-log-inbox-mcp.androots.co.jp",))
-        self.assertEqual(agentlog.check_api_base(self.srv.base + "/"), self.srv.base)
 
-    def test_note_too_long(self):
-        self.w.list()
-        code, out, err = self.send(note="あ" * (agentlog.NOTE_MAX + 1))
+class SafetyTest(SendBase):
+    def test_shares_history_stops_until_confirmed(self):
+        a = Lines(base=time.time() - 7200).user("元の会話").assistant()
+        b = Lines(base=time.time() - 3600).copy_from(a).user("分岐").assistant()
+        self.w.write(a)
+        self.w.write(b)
+        items = self.w.list()["items"]
+        self.assertEqual(items[0]["shares_history_with"], [2])
+        code, out, err = self.send(exclude="1")
+        self.assertEqual(code, agentlog.EXIT_CONFIRM_SHARED)
+        self.assertIn("2 番と 1 番", err)
+        self.assertEqual(self.srv.upload_calls, 0)
+        code, out, err = self.send(exclude="1", extra=["--confirm-shared"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["sent_count"], 1)
+
+    def test_pending_guard(self):
+        self.two_sessions()
+        code, out, err = self.send()
         self.assertEqual(code, agentlog.EXIT_USAGE)
+        self.assertIn("/send-to-nobu", err)
+        self.w.list()
+        other = self.w.start_send_session()
+        code, out, err = self.send(session=other)
+        self.assertEqual(code, agentlog.EXIT_USAGE)
+        code, out, err = self.send(now=time.time() + 7 * 3600)
+        self.assertEqual(code, agentlog.EXIT_USAGE)
+        self.assertIn("古い", err)
+        self.assertEqual(self.srv.upload_calls, 0)
+
+    def test_tampered_pending_path_is_refused(self):
+        a, pa, b, pb = self.two_sessions()
+        self.w.list()
+        p = self.w.pending()
+        link = os.path.join(self.w.tmp, "outside.jsonl")
+        os.symlink(pa, link)
+        p["items"][0]["path"] = link
+        agentlog.write_json_atomic(os.path.join(self.w.data, "pending.json"), p)
+        code, out, err = self.send()
+        self.assertEqual(code, agentlog.EXIT_ERROR)
+        self.assertEqual(self.srv.put_attempts, {})
+
+    def test_old_pack_dirs_are_swept(self):
+        self.w.list()
+        os.makedirs(os.path.join(self.w.data, "pack-999999-dead"))      # もういないプロセス
+        os.makedirs(os.path.join(self.w.data, "pack-oldformat"))
+        alive = os.path.join(self.w.data, "pack-%d-alive" % os.getppid())  # 生きているプロセスは残す
+        os.makedirs(alive)
+        code, out, err = self.send(note="感想")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(glob.glob(os.path.join(self.w.data, "pack-*")), [alive])
+
+    def test_sigterm_removes_the_temp_dir(self):
+        a, pa, b, pb = self.two_sessions()
+        self.w.list()
+        self.w.reply("なし")
+        self.srv.put_delay = 5.0
+        runner = textwrap.dedent("""
+            import sys
+            sys.path.insert(0, %r)
+            import agentlog
+            agentlog.PROJECTS_DIR = %r
+            agentlog.ALLOWED_API_BASES = (%r,)
+            agentlog.ALLOWED_PUT_PREFIXES = (%r,)
+            agentlog._OPENER = agentlog.build_opener(use_proxy=False)
+            sys.exit(agentlog.main(["send", "--exclude", "none", "--code", %r, "--api-base", %r,
+                                    "--data-dir", %r]))
+        """) % (os.path.dirname(agentlog.__file__), self.w.projects, self.srv.base, self.srv.base + "/put/",
+                FakeInbox.CODE, self.srv.base, self.w.data)
+        env = dict(os.environ, CLAUDE_CODE_SESSION_ID=self.w.current)
+        proc = subprocess.Popen([sys.executable, "-c", runner], env=env, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE)
+        deadline = time.time() + 10
+        while time.time() < deadline and not self.srv.put_attempts:
+            time.sleep(0.05)
+        self.assertTrue(glob.glob(os.path.join(self.w.data, "pack-*")))
+        proc.send_signal(signal.SIGTERM)
+        proc.communicate(timeout=10)
+        self.assertEqual(proc.returncode, 128 + signal.SIGTERM)
+        self.assertEqual(glob.glob(os.path.join(self.w.data, "pack-*")), [])
         self.assertEqual(self.srv.finish_bodies, [])
 
 
