@@ -799,18 +799,63 @@ class AskAnswerTest(SendBase):
         self.assertEqual(fin["note"], "わからないことがあった。コマンドの意味")
         self.assertEqual(fin["excluded_count"], 1)
 
-    def test_unanswered_exclude_question_leans_to_excluding_cautions(self):
+    def test_exclude_question_needs_an_explicit_answer(self):
         self.convs(3)
         self.check(caution=[1], ok=[2], unknown=[3])
         qs = self.w.ask()
-        self.w.answer(qs, {qs[2]["question"]: "なし"})                     # 外す・送るは答えなかった
+        self.w.answer(qs, {qs[2]["question"]: "なし"})                     # 外すは答えなかった
+        code, out, err = self.send_answered()
+        self.assertEqual(code, agentlog.EXIT_BAD_ANSWER, err)             # 送らずに聞き直す
+        self.assertEqual((self.srv.upload_calls, self.srv.finish_bodies), (0, []))
+        self.w.answer(qs, {qs[0]["question"]: "なし（全部送る）"})          # 聞き直して答えた
         code, out, err = self.send_answered()
         self.assertEqual(code, 0, err)
         res = json.loads(out)
-        # 気をつけた方がいい 1 番は外す側に倒す。ほかは送る（未確認の 3 番は既定どおり送らない）
-        self.assertEqual((res["sent_count"], res["excluded_count"], res["deferred_unconfirmed"], res["unanswered_excluded"]),
-                         (1, 1, 1, 1))
-        self.assertEqual(self.srv.finish_bodies[0]["note"], "")
+        self.assertEqual((res["sent_count"], res["excluded_count"], res["deferred_unconfirmed"]), (2, 0, 1))
+        self.assertNotIn("unanswered_excluded", res)
+
+    def test_every_exclude_question_needs_an_answer(self):
+        self.convs(8)
+        self.check(caution=range(1, 8), ok=[8])
+        qs = self.w.ask()
+        self.assertEqual([q["header"] for q in qs], ["外す 1/3", "外す 2/3", "外す 3/3", "感想"])
+        self.w.answer(qs, {qs[0]["question"]: "なし（全部送る）", qs[1]["question"]: "なし（全部送る）"})
+        code, out, err = self.send_answered()
+        self.assertEqual(code, agentlog.EXIT_BAD_ANSWER, err)
+        self.assertEqual(self.srv.upload_calls, 0)
+
+    def test_away_from_keyboard_is_not_an_answer(self):
+        self.convs(2)
+        self.check(caution=[1], ok=[2])
+        qs = self.w.ask()
+        # 実データの形: 離席で自動的に閉じると answers が空（または選びかけ）で afkTimeoutMs が付く
+        self.w.answer(qs, {}, afk=300000)
+        code, out, err = self.send_answered()
+        self.assertEqual(code, agentlog.EXIT_NOT_ANSWERED, err)
+        self.w.answer(qs, {qs[0]["question"]: "なし（全部送る）"}, afk=300000)   # 選びかけで閉じても数えない
+        self.assertEqual(self.send_answered()[0], agentlog.EXIT_NOT_ANSWERED)
+        self.assertEqual(self.srv.upload_calls, 0)
+        # 本物の答えのあとに離席の結果が来ても、本物の答えは消えない
+        self.w.answer(qs, {qs[0]["question"]: "1. 会話 00（第三者への発言）"})
+        self.w.answer(qs, {}, afk=300000)
+        code, out, err = self.send_answered()
+        self.assertEqual(code, 0, err)
+        self.assertEqual((json.loads(out)["sent_count"], json.loads(out)["excluded_count"]), (1, 1))
+
+    def test_input_field_takes_only_numbers(self):
+        self.convs(4)
+        self.check(caution=[1], ok=[2, 3, 4])
+        qs = self.w.ask()
+        for text in ("1以外は全部外して", "3は送らないで", "3 も", "全部"):
+            self.w.answer(qs, {qs[0]["question"]: text})
+            code, out, err = self.send_answered()
+            self.assertEqual(code, agentlog.EXIT_BAD_ANSWER, text)
+            self.assertIn("番号だけ", err)
+        self.assertEqual(self.srv.upload_calls, 0)
+        self.w.answer(qs, {qs[0]["question"]: "2、3番"})
+        code, out, err = self.send_answered()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["excluded_count"], 2)
 
     def test_none_option_sends_everything_and_numbers_win_over_none(self):
         self.convs(3)
@@ -822,7 +867,8 @@ class AskAnswerTest(SendBase):
         code, out, err = self.send_answered()
         self.assertEqual(code, 0, err)
         res = json.loads(out)
-        self.assertEqual((res["sent_count"], res["excluded_count"], res["unanswered_excluded"]), (3, 0, 0))
+        self.assertEqual((res["sent_count"], res["excluded_count"]), (3, 0))
+        self.assertNotIn("unanswered_excluded", res)
 
     def test_numbers_win_when_none_is_also_selected(self):
         self.convs(3)
@@ -833,24 +879,11 @@ class AskAnswerTest(SendBase):
         self.assertEqual(code, 0, err)
         self.assertEqual((json.loads(out)["sent_count"], json.loads(out)["excluded_count"]), (1, 2))
 
-    def test_unanswered_last_question_also_covers_cautions_not_in_the_options(self):
-        self.convs(12)
-        self.check(caution=range(1, 11), ok=[11, 12])
-        qs = self.w.ask()
-        self.assertEqual([q["header"] for q in qs], ["外す 1/3", "外す 2/3", "外す 3/3", "感想"])
-        self.assertEqual([len(q["options"]) for q in qs[:3]], [4, 4, 4])     # 3 件 + 「なし（全部送る）」
-        # 1 つ目は「なし」、2 つ目は 1 件だけ、3 つ目（と入りきらなかった 10 番）は答えなかった
-        self.w.answer(qs, {qs[0]["question"]: "なし（全部送る）", qs[1]["question"]: qs[1]["options"][0]["label"]})
-        code, out, err = self.send_answered()
-        self.assertEqual(code, 0, err)
-        res = json.loads(out)
-        self.assertEqual((res["excluded_count"], res["unanswered_excluded"], res["sent_count"]), (5, 4, 7))
-
     def test_numbers_typed_in_the_input_field(self):
         self.convs(6)
         self.check(caution=[1], ok=[2, 3, 4, 5, 6])
         qs = self.w.ask()
-        self.w.answer(qs, {qs[0]["question"]: "1. 会話 00（第三者への発言）, ４ と 5-6 も"})
+        self.w.answer(qs, {qs[0]["question"]: "1. 会話 00（第三者への発言）, ４ と 5-6番"})
         code, out, err = self.send_answered()
         self.assertEqual(code, 0, err)
         self.assertEqual(json.loads(out)["excluded_count"], 4)
@@ -885,12 +918,15 @@ class AskAnswerTest(SendBase):
         self.assertEqual(code, 0, err)
         self.assertEqual(self.srv.finish_bodies[0]["assistant_note"], "確認係は全部届いた")
 
-    def test_a_newer_text_reply_wins_over_the_selection_screen(self):
+    def test_only_a_send_command_reply_overrides_the_selection_screen(self):
         self.convs(2)
         self.check(ok=[1, 2])
         qs = self.w.ask()
         self.w.answer(qs, {qs[0]["question"]: "なし（全部送る）"})
-        self.w.reply("2 は外して")                                           # 送る前に止まって、返事で答え直した
+        self.w.reply("2 は外して", plain=True)                                # ふつうの文では切り替えない
+        code, out, err = self.send_answered(extra=["--exclude", "2"])
+        self.assertEqual(code, agentlog.EXIT_USAGE, err)
+        self.w.reply("2 は外して")                                           # /send-to-nobu <返事> で答え直した
         code, out, err = self.send_answered(extra=["--exclude", "2"])
         self.assertEqual(code, 0, err)
         self.assertEqual((json.loads(out)["sent_count"], json.loads(out)["excluded_count"]), (1, 1))
@@ -964,8 +1000,42 @@ class AskAnswerTest(SendBase):
         code, out, err = self.send_answered()
         self.assertEqual(code, 0, err)
         res = json.loads(out)
-        self.assertEqual((res["excluded_count"], res["deferred_unconfirmed"], res["sent_count"], res["unanswered_excluded"]),
-                         (2, 7, 21, 0))
+        self.assertEqual((res["excluded_count"], res["deferred_unconfirmed"], res["sent_count"]), (2, 7, 21))
+
+    def overview(self, qs):
+        q = qs[0]["question"]
+        return q[:q.rindex("\n\n")].split("\n")
+
+    def test_long_lists_are_condensed_in_the_selection_screen(self):
+        self.convs(60)
+        out = self.check(caution=[5, 40], unknown=[50], ok=[k for k in range(1, 61) if k not in (5, 40, 50)])
+        lines = self.overview(out["ask"]["questions"])
+        self.assertLessEqual(len(lines), agentlog.OVERVIEW_MAX_LINES)
+        self.assertLessEqual(len("\n".join(lines)), agentlog.OVERVIEW_MAX_CHARS)
+        self.assertEqual(len(out["display"]["items"]), 60)                   # 本文用の一覧は全部のまま
+        # 気をつける・既定では送らない会話は、タイトルを略さずに先に出す
+        for n in (5, 40, 50):
+            self.assertIn(out["display"]["items"][n - 1], lines)
+        self.assertTrue(any("1. 会話 00" in line and "／" in line for line in lines))   # ほかは短く詰める
+
+    def test_very_long_lists_fall_back_to_number_ranges(self):
+        now = time.time()
+        for i in range(261):
+            self.w.write(Lines(base=now - 400000 + i * 1000).user("とても長いタイトルの会話 %03d 番目の相談" % i).assistant())
+        with mock.patch.object(agentlog, "TOTAL_CHECKER_CAP", 300):
+            r = self.w.list()
+        out = self.w.check()
+        lines = self.overview(out["ask"]["questions"])
+        self.assertLessEqual(len(lines), agentlog.OVERVIEW_MAX_LINES)
+        self.assertLessEqual(len("\n".join(lines)), agentlog.OVERVIEW_MAX_CHARS)
+        self.assertIn("ほかの会話: 1-%d" % r["count"], lines)
+        if r.get("not_listed"):
+            self.assertTrue(lines[-1].startswith("ほかに古い会話が %d 件" % r["not_listed"]))
+
+    def test_short_lists_are_shown_in_full(self):
+        self.convs(5)
+        out = self.check(caution=[1], ok=[2, 3, 4, 5])
+        self.assertEqual(self.overview(out["ask"]["questions"])[-5:], out["display"]["items"])
 
     def test_nothing_to_send_still_asks_for_the_note(self):
         self.w.list()

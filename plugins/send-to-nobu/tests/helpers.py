@@ -196,7 +196,7 @@ class World(object):
         if os.path.exists(path):
             self.append(path, Lines(sid=sid or self.current).user(text if plain else send_cmd(text)))
 
-    def answer(self, questions, answers, sid=None, annotations=None, answers_in_input=False, error=False):
+    def answer(self, questions, answers, sid=None, annotations=None, answers_in_input=False, error=False, afk=None):
         """本人が選択画面（AskUserQuestion）に答えた 2 行（AI の tool_use と、答えの tool_result）を、いまの会話に足す。
 
         形は Claude Code 2.1.284 の対話で実際に残った行に合わせる（toolUseResult に questions・answers・annotations）。
@@ -217,6 +217,8 @@ class World(object):
             result["is_error"] = True
         else:
             extra["toolUseResult"] = {"questions": questions, "answers": answers, "annotations": annotations or {}}
+            if afk is not None:
+                extra["toolUseResult"]["afkTimeoutMs"] = afk   # 離席で自動的に閉じた（実データにある形）
         L._msg("user", [result], **extra)
         self.append(self.session_file(sid), L)
 

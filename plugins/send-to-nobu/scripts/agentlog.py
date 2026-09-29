@@ -883,6 +883,20 @@ def has_turn_after(path, offset):
     return False
 
 
+def send_reply_after(path, offset):
+    """offset 以降に、引数つきの /send-to-nobu <返事> があるか（選択画面の答えから逃げ道に切り替える合図）。"""
+    with open_nofollow(path) as fh:
+        fh.seek(offset)
+        for raw in fh:
+            d = parse_line(raw)
+            if d is None:
+                continue
+            kind, text = classify(d)
+            if kind == "send" and _command_args(text):
+                return True
+    return False
+
+
 def reply_after(path, offset):
     """offset 以降に本人の返事（人の指示、または引数付きの送信コマンド）があるか。
 
@@ -1965,7 +1979,8 @@ def _apply_checked(pending, incoming, now):
         # 答えがそろった: 一覧を出して選択画面で聞く。このあとの答えでは結果を変えない
         display = display_summary(convs, pending["items"])
         if not pending.get("closed") or not pending.get("ask"):
-            pending["ask"] = build_ask(pending["items"], convs, overview_lines(pending.get("output") or {}, display))
+            pending["ask"] = build_ask(pending["items"], convs,
+                                       overview_lines(pending.get("output") or {}, display, pending["items"], convs))
         pending["closed"] = True
         result["display"] = display
         result["ask"] = {"questions": pending["ask"]["questions"]}
@@ -2015,18 +2030,77 @@ def display_summary(convs, items=()):
             "items": [item_line(it) for it in items]}
 
 
-def overview_lines(list_output, display):
-    """選択画面の最初の質問の頭に入れる一覧（結論・番号つきのタイトル）。AI の本文に頼らず、本人に必ず見せるため。"""
-    lines = []
+OVERVIEW_MAX_LINES = 40         # 選択画面の最初の質問に入れる一覧の行数の目安（ふつうの端末の高さに収める）
+OVERVIEW_MAX_CHARS = 3000
+OVERVIEW_SHORT_TITLE = 12
+OVERVIEW_LINE_CHARS = 64
+
+
+def _ranges(ns):
+    out, ns = [], sorted(ns)
+    i = 0
+    while i < len(ns):
+        j = i
+        while j + 1 < len(ns) and ns[j + 1] == ns[j] + 1:
+            j += 1
+        out.append(str(ns[i]) if i == j else "%d-%d" % (ns[i], ns[j]))
+        i = j + 1
+    return ", ".join(out)
+
+
+def _packed(entries):
+    """「n. 短いタイトル」を 1 行に詰める。"""
+    lines, cur = [], ""
+    for e in entries:
+        if cur and len(cur) + 1 + len(e) > OVERVIEW_LINE_CHARS:
+            lines.append(cur)
+            cur = e
+        else:
+            cur = "%s／%s" % (cur, e) if cur else e
+    return lines + ([cur] if cur else [])
+
+
+def overview_lines(list_output, display, items=(), convs=()):
+    """選択画面の最初の質問の頭に入れる一覧（結論・番号つきのタイトル）。AI の本文に頼らず、本人に必ず見せるため。
+
+    長いときは、気をつけた方がいい会話・既定では送らない会話を先に出し、ほかは短いタイトル → 番号の範囲だけ、と縮める。
+    """
+    head = []
     if list_output.get("first_run"):
-        lines.append("初回なので %s 以降の分" % list_output.get("since", ""))
-    lines += display["text"]
-    if display["items"]:
-        lines += [""] + display["items"]
+        head.append("初回なので %s 以降の分" % list_output.get("since", ""))
+    head += display["text"]
+    tail = []
     if list_output.get("not_listed"):
-        lines.append("ほかに古い会話が %d 件ある（多すぎて今回は出せなかった。次の /send-to-nobu で出る）"
-                     % list_output["not_listed"])
-    return lines
+        tail.append("ほかに古い会話が %d 件ある（多すぎて今回は出せなかった。次の /send-to-nobu で出る）"
+                    % list_output["not_listed"])
+    result = {c["n"]: c for c in convs}
+
+    def flagged(it):
+        c = result.get(it["n"]) or {}
+        det = c.get("detect") or {}
+        return (c.get("result") in ("caution", "unconfirmed") or det.get("card") or det.get("secret")
+                or it.get("previously_excluded") or it.get("contains_excluded_copy") or it.get("shares")
+                or it.get("group_cut"))
+
+    def short(it):
+        return "%d. %s" % (it["n"], squash(it.get("title") or "", OVERVIEW_SHORT_TITLE))
+    marked = [it for it in items if flagged(it)]
+    plain = [it for it in items if not flagged(it)]
+    candidates = [display["items"]]
+    if items:
+        candidates += [
+            [item_line(it) for it in marked] + _packed([short(it) for it in plain]),
+            _packed([short(it) for it in marked]) + (["ほかの会話: " + _ranges([it["n"] for it in plain])] if plain else []),
+            (["気をつける・既定では送らない会話: " + _ranges([it["n"] for it in marked])] if marked else [])
+            + (["ほかの会話: " + _ranges([it["n"] for it in plain])] if plain else []),
+        ]
+    body = candidates[-1]
+    for cand in candidates:
+        lines = head + ([""] + cand if cand else []) + tail
+        if len(lines) <= OVERVIEW_MAX_LINES and len("\n".join(lines)) <= OVERVIEW_MAX_CHARS:
+            body = cand
+            break
+    return head + ([""] + body if body else []) + tail
 
 
 def item_line(it):
@@ -2105,8 +2179,7 @@ def build_ask(items, convs, overview=()):
 
     外す会話（既定で送る会話のうち、気をつけた方がいい会話）・送る会話（既定では送らない会話）・感想。
     質問は 4 つまで、選択肢は 2〜4 個。入りきらない会話の番号は入力欄（Type something）に書いてもらう。
-    外す質問には「なし（全部送る）」を必ず入れる。外す質問に答えなかったら、その質問の会話（入りきらなかった分は
-    最後の外す質問が受け持つ）を外す側に倒す（unanswered）。
+    外す質問には「なし（全部送る）」を必ず入れる（答えが要る。答えが無ければ送らずに聞き直す）。
     overview（一覧）は最初の質問の頭に入れる（選択画面にそのまま出る）。
     """
     by_n = {it["n"]: it for it in items}
@@ -2148,11 +2221,10 @@ def build_ask(items, convs, overview=()):
         chunks, rest = _balanced_chunks(ex, q_ex, per_ex)
         for i, chunk in enumerate(chunks, 1):
             part = " %d/%d" % (i, len(chunks)) if len(chunks) > 1 else ""
-            add("exclude", "外す" + part, "外す会話は？（気をつけた方がいい会話%s。ほかに外す番号は入力欄に）" % part,
+            add("exclude", "外す" + part, "外す会話は？（気をつけた方がいい会話%s。ほかに外す番号は入力欄に番号だけ。例: 3, 5-7）" % part,
                 chunk, EXCLUDE_NONE)
-            qmap[-1]["unanswered"] = [n for n, _ in chunk] + ([n for n, _ in rest] if i == len(chunks) else [])
     else:
-        add("exclude", "外す", "外す会話は？（外すなら番号を入力欄に）",
+        add("exclude", "外す", "外す会話は？（外すなら入力欄に番号だけ。例: 3, 5-7）",
             [], None, multi=False)
         qmap[-1]["labels"] = collections.OrderedDict([(EXCLUDE_NONE, None), (EXCLUDE_ALL, "all")])
         questions[-1]["options"] = [{"label": EXCLUDE_NONE, "description": ""},
@@ -2161,7 +2233,7 @@ def build_ask(items, convs, overview=()):
         chunks, _rest = _balanced_chunks(inc, q_in, ASK_OPTIONS)
         for i, chunk in enumerate(chunks, 1):
             part = " %d/%d" % (i, len(chunks)) if len(chunks) > 1 else ""
-            add("include", "送る" + part, "送る会話は？（既定では送らない会話%s。選んだものだけ送る。ほかの番号は入力欄に）" % part,
+            add("include", "送る" + part, "送る会話は？（既定では送らない会話%s。選んだものだけ送る。ほかの番号は入力欄に番号だけ）" % part,
                 chunk, INCLUDE_NONE if len(chunk) < 2 else None)
     questions.append({"question": NOTE_QUESTION, "header": "感想", "multiSelect": False,
                       "options": [{"label": lb, "description": ""} for lb in NOTE_OPTIONS]})
@@ -2183,21 +2255,42 @@ def _annotation_text(annotations, question):
     return a.strip() if isinstance(a, str) else ""
 
 
-def parse_answers(ask, answers, annotations, numbers):
-    """選択画面の答え → (外す番号, 送る番号, 感想, 答えなかったので外した番号)。一覧に無い番号は EXIT_BAD_ANSWER。
+_FREE_NUMBERS_RE = re.compile(r"^[\d\s,、，・と番\-〜~～]*$")
 
-    答えなかった外す質問の、気をつけた方がいい会話は外す（安全側）。答えなかった送る質問・感想は何もしない。
-    「なし（全部送る）」とほかの番号を同時に選んだら、番号の方を採る。
+
+def _free_numbers(text, numbers):
+    """入力欄の文 → 番号。受け付けるのは数字・範囲・区切り・「なし」だけ（「1 以外は外して」のような文は読み違えるので
+    聞き直す）。一覧に無い番号も聞き直す。"""
+    t = unicodedata.normalize("NFKC", text or "").strip()
+    if not t or t in ("なし", "none"):
+        return set()
+    if not _FREE_NUMBERS_RE.match(t):
+        raise Fail("入力欄には番号だけを書いてもらう（例: 3, 5-7）。読めない答え: %s" % t[:30], EXIT_BAD_ANSWER)
+    out = set()
+    for m in _ANSWER_NUM_RE.finditer(t):
+        lo, hi = int(m.group(1)), int(m.group(2) or m.group(1))
+        if hi < lo or any(k not in numbers for k in range(lo, hi + 1)):
+            raise Fail("答えの番号（%s）は一覧に無い" % m.group(0), EXIT_BAD_ANSWER)
+        out.update(range(lo, hi + 1))
+    return out
+
+
+def parse_answers(ask, answers, annotations, numbers):
+    """選択画面の答え → (外す番号, 送る番号, 感想)。
+
+    外す質問は明示の答え（「なし（全部送る）」か番号）が要る。無い・入力欄が番号でない・一覧に無い番号は
+    EXIT_BAD_ANSWER（同じ質問で聞き直す）。「なし（全部送る）」とほかの番号を同時に選んだら番号の方を採る。
+    答えなかった送る質問・感想は何もしない（既定どおり）。
     """
-    exclude, include, notes, unanswered = set(), set(), [], set()
+    exclude, include, notes = set(), set(), []
     for q in ask["map"]:
         a = answers.get(q["question"])
         extra = _annotation_text(annotations, q["question"])
         if not isinstance(a, str):
             a = ""
-        if not a and not extra:
+        if not a.strip() and not extra:
             if q["kind"] == "exclude":
-                unanswered.update(int(n) for n in q.get("unanswered") or [])
+                raise Fail("外す会話の質問に答えが無い（「なし（全部送る）」か番号を選んでもらう）", EXIT_BAD_ANSWER)
             continue
         labels = q["labels"]
         if q["kind"] == "note":
@@ -2216,24 +2309,19 @@ def parse_answers(ask, answers, annotations, numbers):
                     chosen.add(int(v))
             elif tok.strip():
                 other.append(tok)
-        free = unicodedata.normalize("NFKC", " ".join(other + [extra]))
-        for m in _ANSWER_NUM_RE.finditer(free):
-            lo, hi = int(m.group(1)), int(m.group(2) or m.group(1))
-            if hi < lo or any(k not in numbers for k in range(lo, hi + 1)):
-                raise Fail("答えの番号（%s）は一覧に無い" % m.group(0), EXIT_BAD_ANSWER)
-            chosen.update(range(lo, hi + 1))
+        for free in other + ([extra] if extra else []):
+            chosen |= _free_numbers(free, numbers)
         if all_:
             chosen.update(numbers)
         (exclude if q["kind"] == "exclude" else include).update(chosen)
-    exclude |= unanswered
-    return exclude, include - exclude, "\n".join(notes), unanswered
+    return exclude, include - exclude, "\n".join(notes)
 
 
 def find_ask_answer(path, offset, questions):
     """offset 以降で、questions をそのまま（質問文・選択肢まで同じに）聞いた AskUserQuestion への本人の答え。
 
     答えは利用者の操作からしか作られない tool_result（toolUseResult.answers）から読む。AI が answers を入れて呼んだ
-    質問や、選択肢を書き換えた質問は数えない。無ければ None、あれば最後の (answers, annotations, 答えの行の終わりの位置)。
+    質問や、選択肢を書き換えた質問、離席で自動的に閉じた結果（afkTimeoutMs）、答えが空の結果は数えない。無ければ None、あれば最後の (answers, annotations, 答えの行の終わりの位置)。
     """
     def shape(qs):
         if not isinstance(qs, list):
@@ -2268,7 +2356,9 @@ def find_ask_answer(path, offset, questions):
                 for b in content:
                     if (isinstance(b, dict) and b.get("type") == "tool_result" and b.get("tool_use_id") in asked
                             and not b.get("is_error") and isinstance(tur, dict) and isinstance(tur.get("answers"), dict)
+                            and tur["answers"] and "afkTimeoutMs" not in tur
                             and shape(tur.get("questions")) == want):
+                        # 離席で自動的に閉じた結果（afkTimeoutMs）・何も答えていない結果は答えにしない（前の答えも消さない）
                         found = (tur["answers"], tur.get("annotations") or {}, pos)
     return found
 
@@ -2736,13 +2826,13 @@ def _cmd_send(args, out, stdin):
     offset = int(pending.get("session_size") or 0)
     ask = pending.get("ask") if isinstance(pending.get("ask"), dict) else None
     answer = find_ask_answer(cur_path, offset, ask["questions"]) if ask else None
-    if answer is not None and args.exclude is not None and reply_after(cur_path, answer[2]):
+    if answer is not None and args.exclude is not None and send_reply_after(cur_path, answer[2]):
         answer = None   # 選択画面の答えのあとに、本人が /send-to-nobu <返事> で答え直した（逃げ道の方を使う）
     if answer is not None:
         # 選択画面（AskUserQuestion）の答えを、会話ログから直接読む。AI には番号も感想も渡させない
         if args.exclude is not None or args.include is not None:
             raise Fail("選択画面の答えがある。外す・送る番号は答えから読むので --exclude・--include は渡さない", EXIT_USAGE)
-        explicit, included, user_note, unanswered = parse_answers(ask, answer[0], answer[1], set(items))
+        explicit, included, user_note = parse_answers(ask, answer[0], answer[1], set(items))
     else:
         # 逃げ道: 一覧のあとの本人の返事（/send-to-nobu <返事>）を AI が読み取って渡す
         if args.exclude is None:
@@ -2754,7 +2844,7 @@ def _cmd_send(args, out, stdin):
         if explicit & included:
             raise Fail("同じ番号が --exclude と --include の両方にある: %s"
                        % ",".join(map(str, sorted(explicit & included))), EXIT_USAGE)
-        user_note, unanswered = None, set()
+        user_note = None
 
     def decide(explicit):
         # 確認係が確認できなかった会話は、送ると選ばれない限り今回は送らない。本人の判断ではないので「外した」とは
@@ -2839,7 +2929,6 @@ def _cmd_send(args, out, stdin):
         clear_reviews(data_dir)
         result = {"submission_id": None, "sent_count": 0, "excluded_count": len(excluded_items),
                   "deferred_unconfirmed": len(deferred - too_long), "too_long_count": len(too_long),
-                  "unanswered_excluded": len(unanswered),
                   "subagent_count": 0, "bytes": 0, "redactions": 0, "omitted": 0}
         if assistant_note:
             result["assistant_note_sent"] = False  # 送るものも感想もない日はサーバーに何も送らない
@@ -2904,7 +2993,6 @@ def _cmd_send(args, out, stdin):
         "excluded_count": len(excluded_items),
         "deferred_unconfirmed": len(deferred - too_long),
         "too_long_count": len(too_long),
-        "unanswered_excluded": len(unanswered),
         "subagent_count": sum(len(p["sent"]["subagents"]) for p in packed),
         "bytes": sum(f["bytes"] for f in files),
         "redactions": sum(p["sent"]["redactions"] for p in packed),
