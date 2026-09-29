@@ -4,6 +4,7 @@
 import base64
 import glob
 import gzip
+import io
 import json
 import os
 import signal
@@ -596,6 +597,75 @@ class ReasonCodeTest(unittest.TestCase):
         self.assertEqual(agentlog.reason_label("money"), "お金・個人の事業の話")
         self.assertEqual(agentlog.reason_label("other:社内の噂"), "その他（社内の噂）")
         self.assertEqual(agentlog.reason_label("other"), "その他")
+
+
+class TooLongTest(SendBase):
+    """確認しきれない長さの会話は「残り」に数えない（続けても確認係にかけられないので、続きに誘わない）。"""
+
+    def long_and_small(self):
+        L = Lines(base=time.time() - 9000)
+        for i in range(35):
+            L.user("指示 %03d " % i + "あ" * 900).assistant("返事 %03d " % i + "い" * 900)   # 確認係 3 体ぶん
+        self.long_path = self.w.write(L)
+        self.w.write(Lines(base=time.time() - 3000).user("小さな会話").assistant())
+        with mock.patch.object(agentlog, "CHECKER_CAP", 2):                  # 「1 会話で上限を超える」を小さく作る
+            res = self.w.list()
+        self.assertEqual(res["too_long_count"], 0)                             # この一覧の外には無い
+        return [it["session_id"] for it in res["items"] if it.get("too_long")][0]
+
+    def nudge(self):
+        out = io.StringIO()
+        self.assertEqual(agentlog.main(["nudge", "--data-dir", self.w.data], stdout=out), 0)
+        return json.loads(out.getvalue())["systemMessage"] if out.getvalue().strip() else None
+
+    def test_not_remaining_but_too_long_count(self):
+        long_sid = self.long_and_small()
+        self.w.check()
+        code, out, err = self.send(check=False)
+        self.assertEqual(code, 0, err)
+        res = json.loads(out)
+        self.assertEqual((res["sent_count"], res["deferred_unconfirmed"], res["too_long_count"], res["remaining"]),
+                         (1, 0, 1, 0))
+        self.assertNotIn(long_sid, self.w.state()["sessions"])                 # 外したとは記録しない（未決定のまま）
+        self.assertIn(long_sid, self.w.state()["too_long"])
+        # 朝の案内は、確認しきれない長さの会話だけなら出さない。書き足しても長いまま
+        self.w.append(self.long_path, Lines(sid=long_sid).user("さらに").assistant())
+        self.assertIsNone(self.nudge())
+        self.w.write(Lines(base=time.time() - 60).user("新しい会話").assistant())
+        self.assertIn("未送信の会話が 1 件", self.nudge())
+
+    def test_left_out_of_a_full_round_is_counted_separately(self):
+        self.long_and_small()
+        self.w.check()
+        self.assertEqual(self.send(check=False)[0], 0)
+        self.srv.finished = False
+        now = time.time()
+        for i in range(2):
+            self.w.write(Lines(base=now - 600 + i * 60).user("新しい会話 %d" % i).assistant())
+        with mock.patch.object(agentlog, "ROUND_SIZE", 2), mock.patch.object(agentlog, "CHECKER_CAP", 2):
+            r2 = self.w.list()
+        self.assertEqual((r2["count"], r2["remaining"], r2["too_long_count"]), (2, 0, 1))
+        self.w.check()
+        code, out, err = self.send(check=False)
+        self.assertEqual(code, 0, err)
+        res = json.loads(out)
+        self.assertEqual((res["sent_count"], res["too_long_count"], res["remaining"]), (2, 1, 0))
+
+    def test_include_sends_it_and_forgets_it(self):
+        long_sid = self.long_and_small()
+        self.w.check()
+        self.assertEqual(self.send(check=False)[0], 0)
+        self.srv.finished = False
+        with mock.patch.object(agentlog, "CHECKER_CAP", 2):
+            r2 = self.w.list()
+        self.assertEqual([(it["session_id"], it.get("too_long")) for it in r2["items"]], [(long_sid, True)])
+        self.w.check()
+        code, out, err = self.send(check=False, extra=["--include", "1"])      # 「1 も送る」
+        self.assertEqual(code, 0, err)
+        res = json.loads(out)
+        self.assertEqual((res["sent_count"], res["too_long_count"], res["remaining"]), (1, 0, 0))
+        self.assertEqual(self.w.state()["sessions"][long_sid]["d"], "sent")
+        self.assertNotIn(long_sid, self.w.state()["too_long"])
 
 
 class CheckedHardeningTest(SendBase):

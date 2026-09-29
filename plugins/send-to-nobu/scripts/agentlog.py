@@ -1054,7 +1054,7 @@ def cmd_nudge(args, out):
                 facts = cached_facts(cache, sid, path, st)
             except OSError:
                 continue
-            if listable(facts, rec, state["baseline"], st.st_mtime):
+            if listable(facts, rec, state["baseline"], st.st_mtime) and not known_too_long(state, sid, st.st_size):
                 n += 1
         if cache != old_cache:
             write_json_atomic(cache_path(data_dir), cache)
@@ -1153,10 +1153,17 @@ def build_list(state, current, excluded_store, cache):
             "shares_idx": sorted(shares.get(idx, ())),
             "previously_excluded": bool((rec and rec.get("d") == "excluded") or sid in excluded_store),
             "deferred_before": sid in (state.get("deferred") or {}),
+            "known_too_long": known_too_long(state, sid, st.st_size),
             "contains_excluded_copy": any(
                 (excluded_hashes.get(uuid_hash(u), set()) - {sid}) for u in s.head_uuids),
         })
     return items, [r[5] for r in rows]
+
+
+def known_too_long(state, sid, size):
+    """前のラウンドで確認しきれない長さだった会話か（そのあと書き足されても長いまま）。"""
+    rec = (state.get("too_long") or {}).get(sid)
+    return isinstance(rec, dict) and isinstance(rec.get("size"), int) and size >= rec["size"]
 
 
 def share_groups(items):
@@ -1525,7 +1532,7 @@ def render_round(items, shown, state, remaining, reviews, checkers, compact=Fals
                 row[key] = rev[key]
         rows.append(row)
         p = {k: v for k, v in it.items()
-             if k not in ("prompt_count", "total_bytes", "last_ts", "shares_idx", "deferred_before")}
+             if k not in ("prompt_count", "total_bytes", "last_ts", "shares_idx", "deferred_before", "known_too_long")}
         p.update({"n": n, "shares": shares, "group_cut": cut, "checkers": rev.get("checkers") or [],
                   "too_big": bool(rev.get("too_big")), "too_long": bool(rev.get("too_long")),
                   "review_error": bool(rev.get("review_error")),
@@ -1636,8 +1643,13 @@ def cmd_list(args, out):
         review_dir = make_review_dir(data_dir, now)
         header["review_dir"] = review_dir
         reviews, checkers = build_round(items, rows, unchecked, layers, review_dir)
-        remaining = len(items) - len(rows)
-        result, pend = render_round(items, rows, state, remaining, reviews, checkers, compact, cut, header)
+        in_round = set(rows)
+        rest = [i for i in range(len(items)) if i not in in_round]
+        too_long_rest = sum(1 for i in rest if items[i].get("known_too_long"))
+        # 確認しきれない長さの会話は「残り」に数えない（続けても確認係にかけられない）。別の数で出す
+        header["too_long_count"] = too_long_rest
+        result, pend = render_round(items, rows, state, len(rest) - too_long_rest, reviews, checkers,
+                                    compact, cut, header)
         return result, pend, review_dir, checkers
 
     got = None
@@ -1654,7 +1666,8 @@ def cmd_list(args, out):
     result, pend_items, review_dir, checkers = got
     pending = {LIST_MARKER: 1, "v": PENDING_VERSION, "session": sid, "created_at": iso_utc(now), "created_ts": now,
                "session_size": file_size(cur_path), "items": pend_items, "output": result,
-               "remaining": result["remaining"], "review_dir": review_dir,
+               "remaining": result["remaining"], "too_long_rest": result["too_long_count"],
+               "review_dir": review_dir,
                "checkers": {str(c["id"]): c["n"] for c in checkers},
                "tickets": {c["ticket"]: c["id"] for c in checkers},
                "checker_list": [{"id": c["id"], "ticket": c["ticket"], "n": c["n"], "parts": c["parts"],
@@ -2271,16 +2284,23 @@ def record_decisions(data_dir, now, packed, excluded_items, sid, note_sent, defe
     """送った / 外したを、判断した時点（一覧の時点）の位置で状態に記録する。この会話のラウンド数と感想の有無も。
 
     確認できなかった会話（deferred_items）は判断を記録せず、次の一覧でラウンドの後ろに回す印だけ付ける。
+    そのうち確認しきれない長さの会話は、そのときの大きさも覚える（残りの数・朝の案内から外すため）。
     """
     state = load_state(data_dir, now)
     sessions = state["sessions"]
     deferred = dict(state.get("deferred") or {})
+    too_long = dict(state.get("too_long") or {})
     for it in deferred_items:
         deferred[it["session_id"]] = now
+        if it.get("too_long"):
+            too_long[it["session_id"]] = {"size": it["size"], "at": now}
     for it in list(excluded_items) + [p["item"] for p in packed]:
         deferred.pop(it["session_id"], None)
+        too_long.pop(it["session_id"], None)
     state["deferred"] = {k: v for k, v in deferred.items()
                          if isinstance(v, (int, float)) and now - v < 30 * 86400}
+    state["too_long"] = {k: v for k, v in too_long.items()
+                         if isinstance(v, dict) and isinstance(v.get("at"), (int, float)) and now - v["at"] < 30 * 86400}
     convs = state.get("conversations") if isinstance(state.get("conversations"), dict) else {}
     conv = dict(convs.get(sid) or {})
     conv["rounds"] = int(conv.get("rounds") or 0) + 1
@@ -2370,6 +2390,9 @@ def cmd_send(args, out, stdin):
     # 本人の判断ではない（技術的な失敗）ので「外した」とは記録せず、未決定のまま次の一覧でもう一度確認係にかける
     unconfirmed = {n for n, it in items.items() if it.get("checked") not in ("ok", "caution")}
     deferred = unconfirmed - included - explicit
+    # 確認しきれない長さの会話は、次の一覧でも確認係にかけられない。「残り」には数えず too_long_count で出す
+    too_long = {n for n in deferred if items[n].get("too_long")}
+    too_long_count = len(too_long) + int(pending.get("too_long_rest") or 0)
     # 前に外した会話の続き・前に外した会話を引き継いだ会話は、--include で明示されない限り外す（外したと記録する）
     default_excluded = {n for n, it in items.items()
                         if it.get("previously_excluded") or it.get("contains_excluded_copy")}
@@ -2377,7 +2400,7 @@ def cmd_send(args, out, stdin):
     not_sent = excluded | deferred
     send_items = [items[n] for n in sorted(items) if n not in not_sent]
     excluded_items = [items[n] for n in sorted(excluded)]
-    remaining_after = int(pending.get("remaining") or 0) + len(deferred)
+    remaining_after = int(pending.get("remaining") or 0) + len(deferred - too_long)
 
     if not args.confirm_shared:
         cut = [it["n"] for it in send_items if it.get("group_cut")]
@@ -2418,8 +2441,8 @@ def cmd_send(args, out, stdin):
         remove_quietly(pending_path(data_dir))
         clear_reviews(data_dir)
         result = {"submission_id": None, "sent_count": 0, "excluded_count": len(excluded_items),
-                  "deferred_unconfirmed": len(deferred), "subagent_count": 0, "bytes": 0, "redactions": 0,
-                  "omitted": 0, "remaining": remaining_after}
+                  "deferred_unconfirmed": len(deferred - too_long), "too_long_count": too_long_count,
+                  "subagent_count": 0, "bytes": 0, "redactions": 0, "omitted": 0, "remaining": remaining_after}
         if assistant_note:
             result["assistant_note_sent"] = False  # 送るものも感想もない日はサーバーに何も送らない
         out.write(json.dumps(result, ensure_ascii=False) + "\n")
@@ -2481,7 +2504,8 @@ def cmd_send(args, out, stdin):
         "submission_id": res.get("submission_id"),
         "sent_count": len(packed),
         "excluded_count": len(excluded_items),
-        "deferred_unconfirmed": len(deferred),
+        "deferred_unconfirmed": len(deferred - too_long),
+        "too_long_count": too_long_count,
         "subagent_count": sum(len(p["sent"]["subagents"]) for p in packed),
         "bytes": sum(f["bytes"] for f in files),
         "redactions": sum(p["sent"]["redactions"] for p in packed),

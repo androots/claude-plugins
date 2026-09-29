@@ -89,6 +89,7 @@ Bash で実行する:
      `shares_history_with: [m]` か同じ `history_group` →「m と同じ履歴」、`group_cut` →「同じ履歴の会話が多すぎて一部だけ表示」
    - `first_run` なら先頭の行の前に「初回なので `since` 以降の分」
    - `remaining` が 1 以上なら一覧の下に「このあとに `remaining` 件ある（送ったあと /send-to-nobu で続き）」
+   - `too_long_count` が 1 以上なら一覧の下に「確認しきれない長さの会話がほかに `too_long_count` 件ある（この一覧には出ていない）」
    - `note_already_sent` があれば（この会話で感想はもう送った）感想の行は出さず、「→ /send-to-nobu に続けて書いてね（例: /send-to-nobu 3 は外して）」
 
 ## 送信モード
@@ -121,7 +122,9 @@ Bash で実行する:
 4. 終了コードで分ける:
    - 0 → 出力の JSON から 1 行で「`sent_count` 件送った・`excluded_count` 件外した」（0 件で感想だけなら「感想を送った」）。
      `deferred_unconfirmed` が 1 以上なら「確認できなかった `deferred_unconfirmed` 件は今回は送らず、次の一覧でもう一度確かめる」と添える。
-     `remaining` が 1 以上なら「あと `remaining` 件ある。続けるなら /send-to-nobu」と続ける
+     `remaining` が 1 以上なら「あと `remaining` 件ある。続けるなら /send-to-nobu」と続ける。
+     `too_long_count` が 1 以上なら「確認しきれない長さの会話が `too_long_count` 件ある（送るなら、次の一覧でその番号を『n も送る』）」とだけ添える（番号は次の一覧で変わるので、ここでは書かない）
+     （`remaining` が 0 なら続きには誘わない。確認しきれない長さの会話は、続けても確認係にかけられない）
    - 3（同じ履歴を共有している）→ 中身を平易に伝えて終わる。「それでも送るなら `/send-to-nobu それでも送る`、
      やめるなら `/send-to-nobu 両方外す`」と案内する。次の呼び出しで了承なら、この一覧への同じ答えで 3 に `--confirm-shared` を付ける
    - 4（引換券が使えない・使用済み）→ 2 からもう一度だけやり直す
