@@ -6,11 +6,12 @@ python3 3.9 の標準ライブラリだけで動く（macOS の /usr/bin/python3
 
 サブコマンド:
   nudge  SessionStart フック。未送信の会話があれば 1 日 1 回だけ 1 行知らせる
-  status いまの会話に有効な一覧の控えがあるか（スキルが一覧モードか送信モードかを決める）
-  checked 確認係の結果（標準入力の JSON）を控えに足し、会話ごとの結果をまとめる。確認できなかった会話は今回は送らない
-  list   未送信の会話のうち 1 ラウンド分（最大 15 件）の一覧を出し、控えを保存する。
+  status いまの会話に有効な一覧の控えがあるか（スキルが一覧から送るか、返事で送るかを決める）
+  list   未決定の会話を全部一覧にし、控えを保存する。確認係は新しい会話から一覧全体で 60 体まで。
          各会話の本文（本人の指示・AI の返事。伏せてから）を確認係が読むファイルにし、ツールの結果は機械で数える
-  send   控えに沿って、画像の base64 を外す → 秘密を伏せる → gzip → 引換券でアップロード → 送信票
+  checked 確認係の結果を控えに足し、会話ごとの結果をまとめる。そろったら選択画面（AskUserQuestion）の質問を返す
+  send   選択画面の答え（会話ログから直接読む。無ければ --exclude）に沿って、画像の base64 を外す → 秘密を伏せる
+         → gzip → 引換券でアップロード → 送信票
 
 status / list / send は「いまの会話の最初の人の指示が /send-to-nobu」の会話でしか動かない。
 いまの会話 ID は env の CLAUDE_CODE_SESSION_ID だけから取る。
@@ -54,7 +55,6 @@ FIRST_RUN_DAYS = 7          # 初回は「いま − 7 日」より前から触�
 DAY_START_HOUR = 6          # nudge の日の区切り（ローカル時刻）
 PENDING_TTL = 6 * 3600      # 一覧の控えの有効期限
 HEAD_LINES = 200            # 分岐コピーの判定に使う先頭の行数
-ROUND_SIZE = 15             # 1 回の一覧（1 ラウンド）の件数。同じ履歴のまとまりは分けない
 LIST_OUTPUT_MAX = 20000     # 一覧の出力全体の上限（Bash ツールの 30,000 文字で切れないように）
 TITLE_FALLBACK_CHARS = 40
 TITLE_MAX = 200
@@ -64,7 +64,7 @@ ASSISTANT_NOTE_MAX = 1000       # サーバーは 5,000 まで受けるが、プ
 # 標準入力の感想（本人の言葉）のあとに AI の報告を続けるときの区切りの行（この 1 行ちょうど）
 ASSISTANT_NOTE_SEPARATOR = "@@SEND_TO_NOBU_ASSISTANT_NOTE@@"
 FACTS_VERSION = 5          # 一覧に出すかの判定を変えたら上げる（nudge のキャッシュを読み直させる）
-PENDING_VERSION = 7        # 一覧の控えの形を変えたら上げる
+PENDING_VERSION = 8        # 一覧の控えの形を変えたら上げる
 # 一覧の出力と控えに入れる目印。会話ファイルの生のバイト列にこれがある会話は（どう読んだにせよ
 # 一覧や控えの中身が残っているので）一覧から隠す
 LIST_MARKER = "send_to_nobu_list"
@@ -91,6 +91,7 @@ EXIT_CONFIRM_SHARED = 3
 EXIT_UNAUTHORIZED = 4
 EXIT_NOT_ANSWERED = 5
 EXIT_NOT_SEND_SESSION = 6
+EXIT_BAD_ANSWER = 7        # 選択画面の答えが読めない（一覧に無い番号など）。同じ質問で聞き直す
 
 
 class Fail(Exception):
@@ -1216,7 +1217,6 @@ def build_list(state, current, excluded_store, cache):
             "total_bytes": st.st_size + sig[1],
             "shares_idx": sorted(shares.get(idx, ())),
             "previously_excluded": bool((rec and rec.get("d") == "excluded") or sid in excluded_store),
-            "deferred_before": sid in (state.get("deferred") or {}),
             "known_too_long": known_too_long(state, sid, st.st_size),
             "contains_excluded_copy": any(
                 (excluded_hashes.get(uuid_hash(u), set()) - {sid}) for u in s.head_uuids),
@@ -1225,7 +1225,7 @@ def build_list(state, current, excluded_store, cache):
 
 
 def known_too_long(state, sid, size):
-    """前のラウンドで確認しきれない長さだった会話か（そのあと書き足されても長いまま）。"""
+    """前の一覧で確認しきれない長さだった会話か（そのあと書き足されても長いまま）。"""
     rec = (state.get("too_long") or {}).get(sid)
     return isinstance(rec, dict) and isinstance(rec.get("size"), int) and size >= rec["size"]
 
@@ -1251,50 +1251,17 @@ def share_groups(items):
     return sorted((sorted(g) for g in groups.values()), key=lambda g: g[-1], reverse=True)
 
 
-def select_round(items, need=lambda idx: 0):
-    """1 ラウンドに入れる会話（添字の昇順）と、確認係にかけられない会話の集合。
-
-    need(idx) はその会話に要る確認係の数（1 会話だけで CHECKER_CAP を超える極端に長い会話は 0 で、確認係にかけない）。
-    同じ履歴のまとまりは分けない。新しいまとまりから「ROUND_SIZE 件まで」かつ「確認係 CHECKER_CAP 体まで」詰める
-    （入らないまとまりは飛ばして、もっと古い小さなまとまりで埋める）。前回確認できなかった会話を含むまとまりは後ろに回す。
-    一番新しいまとまりだけで上限を超えるなら、そのまとまりだけで 1 ラウンドにし、確認係は新しい会話から上限まで割り当てる。
-    """
-    groups = share_groups(items)
-    groups.sort(key=lambda g: any(items[i].get("deferred_before") for i in g))  # 安定ソート: 新しい順は保つ
-    if not groups:
-        return [], set()
-    first = groups[0]
-    if len(first) > ROUND_SIZE or sum(need(i) for i in first) > CHECKER_CAP:
-        unchecked, used = set(), 0
-        for i in sorted(first, reverse=True):
-            if used + need(i) <= CHECKER_CAP:
-                used += need(i)
-            else:
-                unchecked.add(i)
-        return sorted(first), unchecked
-    chosen, used = [], 0
-    for g in groups:
-        if len(chosen) + len(g) > ROUND_SIZE:
-            continue  # 件数で入らないまとまりは、確認係の数を見に行かない（本文を読まない）
-        g_need = sum(need(i) for i in g)
-        if used + g_need <= CHECKER_CAP:
-            chosen.extend(g)
-            used += g_need
-        if len(chosen) == ROUND_SIZE or used >= CHECKER_CAP:
-            break
-    return sorted(chosen), set()
-
-
 # ---------------------------------------------------------------- 確認係に渡す本文と、ツールの結果の機械の検出
 
 REVIEW_PART_CHARS = 10000       # 確認係が 1 回の Read で読む量
 REVIEW_LINE_CHARS = 1000        # 1 行の長さ（Read は長い行を切るので折り返す）
 REVIEW_PARTS_PER_CHECKER = 3    # 確認係 1 体が読むファイルの数（大きい会話は確認係を分ける）
-CHECKER_CAP = 36                # 1 ラウンドの確認係の総数（約 36 万字）。1 会話でこれを超える会話は確認係にかけない
+CHECKER_CAP = 36                # 1 会話の確認係の上限（約 108 万字）。これを超える会話は確認係にかけない（確認しきれない長さ）
+TOTAL_CHECKER_CAP = 60          # 一覧全体の確認係の総数（約 180 万字）。新しい会話から割り当て、超えた分は「確認しきれない量」
 CHECKER_CONCURRENCY = 12        # 同時に動かす確認係の数（Claude Code の同時実行の上限 20 に余裕を持たせる）
 CHECK_WAIT = 12                 # checked --wait が 1 回に待つ秒数（AI がターンを終えずに答えを待つため）
 CHECK_TIMEOUT = 300             # 投げてからこの秒数たっても答えが無い確認係は「確認できなかった」にする
-ROUND_TIMEOUT = 900             # 一覧を出してからこの秒数で、答えの無い確認係（まだ投げていない分も）をすべて打ち切る
+LIST_TIMEOUT = 900              # 一覧を出してからこの秒数で、答えの無い確認係（まだ投げていない分も）をすべて打ち切る
 TICKET_LEN = 12                 # 確認係の札の長さ（16 進）
 REVIEW_KEEP = 86400             # 残った確認用ファイルを消すまでの時間
 
@@ -1493,7 +1460,7 @@ def write_parts(review_dir, n, parts):
 
 
 def new_ticket():
-    """確認係の札（推測できない乱数）。今のラウンドの控えにある札の答えだけを受け付ける。"""
+    """確認係の札（推測できない乱数）。今の一覧の控えにある札の答えだけを受け付ける。"""
     return hashlib.sha256(os.urandom(32)).hexdigest()[:TICKET_LEN]
 
 
@@ -1559,11 +1526,11 @@ def clear_reviews(data_dir, older_than=None, now=None):
 # ---------------------------------------------------------------- 一覧の組み立て
 
 
-def render_round(items, shown, state, remaining, reviews, checkers, compact=False, cut=False, header=None):
+def render_list(items, shown, state, reviews, checkers, compact=False, header=None):
     """items のうち shown（添字の昇順）を 1 から番号を振って、出力と控えの形にする。
 
     compact: 会話 ID を省き、タイトルを短くし、同じ履歴は番号の並びでなく history_group で示す。
-    cut: 同じ履歴のまとまりが大きすぎて一部しか出せなかった。出した会話を送るには --confirm-shared が要る。
+    shown が全部でないとき（出力の上限で古い会話を出せなかった）、出せなかった会話と同じ履歴を持つ会話に group_cut。
     """
     number = {idx: k + 1 for k, idx in enumerate(shown)}
     group_of = {}
@@ -1577,6 +1544,7 @@ def render_round(items, shown, state, remaining, reviews, checkers, compact=Fals
         it = items[idx]
         n = number[idx]
         shares = sorted(number[o] for o in it["shares_idx"] if o in number)
+        cut = any(o not in number for o in it["shares_idx"])
         row = {"n": n, "title": it["title"][:TITLE_FALLBACK_CHARS] if compact else it["title"]}
         if not compact:
             row["session_id"] = it["session_id"]
@@ -1594,22 +1562,22 @@ def render_round(items, shown, state, remaining, reviews, checkers, compact=Fals
         if cut:
             row["group_cut"] = True
         rev = reviews.get(idx) or {}
-        for key in ("checkers", "detect", "too_big", "too_long", "review_error"):
+        for key in ("checkers", "detect", "too_long", "too_much", "review_error"):
             if rev.get(key):
                 row[key] = rev[key]
         rows.append(row)
         p = {k: v for k, v in it.items()
-             if k not in ("prompt_count", "total_bytes", "last_ts", "shares_idx", "deferred_before", "known_too_long")}
+             if k not in ("prompt_count", "total_bytes", "last_ts", "shares_idx", "known_too_long")}
         p.update({"n": n, "shares": shares, "group_cut": cut, "checkers": rev.get("checkers") or [],
-                  "too_big": bool(rev.get("too_big")), "too_long": bool(rev.get("too_long")),
-                  "review_error": bool(rev.get("review_error")),
-                  "detect": rev.get("detect") or {}})
+                  "too_long": bool(rev.get("too_long")), "too_much": bool(rev.get("too_much")),
+                  "review_error": bool(rev.get("review_error")), "detect": rev.get("detect") or {}})
         pend.append(p)
     result = {LIST_MARKER: 1}
     result.update(header or {})
     launch = [{"ticket": c["ticket"], "prompt": c["prompt"]} for c in checkers[:CHECKER_CONCURRENCY]]
-    result.update({"count": len(rows), "items": rows, "remaining": remaining,
-                   "checkers_total": len(checkers), "launch": launch})
+    result.update({"count": len(rows), "items": rows, "checkers_total": len(checkers), "launch": launch})
+    if len(shown) < len(items):
+        result["not_listed"] = len(items) - len(shown)   # 出力の上限で出せなかった古い会話（控えに入れない。次回）
     if not state["sessions"]:
         result["first_run"] = True
         result["since"] = local_short(state["baseline"])
@@ -1621,27 +1589,53 @@ def file_size(path):
         return os.fstat(fh.fileno()).st_size
 
 
-def build_round(items, shown, unchecked, layers, review_dir):
-    """確認用ファイルを書き、確認係を割り当てる。(reviews, checkers)。
+def plan_checks(items, shown, layers):
+    """確認係の割り当て {idx: "check" | "too_long" | "too_much" | "error"}。
 
-    unchecked（ラウンドの確認係の上限に入らなかった会話）と、1 会話だけで上限を超える会話は確認係にかけない（too_big）。
+    新しい会話から TOTAL_CHECKER_CAP 体まで割り当てる。1 会話で CHECKER_CAP 体を超える会話は too_long（確認しきれない
+    長さ）、総数に入らない会話は too_much（確認しきれない量）。総数に届いたら残りの会話の本文は読まない。
     """
-    reviews, checkers = {}, []
-    for k, idx in enumerate(shown, 1):
+    plan, used = {}, 0
+    for idx in sorted(shown, reverse=True):          # items は古い順
+        if items[idx].get("known_too_long"):
+            plan[idx] = "too_long"                   # 前の一覧で長すぎた会話は、読み直さない
+            continue
+        if used >= TOTAL_CHECKER_CAP:
+            plan[idx] = "too_much"
+            continue
         lay = layers(idx)
         if lay.get("error"):
+            plan[idx] = "error"
+            continue
+        c = checkers_needed(lay["parts"])
+        if c > CHECKER_CAP:
+            plan[idx] = "too_long"
+        elif used + c > TOTAL_CHECKER_CAP:
+            plan[idx] = "too_much"
+        else:
+            plan[idx] = "check"
+            used += c
+    return plan
+
+
+def build_reviews(items, shown, plan, layers, review_dir):
+    """確認用ファイルを書き、確認係を割り当てる。(reviews, checkers)。"""
+    reviews, checkers = {}, []
+    for k, idx in enumerate(shown, 1):
+        kind = plan.get(idx)
+        if kind == "error":
             reviews[idx] = {"review_error": True}
             continue
-        parts = lay["parts"]
+        if kind == "too_much" or (kind == "too_long" and items[idx].get("known_too_long")):
+            reviews[idx] = {kind: True}
+            continue
+        lay = layers(idx)
         rev = {"detect": lay["detect"]}
-        if checkers_needed(parts) > CHECKER_CAP:
+        if kind == "too_long":
             rev["too_long"] = True   # 極端に長い会話は確認係にかけない（最初から「確認しきれない長さ」）
             reviews[idx] = rev
             continue
-        if idx in unchecked:
-            rev["too_big"] = True    # 大きすぎる同じ履歴のまとまりで、このラウンドの確認係の上限に入らなかった
-            reviews[idx] = rev
-            continue
+        parts = lay["parts"]
         names = write_parts(review_dir, k, parts)
         ids = []
         for a in range(0, len(names), REVIEW_PARTS_PER_CHECKER):
@@ -1655,6 +1649,21 @@ def build_round(items, shown, unchecked, layers, review_dir):
         rev["checkers"] = ids
         reviews[idx] = rev
     return reviews, checkers
+
+
+def relaunch(pending, now):
+    """同じ会話でもう一度 list されたとき: 答えの無い確認係を最初の波から投げ直す（答えのある分はそのまま）。"""
+    if pending.get("closed"):
+        return []
+    results = pending.get("checker_results") or {}
+    waiting = [c for c in pending.get("checker_list") or [] if str(c["id"]) not in results]
+    first = waiting[:CHECKER_CONCURRENCY]
+    pending["launched"] = [int(k) for k in results] + [c["id"] for c in first]
+    launched_at = dict(pending.get("launched_at") or {})
+    for c in first:
+        launched_at[str(c["id"])] = now
+    pending["launched_at"] = launched_at
+    return [{"ticket": c["ticket"], "prompt": c["prompt"]} for c in first]
 
 
 def cmd_list(args, out):
@@ -1672,10 +1681,12 @@ def _cmd_list(args, out):
 
     pending = valid_pending(data_dir, sid, now)
     if pending and isinstance(pending.get("output"), dict) and os.path.isdir(pending.get("review_dir") or ""):
-        # 同じ会話の中では同じ一覧・同じ番号を返す（返事の待ち受けはここから数え直す）
+        # 同じ会話の中では同じ一覧・同じ番号を返す（返事の待ち受けはここから数え直す）。答えの無い確認係は投げ直す
         pending["session_size"] = file_size(cur_path)
+        result = dict(pending["output"])
+        result["launch"] = relaunch(pending, now)
         write_json_atomic(pending_path(data_dir), pending)
-        out.write(json.dumps(pending["output"], ensure_ascii=False) + "\n")
+        out.write(json.dumps(result, ensure_ascii=False) + "\n")
         return 0
 
     old_cache = load_cache(data_dir)
@@ -1684,7 +1695,7 @@ def _cmd_list(args, out):
     if cache != old_cache:
         write_json_atomic(cache_path(data_dir), cache)
 
-    # 会話の層（確認係に渡す本文）は、ラウンドを選ぶために要る分だけ読む
+    # 会話の層（確認係に渡す本文）は、確認係を割り当てるのに要る分だけ読む
     memo = {}
 
     def layers(idx):
@@ -1696,49 +1707,39 @@ def _cmd_list(args, out):
                 memo[idx] = {"error": True}
         return memo[idx]
 
-    def need(idx):
-        lay = layers(idx)
-        c = 0 if lay.get("error") else checkers_needed(lay["parts"])
-        return 0 if c > CHECKER_CAP else c
-
-    shown, unchecked = select_round(items, need)
-    conv = conversation_record(state, sid)
-    header = {"round": int(conv.get("rounds") or 0) + 1}
-    if conv.get("note_sent"):
-        header["note_already_sent"] = True
+    header = {}
 
     def fits(result):
         return len(json.dumps(result, ensure_ascii=False)) <= LIST_OUTPUT_MAX
 
-    def attempt(rows, compact=False, cut=False):
+    def attempt(rows, compact=False):
         clear_reviews(data_dir)
         review_dir = make_review_dir(data_dir, now)
         header["review_dir"] = review_dir
-        reviews, checkers = build_round(items, rows, unchecked, layers, review_dir)
-        in_round = set(rows)
-        rest = [i for i in range(len(items)) if i not in in_round]
-        too_long_rest = sum(1 for i in rest if items[i].get("known_too_long"))
-        # 確認しきれない長さの会話は「残り」に数えない（続けても確認係にかけられない）。別の数で出す
-        header["too_long_count"] = too_long_rest
-        result, pend = render_round(items, rows, state, len(rest) - too_long_rest, reviews, checkers,
-                                    compact, cut, header)
+        reviews, checkers = build_reviews(items, rows, plan_checks(items, rows, layers), layers, review_dir)
+        result, pend = render_list(items, rows, state, reviews, checkers, compact, header)
         return result, pend, review_dir, checkers
 
+    # 未決定の会話を全部出す。入らなければ短い形にし、それでも入らない極端な件数のときだけ新しい会話から入るだけ出す
+    # （出せなかった古い会話は控えに入れず、次の /send-to-nobu で）
+    shown = list(range(len(items)))
     got = None
     for compact in (False, True):
         got = attempt(shown, compact=compact)
         if fits(got[0]):
             break
     else:
-        # それでも入らないほど大きなまとまりは、新しい会話から入るだけ出す（出さなかった会話は控えに入れない）
-        for m in range(len(shown) - 1, 0, -1):
-            got = attempt(shown[-m:], compact=True, cut=True)
-            if fits(got[0]):
-                break
+        lo, hi = 1, len(shown) - 1
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if fits(attempt(shown[-mid:], compact=True)[0]):
+                lo = mid
+            else:
+                hi = mid - 1
+        got = attempt(shown[-lo:], compact=True)
     result, pend_items, review_dir, checkers = got
     pending = {LIST_MARKER: 1, "v": PENDING_VERSION, "session": sid, "created_at": iso_utc(now), "created_ts": now,
                "session_size": file_size(cur_path), "items": pend_items, "output": result,
-               "remaining": result["remaining"], "too_long_rest": result["too_long_count"],
                "review_dir": review_dir,
                "checkers": {str(c["id"]): c["n"] for c in checkers},
                "tickets": {c["ticket"]: c["id"] for c in checkers},
@@ -1859,14 +1860,14 @@ def cmd_checked(args, out):
 
 
 def _deadlines(pending, results):
-    """答えの無い確認係ごとの打ち切り時刻（投げてから CHECK_TIMEOUT。まだ投げていない分は無し）と、ラウンドの打ち切り時刻。"""
+    """答えの無い確認係ごとの打ち切り時刻（投げてから CHECK_TIMEOUT。まだ投げていない分は無し）と、一覧全体の打ち切り時刻。"""
     created = float(pending.get("created_ts") or 0)
     launched_at = pending.get("launched_at") or {}
     per = {}
     for c in pending.get("launched") or []:
         if str(c) not in results:
             per[str(c)] = float(launched_at.get(str(c), created)) + CHECK_TIMEOUT
-    return per, created + ROUND_TIMEOUT
+    return per, created + LIST_TIMEOUT
 
 
 def _wait_seconds(pending, now):
@@ -1886,8 +1887,8 @@ def _apply_checked(pending, incoming, now):
         incoming = []  # 答えがそろって一覧を出したあとに届いた答えでは、結果を変えない
     bad = [r.get("ticket") for r in incoming if not isinstance(r.get("ticket"), str) or r["ticket"] not in tickets]
     if bad:
-        # 前のラウンドの札・偽の札・札の無い答えは、今のラウンドの答えとして受け付けない（入力ごと止める）
-        raise Fail("今のラウンドの確認係の札ではない答えがある（前のラウンドの答えや札の無い答えは渡さない）: %s"
+        # 前の一覧の札・偽の札・札の無い答えは、今の一覧の答えとして受け付けない（入力ごと止める）
+        raise Fail("今の一覧の確認係の札ではない答えがある（前の一覧の答えや札の無い答えは渡さない）: %s"
                    % ", ".join(str(t)[:16] for t in bad[:5]), EXIT_USAGE)
     for r in incoming:
         cid = str(tickets[r["ticket"]])
@@ -1906,7 +1907,7 @@ def _apply_checked(pending, incoming, now):
         elif _SEVERITY[verdict] == _SEVERITY[old["verdict"]] == _SEVERITY["caution"]:
             old["reasons"] = (old["reasons"] + [x for x in reasons if x not in old["reasons"]])[:6]
 
-    # 打ち切り: 投げてから CHECK_TIMEOUT たった確認係、ラウンドが ROUND_TIMEOUT たったら残り全部を unknown にする
+    # 打ち切り: 投げてから CHECK_TIMEOUT たった確認係、一覧から LIST_TIMEOUT たったら残り全部を unknown にする
     per, round_end = _deadlines(pending, results)
     expired = [c for c, t in per.items() if now >= t]
     if now >= round_end:
@@ -1929,14 +1930,14 @@ def _apply_checked(pending, incoming, now):
     missing, convs, summary = [], [], {"ok": 0, "caution": 0, "unconfirmed": 0}
     for it in pending["items"]:
         ids = it.get("checkers") or []
-        entry = {"n": it["n"], "title": it.get("title", "")}
+        entry = {"n": it["n"]}
         got = [results.get(str(c)) for c in ids]
         waiting = [c for c, g in zip(ids, got) if g is None]
         missing.extend(waiting)
         if it.get("too_long"):
             entry.update({"result": "unconfirmed", "why": "too_long"})
-        elif it.get("too_big"):
-            entry.update({"result": "unconfirmed", "why": "too_big"})
+        elif it.get("too_much"):
+            entry.update({"result": "unconfirmed", "why": "too_much"})
         elif it.get("review_error") or not ids:
             entry.update({"result": "unconfirmed", "why": "review_error"})
         elif waiting:
@@ -1955,54 +1956,90 @@ def _apply_checked(pending, incoming, now):
         it["checked"] = entry["result"] if entry["result"] in ("ok", "caution") else None
         summary[entry["result"]] += 1
         convs.append(entry)
-    if not missing:
-        pending["closed"] = True   # 一覧を出す。このあとの答えでは結果を変えない
     result = {"missing": sorted(missing),
               "launch": [{"ticket": c["ticket"], "prompt": c["prompt"]} for c in to_launch],
-              "summary": summary, "conversations": convs, "display": display_summary(convs)}
+              "summary": summary, "conversations": convs}
     if any(r.get("timed_out") for r in results.values()):
         result["timed_out"] = True
+    if not missing:
+        # 答えがそろった: 一覧を出して選択画面で聞く。このあとの答えでは結果を変えない
+        display = display_summary(convs, pending["items"])
+        if not pending.get("closed") or not pending.get("ask"):
+            pending["ask"] = build_ask(pending["items"], convs, overview_lines(pending.get("output") or {}, display))
+        pending["closed"] = True
+        result["display"] = display
+        result["ask"] = {"questions": pending["ask"]["questions"]}
     return result
 
 
-def display_summary(convs):
-    """一覧の頭に出す「気をつけた方がいい会話」を、理由ごとに番号をまとめた形にする（AI が手でまとめ直さない）。"""
+UNCONFIRMED_LABELS = collections.OrderedDict([
+    ("too_long", "確認しきれない長さ（既定では送らない）"),
+    ("too_much", "確認しきれない量（既定では送らない）"),
+    ("other", "確認できなかった（既定では送らない）"),
+])
+DETECT_LABELS = {"card": "ツールの結果にカード番号らしきもの", "secret": "ツールの結果にキー・トークン類（送るときは伏せる）"}
+
+
+def display_summary(convs, items=()):
+    """一覧の頭に出す結論（理由ごとに番号をまとめる）と、番号つきのタイトルの行。AI はこのまま出す。"""
     by_label, order = collections.OrderedDict(), []
-    unconfirmed = collections.OrderedDict([("確認しきれない長さ（今回は送らない）", []),
-                                           ("確認できなかった（今回は送らず、次の一覧でもう一度確かめる）", [])])
+    unconfirmed = collections.OrderedDict((k, []) for k in UNCONFIRMED_LABELS)
     info = {"email": [], "phone": []}
     caution_n = set()
     for c in convs:
         n = c["n"]
         det = c.get("detect") or {}
         if c["result"] == "unconfirmed":
-            key = ("確認しきれない長さ（今回は送らない）" if c.get("why") in ("too_long", "too_big")
-                   else "確認できなかった（今回は送らず、次の一覧でもう一度確かめる）")
-            unconfirmed[key].append(n)
+            unconfirmed[c.get("why") if c.get("why") in ("too_long", "too_much") else "other"].append(n)
             continue
-        labels = [(x, reason_label(x)) for x in c.get("reason_codes") or []]
-        if det.get("card"):
-            labels.append(("~card", "ツールの結果にカード番号らしきもの"))
-        if det.get("secret"):
-            labels.append(("~secret", "ツールの結果にキー・トークン類（送るときは伏せる）"))
-        for code, label in labels:
+        labels = [(_reason_order(x), reason_label(x)) for x in c.get("reason_codes") or []]
+        labels += [((99, k), DETECT_LABELS[k]) for k in ("card", "secret") if det.get(k)]
+        for key, label in labels:
             if label not in by_label:
                 by_label[label] = []
-                order.append((_reason_order(code.lstrip("~")) if not code.startswith("~") else (99, code), label))
+                order.append((key, label))
             by_label[label].append(n)
             caution_n.add(n)
         for k in ("email", "phone"):
             if det.get(k):
                 info[k].append(n)
     caution = [{"label": label, "n": by_label[label]} for _, label in sorted(order)]
-    unconf = [{"label": k, "n": v} for k, v in unconfirmed.items() if v]
+    unconf = [{"label": UNCONFIRMED_LABELS[k], "n": v} for k, v in unconfirmed.items() if v]
     unconf_n = sorted({n for g in unconf for n in g["n"]})
     tool_info = {k: v for k, v in info.items() if v}
     ok_count = len(convs) - len(caution_n) - len(unconf_n)
     return {"caution_count": len(caution_n), "caution": caution,
             "unconfirmed_count": len(unconf_n), "unconfirmed": unconf,
             "ok_count": ok_count, "tool_info": tool_info,
-            "text": _display_text(len(convs), len(caution_n), caution, len(unconf_n), unconf, ok_count, tool_info)}
+            "text": _display_text(len(convs), len(caution_n), caution, len(unconf_n), unconf, ok_count, tool_info),
+            "items": [item_line(it) for it in items]}
+
+
+def overview_lines(list_output, display):
+    """選択画面の最初の質問の頭に入れる一覧（結論・番号つきのタイトル）。AI の本文に頼らず、本人に必ず見せるため。"""
+    lines = []
+    if list_output.get("first_run"):
+        lines.append("初回なので %s 以降の分" % list_output.get("since", ""))
+    lines += display["text"]
+    if display["items"]:
+        lines += [""] + display["items"]
+    if list_output.get("not_listed"):
+        lines.append("ほかに古い会話が %d 件ある（多すぎて今回は出せなかった。次の /send-to-nobu で出る）"
+                     % list_output["not_listed"])
+    return lines
+
+
+def item_line(it):
+    """番号つきのタイトルの行。既定で外す・同じ履歴の印を後ろに添える。"""
+    notes = []
+    if it.get("previously_excluded") or it.get("contains_excluded_copy"):
+        notes.append("前に外した会話の続き。既定では送らない")
+    if it.get("shares"):
+        notes.append("%s と同じ履歴" % "・".join(str(m) for m in it["shares"]))
+    if it.get("group_cut"):
+        notes.append("同じ履歴の会話の一部は一覧に出ていない")
+    return "%d. %s%s" % (it["n"], squash(it.get("title") or "", TITLE_FALLBACK_CHARS),
+                         "（%s）" % "／".join(notes) if notes else "")
 
 
 def _nums(ns):
@@ -2011,6 +2048,8 @@ def _nums(ns):
 
 def _display_text(total, c_count, caution, u_count, unconf, ok_count, tool_info):
     """一覧の頭の数行（AI はこのまま出す。並べ替え・言い換え・まとめ直しをしない）。"""
+    if not total:
+        return ["送る会話はない（感想・質問だけ送れる）。"]
     if not c_count and not u_count:
         lines = ["%d 件、会話の本文に気になる点は見当たらなかった（ツールの結果は機械の検出だけ）。" % total]
     else:
@@ -2021,15 +2060,206 @@ def _display_text(total, c_count, caution, u_count, unconf, ok_count, tool_info)
             head.append("確認できなかったのは %d 件" % u_count)
         lines = ["%d 件のうち、%s。" % (total, "、".join(head))]
         lines += ["・%s：%s" % (_nums(g["n"]), g["label"]) for g in caution]
-        for g in unconf:
-            send = "送るなら「%s も送る」" % _nums(g["n"])
-            lines.append("・%s：%s" % (_nums(g["n"]), g["label"][:-1] + "。" + send + "）"))
+        lines += ["・%s：%s" % (_nums(g["n"]), g["label"]) for g in unconf]
         if ok_count:
             lines.append("ほかの %d 件は、会話の本文に気になる点なし（ツールの結果は機械の検出だけ）。" % ok_count)
     names = {"email": "メールアドレスらしきもの", "phone": "電話番号らしきもの"}
     if tool_info:
         lines.append("（ツールの結果に %s）" % " ／ ".join("%s: %s" % (names[k], _nums(v)) for k, v in tool_info.items()))
     return lines
+
+
+# ---------------------------------------------------------------- 選択画面（AskUserQuestion）の質問と答え
+
+ASK_OPTIONS = 4                 # 1 つの質問の選択肢の上限（AskUserQuestion は 2〜4 個）
+ASK_CONVERSATION_QUESTIONS = 3  # 会話を選ぶ質問の数（AskUserQuestion は 4 つまで。1 つは感想）
+ASK_TITLE_CHARS = 24
+SHORT_REASONS = {"third_party": "第三者への発言", "personal": "個人的な相談", "money": "お金の話", "client": "お客さまの情報",
+                 "credential": "キー・ID", "other": "その他", "card": "カード番号らしきもの", "secret": "キー・トークン類"}
+DEFAULT_OFF_REASONS = {"too_long": "確認しきれない長さ", "too_much": "確認しきれない量", "unconfirmed": "確認できなかった",
+                       "excluded": "前に外した会話の続き"}
+CONFIRM_SEND, CONFIRM_EXCLUDE = "それでも送る", "送る方の会話も外す"
+NOTE_QUESTION = "昨日の感想・わからなかったこと・質問は？（自由に書くなら入力欄に）"
+NOTE_OPTIONS = ["なし", "順調に使えている"]
+EXCLUDE_NONE, EXCLUDE_ALL = "外さない", "今回は全部外す"
+INCLUDE_NONE = "送らない"
+
+
+def _balanced_chunks(xs, k):
+    """xs を k 個以下のかたまりに、なるべく同じ大きさで分ける（1 つ ASK_OPTIONS 個まで）。"""
+    if not xs:
+        return []
+    k = max(1, min(k, (len(xs) + ASK_OPTIONS - 1) // ASK_OPTIONS))
+    xs = xs[:k * ASK_OPTIONS]            # 入りきらない会話は、入力欄に番号を書いてもらう
+    size = (len(xs) + k - 1) // k
+    return [xs[i:i + size] for i in range(0, len(xs), size)][:k]
+
+
+def _option_label(n, title, reasons):
+    label = "%d. %s（%s）" % (n, squash(title or "", ASK_TITLE_CHARS), "・".join(reasons))
+    return label.replace(",", "、")   # 複数選択の答えは「, 」でつながるので、選択肢に「,」を入れない
+
+
+def build_ask(items, convs, overview=()):
+    """選択画面の質問（AskUserQuestion にそのまま渡す）と、答えを番号に戻す対応表。
+
+    外す会話（既定で送る会話のうち、気をつけた方がいい会話）・送る会話（既定では送らない会話）・感想。
+    質問は 4 つまで、選択肢は 2〜4 個。入りきらない会話の番号は入力欄（Type something）に書いてもらう。
+    overview（一覧）は最初の質問の頭に入れる（選択画面にそのまま出る）。
+    """
+    by_n = {it["n"]: it for it in items}
+    result = {c["n"]: c for c in convs}
+    ex, inc = [], []
+    for n in sorted(by_n):
+        it, c = by_n[n], result.get(n) or {}
+        det = c.get("detect") or {}
+        reasons = [SHORT_REASONS.get(x.split(":", 1)[0], "その他") for x in c.get("reason_codes") or []]
+        reasons += [SHORT_REASONS[k] for k in ("card", "secret") if det.get(k)]
+        reasons = list(collections.OrderedDict.fromkeys(reasons))
+        off = []
+        if c.get("result") == "unconfirmed":
+            off.append(DEFAULT_OFF_REASONS.get(c.get("why"), DEFAULT_OFF_REASONS["unconfirmed"]))
+        if it.get("previously_excluded") or it.get("contains_excluded_copy"):
+            off.append(DEFAULT_OFF_REASONS["excluded"])
+        if off:
+            inc.append((n, _option_label(n, it.get("title"), (off + reasons)[:2])))
+        elif reasons:
+            ex.append((n, _option_label(n, it.get("title"), reasons[:2])))
+    # 質問の数を配る: 外す（気をつける会話）を優先。送る会話があれば 1 つは残す
+    need_ex, need_in = (len(ex) + ASK_OPTIONS - 1) // ASK_OPTIONS, (len(inc) + ASK_OPTIONS - 1) // ASK_OPTIONS
+    q_in = min(need_in, ASK_CONVERSATION_QUESTIONS - max(1, min(need_ex, ASK_CONVERSATION_QUESTIONS - (1 if inc else 0))))
+    q_ex = ASK_CONVERSATION_QUESTIONS - q_in
+    questions, qmap = [], []
+
+    def add(kind, header, text, chunk, filler, multi=True):
+        labels = collections.OrderedDict((label, n) for n, label in chunk)
+        if filler:
+            labels[filler] = None
+        questions.append({"question": text, "header": header, "multiSelect": multi,
+                          "options": [{"label": lb, "description": ""} for lb in labels]})
+        qmap.append({"question": text, "kind": kind, "labels": labels})
+
+    if not by_n:
+        pass
+    elif ex:
+        chunks = _balanced_chunks(ex, q_ex)
+        for i, chunk in enumerate(chunks, 1):
+            part = " %d/%d" % (i, len(chunks)) if len(chunks) > 1 else ""
+            add("exclude", "外す" + part, "外す会話は？（気をつけた方がいい会話%s。ほかに外す番号は入力欄に）" % part,
+                chunk, EXCLUDE_NONE if len(chunk) < 2 else None)
+    else:
+        add("exclude", "外す", "外す会話は？（外すなら番号を入力欄に）",
+            [], None, multi=False)
+        qmap[-1]["labels"] = collections.OrderedDict([(EXCLUDE_NONE, None), (EXCLUDE_ALL, "all")])
+        questions[-1]["options"] = [{"label": EXCLUDE_NONE, "description": ""},
+                                    {"label": EXCLUDE_ALL, "description": "今回はどの会話も送らない"}]
+    if inc:
+        chunks = _balanced_chunks(inc, q_in)
+        for i, chunk in enumerate(chunks, 1):
+            part = " %d/%d" % (i, len(chunks)) if len(chunks) > 1 else ""
+            add("include", "送る" + part, "送る会話は？（既定では送らない会話%s。選んだものだけ送る。ほかの番号は入力欄に）" % part,
+                chunk, INCLUDE_NONE if len(chunk) < 2 else None)
+    questions.append({"question": NOTE_QUESTION, "header": "感想", "multiSelect": False,
+                      "options": [{"label": lb, "description": ""} for lb in NOTE_OPTIONS]})
+    qmap.append({"question": NOTE_QUESTION, "kind": "note", "labels": collections.OrderedDict((lb, lb) for lb in NOTE_OPTIONS)})
+    if overview:
+        head = "\n".join(overview) + "\n\n"
+        questions[0]["question"] = head + questions[0]["question"]
+        qmap[0]["question"] = questions[0]["question"]
+    return {"questions": questions, "map": qmap}
+
+
+_ANSWER_NUM_RE = re.compile(r"(\d+)(?:\s*[-〜~～]\s*(\d+))?")
+
+
+def _annotation_text(annotations, question):
+    a = (annotations or {}).get(question) if isinstance(annotations, dict) else None
+    if isinstance(a, dict):
+        a = a.get("notes")
+    return a.strip() if isinstance(a, str) else ""
+
+
+def parse_answers(ask, answers, annotations, numbers):
+    """選択画面の答え → (外す番号, 送る番号, 感想)。一覧に無い番号は EXIT_BAD_ANSWER。"""
+    exclude, include, notes = set(), set(), []
+    for q in ask["map"]:
+        a = answers.get(q["question"])
+        extra = _annotation_text(annotations, q["question"])
+        if not isinstance(a, str):
+            a = ""
+        if not a and not extra:
+            continue                                      # 答えなかった質問（外す・送るなら「なし」）
+        labels = q["labels"]
+        if q["kind"] == "note":
+            text = a.strip()
+            if text == NOTE_OPTIONS[0]:
+                text = ""
+            notes += [t for t in (text, extra) if t]
+            continue
+        other, chosen, all_ = [], set(), False
+        for tok in a.split(", "):
+            if tok in labels:
+                v = labels[tok]
+                if v == "all":
+                    all_ = True
+                elif v is not None:
+                    chosen.add(int(v))
+            elif tok.strip():
+                other.append(tok)
+        free = unicodedata.normalize("NFKC", " ".join(other + [extra]))
+        for m in _ANSWER_NUM_RE.finditer(free):
+            lo, hi = int(m.group(1)), int(m.group(2) or m.group(1))
+            if hi < lo or any(k not in numbers for k in range(lo, hi + 1)):
+                raise Fail("答えの番号（%s）は一覧に無い" % m.group(0), EXIT_BAD_ANSWER)
+            chosen.update(range(lo, hi + 1))
+        if all_:
+            chosen.update(numbers)
+        (exclude if q["kind"] == "exclude" else include).update(chosen)
+    return exclude, include - exclude, "\n".join(notes)
+
+
+def find_ask_answer(path, offset, questions):
+    """offset 以降で、questions をそのまま（質問文・選択肢まで同じに）聞いた AskUserQuestion への本人の答え。
+
+    答えは利用者の操作からしか作られない tool_result（toolUseResult.answers）から読む。AI が answers を入れて呼んだ
+    質問や、選択肢を書き換えた質問は数えない。無ければ None、あれば最後の (answers, annotations, 答えの行の終わりの位置)。
+    """
+    def shape(qs):
+        if not isinstance(qs, list):
+            return None
+        out = []
+        for q in qs:
+            if not isinstance(q, dict) or not isinstance(q.get("options"), list):
+                return None
+            out.append((q.get("question"), bool(q.get("multiSelect")),
+                        tuple(o.get("label") if isinstance(o, dict) else None for o in q["options"])))
+        return out
+    want = shape(questions)
+    asked, found, pos = set(), None, offset
+    with open_nofollow(path) as fh:
+        fh.seek(offset)
+        for raw in fh:
+            pos += len(raw)
+            d = parse_line(raw)
+            if d is None or d.get("isSidechain"):
+                continue
+            content = (d.get("message") or {}).get("content")
+            if not isinstance(content, list):
+                continue
+            if d.get("type") == "assistant":
+                for b in content:
+                    if (isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") == "AskUserQuestion"
+                            and isinstance(b.get("input"), dict) and "answers" not in b["input"]
+                            and shape(b["input"].get("questions")) == want):
+                        asked.add(b.get("id"))
+            elif d.get("type") == "user":
+                tur = d.get("toolUseResult")
+                for b in content:
+                    if (isinstance(b, dict) and b.get("type") == "tool_result" and b.get("tool_use_id") in asked
+                            and not b.get("is_error") and isinstance(tur, dict) and isinstance(tur.get("answers"), dict)
+                            and shape(tur.get("questions")) == want):
+                        found = (tur["answers"], tur.get("annotations") or {}, pos)
+    return found
 
 
 # ---------------------------------------------------------------- pack
@@ -2401,42 +2631,24 @@ def excluded_uuid_hashes(item):
     return sorted(out)
 
 
-def conversation_record(state, sid):
-    c = state.get("conversations")
-    rec = c.get(sid) if isinstance(c, dict) else None
-    return rec if isinstance(rec, dict) else {}
+def record_decisions(data_dir, now, packed, excluded_items, deferred_items=()):
+    """送った / 外したを、判断した時点（一覧の時点）の位置で状態に記録する。
 
-
-def record_decisions(data_dir, now, packed, excluded_items, sid, note_sent, deferred_items=()):
-    """送った / 外したを、判断した時点（一覧の時点）の位置で状態に記録する。この会話のラウンド数と感想の有無も。
-
-    確認できなかった会話（deferred_items）は判断を記録せず、次の一覧でラウンドの後ろに回す印だけ付ける。
-    そのうち確認しきれない長さの会話は、そのときの大きさも覚える（残りの数・朝の案内から外すため）。
+    確認できなかった会話（deferred_items）は判断を記録しない（次の一覧にまた出る）。そのうち確認しきれない長さの
+    会話は、そのときの大きさを覚える（次から本文を読み直さない・朝の案内の件数に入れない）。
     """
     state = load_state(data_dir, now)
     sessions = state["sessions"]
-    deferred = dict(state.get("deferred") or {})
     too_long = dict(state.get("too_long") or {})
     for it in deferred_items:
-        deferred[it["session_id"]] = now
         if it.get("too_long"):
             too_long[it["session_id"]] = {"size": it["size"], "at": now}
     for it in list(excluded_items) + [p["item"] for p in packed]:
-        deferred.pop(it["session_id"], None)
         too_long.pop(it["session_id"], None)
-    state["deferred"] = {k: v for k, v in deferred.items()
-                         if isinstance(v, (int, float)) and now - v < 30 * 86400}
     state["too_long"] = {k: v for k, v in too_long.items()
                          if isinstance(v, dict) and isinstance(v.get("at"), (int, float)) and now - v["at"] < 30 * 86400}
-    convs = state.get("conversations") if isinstance(state.get("conversations"), dict) else {}
-    conv = dict(convs.get(sid) or {})
-    conv["rounds"] = int(conv.get("rounds") or 0) + 1
-    conv["note_sent"] = bool(conv.get("note_sent") or note_sent)
-    conv["at"] = now
-    convs[sid] = conv
-    # 古い会話の記録は捨てる（30 日）
-    state["conversations"] = {k: v for k, v in convs.items()
-                              if isinstance(v, dict) and now - float(v.get("at") or 0) < 30 * 86400}
+    state.pop("deferred", None)          # 0.3 までのラウンドの印（もう使わない）
+    state.pop("conversations", None)
     store = load_excluded_store(data_dir)
     at = iso_utc(now)
     for p in packed:
@@ -2509,54 +2721,95 @@ def _cmd_send(args, out, stdin):
     load_excluded_store(data_dir)
     pending = load_pending(data_dir, sid, now)
 
-    # 一覧を出したあとに本人の返事が無ければ送らない（同じターンで勝手に送らせない）
-    if not reply_after(cur_path, int(pending.get("session_size") or 0)):
-        raise Fail("まだ本人の返事が無い。一覧を見せて、返事を待ってから送って", EXIT_NOT_ANSWERED)
-
     items = {int(it["n"]): it for it in pending["items"]}
-    explicit = parse_numbers(args.exclude, items, "exclude")
-    included = parse_numbers(args.include, items, "include") if args.include is not None else set()
-    if explicit & included:
-        raise Fail("同じ番号が --exclude と --include の両方にある: %s" % ",".join(map(str, sorted(explicit & included))),
-                   EXIT_USAGE)
-    # 確認係が確認できなかった会話は、--include で明示されない限り今回は送らない。
-    # 本人の判断ではない（技術的な失敗）ので「外した」とは記録せず、未決定のまま次の一覧でもう一度確認係にかける
-    unconfirmed = {n for n, it in items.items() if it.get("checked") not in ("ok", "caution")}
-    deferred = unconfirmed - included - explicit
-    # 確認しきれない長さの会話は、次の一覧でも確認係にかけられない。「残り」には数えず too_long_count で出す
-    too_long = {n for n in deferred if items[n].get("too_long")}
-    too_long_count = len(too_long) + int(pending.get("too_long_rest") or 0)
-    # 前に外した会話の続き・前に外した会話を引き継いだ会話は、--include で明示されない限り外す（外したと記録する）
-    default_excluded = {n for n, it in items.items()
-                        if it.get("previously_excluded") or it.get("contains_excluded_copy")}
-    excluded = explicit | ((default_excluded - included) - deferred)
-    not_sent = excluded | deferred
-    send_items = [items[n] for n in sorted(items) if n not in not_sent]
-    excluded_items = [items[n] for n in sorted(excluded)]
-    remaining_after = int(pending.get("remaining") or 0) + len(deferred - too_long)
+    offset = int(pending.get("session_size") or 0)
+    ask = pending.get("ask") if isinstance(pending.get("ask"), dict) else None
+    answer = find_ask_answer(cur_path, offset, ask["questions"]) if ask else None
+    if answer is not None and args.exclude is not None and reply_after(cur_path, answer[2]):
+        answer = None   # 選択画面の答えのあとに、本人が /send-to-nobu <返事> で答え直した（逃げ道の方を使う）
+    if answer is not None:
+        # 選択画面（AskUserQuestion）の答えを、会話ログから直接読む。AI には番号も感想も渡させない
+        if args.exclude is not None or args.include is not None:
+            raise Fail("選択画面の答えがある。外す・送る番号は答えから読むので --exclude・--include は渡さない", EXIT_USAGE)
+        explicit, included, user_note = parse_answers(ask, answer[0], answer[1], set(items))
+    else:
+        # 逃げ道: 一覧のあとの本人の返事（/send-to-nobu <返事>）を AI が読み取って渡す
+        if args.exclude is None:
+            raise Fail("まだ本人の答えが無い（選択画面の答えも /send-to-nobu <返事> も無い）", EXIT_NOT_ANSWERED)
+        if not reply_after(cur_path, offset):
+            raise Fail("まだ本人の返事が無い。一覧を見せて、返事を待ってから送って", EXIT_NOT_ANSWERED)
+        explicit = parse_numbers(args.exclude, items, "exclude")
+        included = parse_numbers(args.include, items, "include") if args.include is not None else set()
+        if explicit & included:
+            raise Fail("同じ番号が --exclude と --include の両方にある: %s"
+                       % ",".join(map(str, sorted(explicit & included))), EXIT_USAGE)
+        user_note = None
 
-    if not args.confirm_shared:
+    def decide(explicit):
+        # 確認係が確認できなかった会話は、送ると選ばれない限り今回は送らない。本人の判断ではないので「外した」とは
+        # 記録せず、次の一覧にまた出す
+        unconfirmed = {n for n, it in items.items() if it.get("checked") not in ("ok", "caution")}
+        deferred = unconfirmed - included - explicit
+        # 前に外した会話の続き・前に外した会話を引き継いだ会話は、送ると選ばれない限り外す（外したと記録する）
+        default_excluded = {n for n, it in items.items()
+                            if it.get("previously_excluded") or it.get("contains_excluded_copy")}
+        excluded = explicit | ((default_excluded - included) - deferred)
+        send_items = [items[n] for n in sorted(items) if n not in excluded | deferred]
+        msgs, send_side = [], set()
         cut = [it["n"] for it in send_items if it.get("group_cut")]
         if cut:
-            raise Fail("%s 番は、大きすぎて一覧に出しきれなかった会話と同じ履歴を含む。送るとその中身も届く。"
-                       "了承なら --confirm-shared を付けてやり直す" % "、".join(map(str, cut)), EXIT_CONFIRM_SHARED)
+            msgs.append("%s 番は、一覧に出しきれなかった会話と同じ履歴を含む。送るとその中身も届く"
+                        % "、".join(map(str, cut)))
+            send_side.update(cut)
         pairs_ex = sorted({(it["n"], m) for it in send_items for m in it.get("shares", []) if m in excluded})
         pairs_def = sorted({(it["n"], m) for it in send_items for m in it.get("shares", [])
                             if m in deferred and m not in excluded})
-        if pairs_ex or pairs_def:
-            msgs = []
-            if pairs_ex:
-                msgs.append("%s は同じ履歴を共有している。外した方の中身も、送る方から届く"
-                            % "、".join("%d 番と %d 番" % pr for pr in pairs_ex))
-            if pairs_def:
-                msgs.append("%s は同じ履歴を共有している。確認できなかった方（%s 番）は今回送らないが、"
-                            "その中身の一部は送る方から届く"
-                            % ("、".join("%d 番と %d 番" % pr for pr in pairs_def),
-                               "・".join(str(m) for m in sorted({m for _, m in pairs_def}))))
-            raise Fail("。".join(msgs) + "。了承なら --confirm-shared を付けてやり直す（止めるなら両方外す）",
-                       EXIT_CONFIRM_SHARED)
+        if pairs_ex:
+            msgs.append("%s は同じ履歴を共有している。外した方の中身も、送る方から届く"
+                        % "、".join("%d 番と %d 番" % pr for pr in pairs_ex))
+        if pairs_def:
+            msgs.append("%s は同じ履歴を共有している。確認できなかった方（%s 番）は今回送らないが、"
+                        "その中身の一部は送る方から届く"
+                        % ("、".join("%d 番と %d 番" % pr for pr in pairs_def),
+                           "・".join(str(m) for m in sorted({m for _, m in pairs_def}))))
+        send_side.update(n for n, _ in pairs_ex + pairs_def)
+        return excluded, deferred, send_items, "。".join(msgs), send_side
+
+    excluded, deferred, send_items, conflict, send_side = decide(explicit)
+    if conflict and not args.confirm_shared:
+        if answer is None:
+            raise Fail(conflict + "。了承なら --confirm-shared を付けてやり直す（止めるなら両方外す）", EXIT_CONFIRM_SHARED)
+        # 選択画面で聞く。答えはこの一覧の控えに覚えた質問への答えとして、会話ログから読む
+        confirmed = False
+        prev = pending.get("confirm_ask") if isinstance(pending.get("confirm_ask"), dict) else None
+        got = (find_ask_answer(cur_path, offset, prev["questions"])
+               if prev and prev.get("message") == conflict else None)
+        if got is not None:
+            choice = got[0].get(prev["questions"][0]["question"])
+            if choice == CONFIRM_SEND:
+                confirmed = True
+            elif choice == CONFIRM_EXCLUDE:
+                explicit = explicit | send_side
+                excluded, deferred, send_items, conflict, send_side = decide(explicit)
+                confirmed = not conflict
+        if not confirmed:
+            q = {"question": conflict + "。どうする？", "header": "同じ履歴", "multiSelect": False,
+                 "options": [{"label": CONFIRM_SEND, "description": "共有している中身も届く"},
+                             {"label": CONFIRM_EXCLUDE, "description": "送る方の会話（%s 番）も外す"
+                              % "・".join(map(str, sorted(send_side)))}]}
+            pending["confirm_ask"] = {"questions": [q], "message": conflict}
+            write_json_atomic(pending_path(data_dir), pending)
+            out.write(json.dumps({"ask": {"questions": [q]}}, ensure_ascii=False) + "\n")
+            raise Fail(conflict + "。出力の ask を選択画面で聞いて、答えのあとにもう一度 send", EXIT_CONFIRM_SHARED)
+    excluded_items = [items[n] for n in sorted(excluded)]
+    # 確認しきれない長さの会話は、次の一覧でも確認係にかけられない。deferred_unconfirmed には数えず too_long_count で出す
+    too_long = {n for n in deferred if items[n].get("too_long")}
 
     raw_note, raw_assistant = read_note(args, stdin)
+    if user_note is not None:
+        if raw_note.strip():
+            raise Fail("感想は選択画面の答えから読む。--note-file には区切りの行と AI の報告だけを書く", EXIT_USAGE)
+        raw_note = user_note
     note = mask_text(raw_note)[0]
     if len(note) > NOTE_MAX:
         raise Fail("感想が長すぎる（%d 文字まで）" % NOTE_MAX, EXIT_USAGE)
@@ -2570,12 +2823,12 @@ def _cmd_send(args, out, stdin):
 
     if not send_items and not note:
         # 送るものも感想もない日: サーバーには何も送らず、外したことだけ覚える
-        record_decisions(data_dir, now, [], excluded_items, sid, False, [items[n] for n in sorted(deferred)])
+        record_decisions(data_dir, now, [], excluded_items, [items[n] for n in sorted(deferred)])
         remove_quietly(pending_path(data_dir))
         clear_reviews(data_dir)
         result = {"submission_id": None, "sent_count": 0, "excluded_count": len(excluded_items),
-                  "deferred_unconfirmed": len(deferred - too_long), "too_long_count": too_long_count,
-                  "subagent_count": 0, "bytes": 0, "redactions": 0, "omitted": 0, "remaining": remaining_after}
+                  "deferred_unconfirmed": len(deferred - too_long), "too_long_count": len(too_long),
+                  "subagent_count": 0, "bytes": 0, "redactions": 0, "omitted": 0}
         if assistant_note:
             result["assistant_note_sent"] = False  # 送るものも感想もない日はサーバーに何も送らない
         out.write(json.dumps(result, ensure_ascii=False) + "\n")
@@ -2624,7 +2877,7 @@ def _cmd_send(args, out, stdin):
             body["assistant_note"] = assistant_note  # AI の報告は感想と別の欄
         res = api_post(api_base, "/v1/finish", body, code, retry_ok_codes=("already_finished",))
 
-        record_decisions(data_dir, now, packed, excluded_items, sid, bool(note), [items[n] for n in sorted(deferred)])
+        record_decisions(data_dir, now, packed, excluded_items, [items[n] for n in sorted(deferred)])
         remove_quietly(pending_path(data_dir))
         clear_reviews(data_dir)
     finally:
@@ -2638,12 +2891,11 @@ def _cmd_send(args, out, stdin):
         "sent_count": len(packed),
         "excluded_count": len(excluded_items),
         "deferred_unconfirmed": len(deferred - too_long),
-        "too_long_count": too_long_count,
+        "too_long_count": len(too_long),
         "subagent_count": sum(len(p["sent"]["subagents"]) for p in packed),
         "bytes": sum(f["bytes"] for f in files),
         "redactions": sum(p["sent"]["redactions"] for p in packed),
         "omitted": sum(p["omitted"] for p in packed),
-        "remaining": remaining_after,
     }
     if assistant_note:
         result["assistant_note_sent"] = True
@@ -2675,7 +2927,8 @@ def build_parser():
     sp = sub.add_parser("send", help="一覧の控えに沿って送る")
     data_dir(sp)
     sp.add_argument("--code", default=None, help="start_submission の upload_code")
-    sp.add_argument("--exclude", required=True, help="外す番号（カンマ区切り）か none")
+    sp.add_argument("--exclude", default=None,
+                    help="外す番号（カンマ区切り）か none。選択画面の答えがあるときは渡さない（答えから読む）")
     sp.add_argument("--include", default=None, help="既定で外す会話のうち、送る番号")
     sp.add_argument("--note-file", default=None,
                     help="感想は標準入力から（- だけ）。区切りの行 %s のあとは AI の報告" % ASSISTANT_NOTE_SEPARATOR)

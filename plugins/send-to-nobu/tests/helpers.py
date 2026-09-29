@@ -196,6 +196,33 @@ class World(object):
         if os.path.exists(path):
             self.append(path, Lines(sid=sid or self.current).user(text if plain else send_cmd(text)))
 
+    def answer(self, questions, answers, sid=None, annotations=None, answers_in_input=False, error=False):
+        """本人が選択画面（AskUserQuestion）に答えた 2 行（AI の tool_use と、答えの tool_result）を、いまの会話に足す。
+
+        形は Claude Code 2.1.284 の対話で実際に残った行に合わせる（toolUseResult に questions・answers・annotations）。
+        """
+        sid = sid or self.current
+        L = Lines(sid=sid)
+        tid = "toolu_" + new_uuid().replace("-", "")[:20]
+        inp = {"questions": questions}
+        if answers_in_input:
+            inp["answers"] = answers
+        L._msg("assistant", [{"type": "tool_use", "id": tid, "name": "AskUserQuestion", "input": inp,
+                              "caller": {"type": "direct"}}])
+        src = L.parent
+        result = {"type": "tool_result", "tool_use_id": tid,
+                  "content": "The user answered: %s" % ", ".join('"%s"="%s"' % kv for kv in answers.items())}
+        extra = {"sourceToolAssistantUUID": src}
+        if error:
+            result["is_error"] = True
+        else:
+            extra["toolUseResult"] = {"questions": questions, "answers": answers, "annotations": annotations or {}}
+        L._msg("user", [result], **extra)
+        self.append(self.session_file(sid), L)
+
+    def ask(self):
+        return (self.pending().get("ask") or {}).get("questions")
+
     def run(self, *argv, stdin="", session=None, now=None, reply=True):
         """CLI をこのプロセスの中で呼ぶ。会話 ID は env だけ、時刻は agentlog._now の差し替え。"""
         argv = list(argv) + ["--data-dir", self.data]

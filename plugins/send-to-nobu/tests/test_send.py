@@ -207,8 +207,8 @@ class RoundTripTest(SendBase):
         self.assertEqual((fin["sent"], fin["excluded_count"]), ([], 2))
 
 
-class RoundSendTest(SendBase):
-    def test_sent_and_excluded_do_not_come_back_in_later_rounds(self):
+class SentAndExcludedTest(SendBase):
+    def test_sent_and_excluded_do_not_come_back(self):
         now = time.time()
         sids = []
         for i in range(20):
@@ -216,36 +216,17 @@ class RoundSendTest(SendBase):
             self.w.write(L)
             sids.append(L.sid)
         r1 = self.w.list()
-        self.assertEqual((r1["count"], r1["remaining"], r1["round"]), (15, 5, 1))
-        self.assertNotIn("note_already_sent", r1)
-        code, out, err = self.send(exclude="1", note="1 ラウンド目の感想")
+        self.assertEqual(r1["count"], 20)
+        code, out, err = self.send(exclude="1", note="感想")
         self.assertEqual(code, 0, err)
         res = json.loads(out)
-        self.assertEqual((res["sent_count"], res["excluded_count"], res["remaining"]), (14, 1, 5))
-        self.srv.finished = False                        # 次のラウンドは新しい引換券
-        # 送信のあと、同じ会話でもう一度 /send-to-nobu → 次のラウンド
+        self.assertEqual((res["sent_count"], res["excluded_count"]), (19, 1))
+        self.assertNotIn("remaining", res)
         code, out, err = self.w.run("status")
         self.assertEqual(json.loads(out), {"pending": False})
-        r2 = self.w.list()
-        self.assertEqual((r2["count"], r2["remaining"], r2["round"]), (5, 0, 2))
-        self.assertTrue(r2["note_already_sent"])        # 2 ラウンド目は感想を聞かない
-        # 別の会話（翌日）では 1 ラウンド目から・感想も聞く
-        other = self.w.start_send_session()
-        code, out, err = self.w.run("list", session=other)
-        r_other = json.loads(out)
-        self.assertEqual(r_other["round"], 1)
-        self.assertNotIn("note_already_sent", r_other)
-        code, out, err = self.w.run("list")   # もとの会話に戻る（控えは別の会話に移った）
-        r2 = json.loads(out)
-        self.assertEqual((r2["count"], r2["round"]), (5, 2))
-        self.assertEqual([it["session_id"] for it in r2["items"]], sids[:5])
-        self.assertEqual([it["n"] for it in r2["items"]], list(range(1, 6)))
-        code, out, err = self.send()
-        self.assertEqual(code, 0, err)
-        self.assertEqual(json.loads(out)["remaining"], 0)
         self.assertEqual(self.w.list()["count"], 0)
         sent = {o.split("/")[-1].split(".")[0] for o in self.srv.objects}
-        self.assertEqual(sent, set(sids) - {sids[5]})
+        self.assertEqual(sent, set(sids) - {sids[0]})
 
 
 class UnconfirmedTest(SendBase):
@@ -260,11 +241,10 @@ class UnconfirmedTest(SendBase):
         code, out, err = self.send(check=False)                           # 確認係の結果を書いていない
         self.assertEqual(code, 0, err)
         res = json.loads(out)
-        self.assertEqual((res["sent_count"], res["excluded_count"], res["deferred_unconfirmed"], res["remaining"]),
-                         (0, 0, 3, 3))
+        self.assertEqual((res["sent_count"], res["excluded_count"], res["deferred_unconfirmed"]), (0, 0, 3))
         self.assertEqual(self.srv.upload_calls, 0)
         self.assertEqual({k for k in self.w.state()["sessions"] if k != self.w.current}, set())   # 何も記録しない
-        # 同じ会話の次のラウンドで、同じ 3 件がもう一度出て確認係にかかる
+        # 同じ会話でもう一度 list すると、同じ 3 件がもう一度出て確認係にかかる
         r2 = self.w.list()
         self.assertEqual([it["session_id"] for it in r2["items"]], [it["session_id"] for it in r1["items"]])
         self.assertTrue(all(it["checkers"] for it in r2["items"]))
@@ -279,8 +259,7 @@ class UnconfirmedTest(SendBase):
         code, out, err = self.send(check=False)
         self.assertEqual(code, 0, err)
         res = json.loads(out)
-        self.assertEqual((res["sent_count"], res["excluded_count"], res["deferred_unconfirmed"], res["remaining"]),
-                         (2, 0, 1, 1))
+        self.assertEqual((res["sent_count"], res["excluded_count"], res["deferred_unconfirmed"]), (2, 0, 1))
         self.assertEqual(self.srv.finish_bodies[0]["excluded_count"], 0)   # 外したとは送らない
         self.assertNotIn(unconfirmed_sid, self.w.state()["sessions"])     # 未決定のまま
         self.srv.finished = False
@@ -301,8 +280,7 @@ class UnconfirmedTest(SendBase):
         code, out, err = self.send(exclude="3", check=False)             # 本人が外すと言った
         self.assertEqual(code, 0, err)
         res = json.loads(out)
-        self.assertEqual((res["sent_count"], res["excluded_count"], res["deferred_unconfirmed"], res["remaining"]),
-                         (2, 1, 0, 0))
+        self.assertEqual((res["sent_count"], res["excluded_count"], res["deferred_unconfirmed"]), (2, 1, 0))
         self.assertEqual(self.w.state()["sessions"][r1["items"][2]["session_id"]]["d"], "excluded")
         self.assertEqual(self.w.list()["count"], 0)
 
@@ -541,18 +519,18 @@ class WaveAndDisplayTest(SendBase):
             {"ticket": t[2], "verdict": "caution", "reasons": ["third_party"]},
             {"ticket": t[3], "verdict": "ok", "reasons": []},
             {"ticket": t[4], "verdict": "unknown", "reasons": []},
+            {"ticket": t[5], "verdict": "unknown", "reasons": []},
         ])
         d = out["display"]
         self.assertEqual(d["caution"], [{"label": "第三者への否定的な発言・評価", "n": [1, 2]},
                                         {"label": "お客さま・クライアントの名前や情報", "n": [1]}])
-        self.assertEqual(d["unconfirmed"], [{"label": "確認できなかった（今回は送らず、次の一覧でもう一度確かめる）",
-                                             "n": [4, 5]}])
+        self.assertEqual(d["unconfirmed"], [{"label": "確認できなかった（既定では送らない）", "n": [4, 5]}])
         self.assertEqual((d["caution_count"], d["unconfirmed_count"], d["ok_count"]), (2, 2, 1))
         self.assertEqual(d["text"], [
             "5 件のうち、気をつけた方がいいのは 2 件、確認できなかったのは 2 件。",
             "・1, 2：第三者への否定的な発言・評価",
             "・1：お客さま・クライアントの名前や情報",
-            "・4, 5：確認できなかった（今回は送らず、次の一覧でもう一度確かめる。送るなら「4, 5 も送る」）",
+            "・4, 5：確認できなかった（既定では送らない）",
             "ほかの 1 件は、会話の本文に気になる点なし（ツールの結果は機械の検出だけ）。"])
 
     def test_display_all_ok_and_tool_info(self):
@@ -687,8 +665,8 @@ class WaitAndTimeoutTest(SendBase):
         out = self.wait(now=created + T + 60)
         self.assertEqual(self.slept, [agentlog.CHECK_WAIT])
         self.assertEqual(len(out["missing"]), total - len(first))
-        # ラウンド全体は一覧から 15 分で、まだ投げていない分も含めて打ち切る
-        out = self.wait(now=created + agentlog.ROUND_TIMEOUT)
+        # 一覧全体は 15 分で、まだ投げていない分も含めて打ち切る
+        out = self.wait(now=created + agentlog.LIST_TIMEOUT)
         self.assertEqual((out["missing"], out["launch"], out["conversations"][0]["why"]), ([], [], "unknown"))
 
     def test_wait_reads_the_pending_again_after_sleeping(self):
@@ -747,8 +725,225 @@ class LockTest(SendBase):
             self.assertTrue(c.acquired)
 
 
+class AskAnswerTest(SendBase):
+    """選択画面（AskUserQuestion）の質問はスクリプトが作り、答えは会話ログから直接読む。"""
+
+    def convs(self, n):
+        now = time.time()
+        for i in range(n):
+            self.w.write(Lines(base=now - 90000 + i * 1000).user("会話 %02d" % i).assistant())
+        self.w.list()
+        return self.w.tickets()
+
+    def check(self, **by_verdict):
+        t = self.w.tickets()
+        res = []
+        for verdict, nums in by_verdict.items():
+            for k in nums:
+                res.append({"ticket": t[k], "verdict": verdict, "reasons": ["third_party"] if verdict == "caution" else []})
+        return self.w.check(results=res)
+
+    def send_answered(self, stdin="", extra=()):
+        args = ["send", "--code", FakeInbox.CODE, "--api-base", self.srv.base] + list(extra)
+        if stdin:
+            args += ["--note-file", "-"]
+        return self.w.run(*args, stdin=stdin, reply=False)
+
+    def q(self, kind):
+        return [m for m in self.w.pending()["ask"]["map"] if m["kind"] == kind]
+
+    def assert_fits_ask(self, questions):
+        self.assertLessEqual(len(questions), 4)
+        self.assertEqual(len({q["question"] for q in questions}), len(questions))
+        for q in questions:
+            self.assertTrue(2 <= len(q["options"]) <= 4, q)
+            self.assertLessEqual(len(q["header"]), 12)
+            self.assertTrue(all("," not in o["label"] for o in q["options"]))
+
+    def test_checked_returns_the_questions_when_done(self):
+        self.convs(5)
+        out = self.check(caution=[1], ok=[2, 4, 5], unknown=[3])
+        qs = out["ask"]["questions"]
+        self.assert_fits_ask(qs)
+        self.assertEqual([q["header"] for q in qs], ["外す", "送る", "感想"])
+        self.assertEqual([o["label"] for o in qs[0]["options"]], ["1. 会話 00（第三者への発言）", "外さない"])
+        self.assertEqual([o["label"] for o in qs[1]["options"]], ["3. 会話 02（確認できなかった）", "送らない"])
+        self.assertEqual(out["display"]["items"][:2], ["1. 会話 00", "2. 会話 01"])
+        # 一覧は最初の質問の頭に入れる（AI の本文に頼らず、選択画面で本人に必ず見せる）
+        head = qs[0]["question"].split("\n")
+        self.assertTrue(head[0].startswith("初回なので"))
+        self.assertEqual(head[1:3], out["display"]["text"][:2])
+        self.assertIn("5. 会話 04", head)
+        self.assertTrue(head[-1].startswith("外す会話は？"))
+        mid = self.w.check(results=[])                                   # そろったあとは同じ質問
+        self.assertEqual(mid["ask"], out["ask"])
+
+    def test_no_questions_before_every_checker_answered(self):
+        self.convs(3)
+        out = self.check(ok=[1])
+        self.assertNotIn("ask", out)
+        self.assertNotIn("display", out)
+
+    def test_send_reads_the_answers_from_the_log(self):
+        self.convs(5)
+        self.check(caution=[1], ok=[2, 4, 5], unknown=[3])
+        qs = self.w.ask()
+        self.w.answer(qs, {qs[0]["question"]: "1. 会話 00（第三者への発言）",
+                           qs[1]["question"]: "3. 会話 02（確認できなかった）",
+                           qs[2]["question"]: "わからないことがあった。コマンドの意味"})
+        code, out, err = self.send_answered()
+        self.assertEqual(code, 0, err)
+        res = json.loads(out)
+        self.assertEqual((res["sent_count"], res["excluded_count"], res["deferred_unconfirmed"]), (4, 1, 0))
+        fin = self.srv.finish_bodies[0]
+        self.assertEqual(fin["note"], "わからないことがあった。コマンドの意味")
+        self.assertEqual(fin["excluded_count"], 1)
+
+    def test_unanswered_questions_change_nothing(self):
+        self.convs(3)
+        self.check(caution=[1], ok=[2], unknown=[3])
+        qs = self.w.ask()
+        self.w.answer(qs, {qs[2]["question"]: "なし"})                     # 外す・送るは答えなかった
+        code, out, err = self.send_answered()
+        self.assertEqual(code, 0, err)
+        res = json.loads(out)
+        self.assertEqual((res["sent_count"], res["excluded_count"], res["deferred_unconfirmed"]), (2, 0, 1))
+        self.assertEqual(self.srv.finish_bodies[0]["note"], "")
+
+    def test_numbers_typed_in_the_input_field(self):
+        self.convs(6)
+        self.check(caution=[1], ok=[2, 3, 4, 5, 6])
+        qs = self.w.ask()
+        self.w.answer(qs, {qs[0]["question"]: "1. 会話 00（第三者への発言）, ４ と 5-6 も"})
+        code, out, err = self.send_answered()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["excluded_count"], 4)
+        self.assertEqual(self.srv.finish_bodies[0]["note"], "")
+
+    def test_exclude_all_and_numbers_not_in_the_list(self):
+        self.convs(3)
+        self.check(ok=[1, 2, 3])
+        qs = self.w.ask()
+        self.assertEqual([o["label"] for o in qs[0]["options"]], ["外さない", "今回は全部外す"])
+        self.w.answer(qs, {qs[0]["question"]: "9"})
+        code, out, err = self.send_answered()
+        self.assertEqual(code, agentlog.EXIT_BAD_ANSWER, err)
+        self.assertIn("一覧に無い", err)
+        self.w.answer(qs, {qs[0]["question"]: "今回は全部外す", qs[1]["question"]: "順調に使えている"})   # 聞き直した
+        code, out, err = self.send_answered()
+        self.assertEqual(code, 0, err)
+        self.assertEqual((json.loads(out)["sent_count"], json.loads(out)["excluded_count"]), (0, 3))
+        self.assertEqual(self.srv.finish_bodies[0]["note"], "順調に使えている")
+
+    def test_the_ai_cannot_pass_numbers_or_the_note_when_answered(self):
+        self.convs(2)
+        self.check(ok=[1, 2])
+        qs = self.w.ask()
+        self.w.answer(qs, {qs[0]["question"]: "外さない"})
+        code, out, err = self.send_answered(extra=["--exclude", "1"])
+        self.assertEqual(code, agentlog.EXIT_USAGE)
+        code, out, err = self.send_answered(stdin="AI が書いた感想")
+        self.assertEqual(code, agentlog.EXIT_USAGE)
+        self.assertIn("選択画面の答えから読む", err)
+        code, out, err = self.send_answered(stdin="%s\n確認係は全部届いた" % agentlog.ASSISTANT_NOTE_SEPARATOR)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.srv.finish_bodies[0]["assistant_note"], "確認係は全部届いた")
+
+    def test_a_newer_text_reply_wins_over_the_selection_screen(self):
+        self.convs(2)
+        self.check(ok=[1, 2])
+        qs = self.w.ask()
+        self.w.answer(qs, {qs[0]["question"]: "外さない"})
+        self.w.reply("2 は外して")                                           # 送る前に止まって、返事で答え直した
+        code, out, err = self.send_answered(extra=["--exclude", "2"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual((json.loads(out)["sent_count"], json.loads(out)["excluded_count"]), (1, 1))
+
+    def test_answers_that_the_user_did_not_give_are_not_read(self):
+        self.convs(2)
+        self.check(ok=[1, 2])
+        qs = self.w.ask()
+        self.w.answer(qs, {qs[0]["question"]: "今回は全部外す"}, answers_in_input=True)   # AI が答えを入れて呼んだ
+        self.w.answer(qs, {qs[0]["question"]: "今回は全部外す"}, error=True)              # 答えなかった（Esc）
+        changed = json.loads(json.dumps(qs))
+        changed[0]["options"][1]["label"] = "2. 会話 01（外す）"                          # 選択肢を書き換えた
+        self.w.answer(changed, {changed[0]["question"]: "2. 会話 01（外す）"})
+        code, out, err = self.send_answered()
+        self.assertEqual(code, agentlog.EXIT_NOT_ANSWERED, err)
+        # 一覧より前の答えも数えない（もう一度 list すると、そこから数え直す）
+        self.w.answer(qs, {qs[0]["question"]: "今回は全部外す"})
+        self.w.list()
+        code, out, err = self.send_answered()
+        self.assertEqual(code, agentlog.EXIT_NOT_ANSWERED, err)
+
+    def test_shared_history_is_asked_in_the_selection_screen(self):
+        now = time.time()
+        root = Lines(base=now - 9000).user("元の会話").assistant()
+        fork = Lines(base=now - 5000).copy_from(root).user("分岐").assistant()
+        self.w.write(root)
+        self.w.write(fork)
+        self.w.list()
+        self.check(caution=[1], ok=[2])
+        qs = self.w.ask()
+        self.w.answer(qs, {qs[0]["question"]: "1. 元の会話（第三者への発言）"})
+        code, out, err = self.send_answered()
+        self.assertEqual(code, agentlog.EXIT_CONFIRM_SHARED, err)
+        confirm = json.loads(out)["ask"]["questions"]
+        self.assert_fits_ask(confirm)
+        self.assertEqual([o["label"] for o in confirm[0]["options"]], ["それでも送る", "送る方の会話も外す"])
+        code, out, err = self.send_answered()                               # 答える前はもう一度同じ質問
+        self.assertEqual((code, json.loads(out)["ask"]["questions"]), (agentlog.EXIT_CONFIRM_SHARED, confirm))
+        self.w.answer(confirm, {confirm[0]["question"]: "送る方の会話も外す"})
+        code, out, err = self.send_answered()
+        self.assertEqual(code, 0, err)
+        self.assertEqual((json.loads(out)["sent_count"], json.loads(out)["excluded_count"]), (0, 2))
+
+    def test_shared_history_send_anyway(self):
+        now = time.time()
+        root = Lines(base=now - 9000).user("元の会話").assistant()
+        fork = Lines(base=now - 5000).copy_from(root).user("分岐").assistant()
+        self.w.write(root)
+        self.w.write(fork)
+        self.w.list()
+        self.check(caution=[1], ok=[2])
+        qs = self.w.ask()
+        self.w.answer(qs, {qs[0]["question"]: "1. 元の会話（第三者への発言）"})
+        confirm = json.loads(self.send_answered()[1])["ask"]["questions"]
+        self.w.answer(confirm, {confirm[0]["question"]: "それでも送る"})
+        code, out, err = self.send_answered()
+        self.assertEqual(code, 0, err)
+        self.assertEqual((json.loads(out)["sent_count"], json.loads(out)["excluded_count"]), (1, 1))
+
+    def test_many_flagged_conversations_fit_in_four_questions(self):
+        self.convs(30)
+        out = self.check(caution=range(1, 14), unknown=range(14, 23), ok=range(23, 31))
+        qs = out["ask"]["questions"]
+        self.assert_fits_ask(qs)
+        self.assertEqual([q["header"] for q in qs], ["外す 1/2", "外す 2/2", "送る", "感想"])
+        shown_ex = [o["label"] for q in qs[:2] for o in q["options"]]
+        self.assertEqual(len(shown_ex), 8)
+        # 選択肢に無い 13 番は入力欄に書けば外せる
+        self.w.answer(qs, {qs[0]["question"]: shown_ex[0], qs[1]["question"]: "13",
+                           qs[2]["question"]: qs[2]["options"][0]["label"] + ", 20"})
+        code, out, err = self.send_answered()
+        self.assertEqual(code, 0, err)
+        res = json.loads(out)
+        self.assertEqual((res["excluded_count"], res["deferred_unconfirmed"], res["sent_count"]), (2, 7, 21))
+
+    def test_nothing_to_send_still_asks_for_the_note(self):
+        self.w.list()
+        out = self.w.check(results=[])
+        self.assertEqual(out["display"]["text"], ["送る会話はない（感想・質問だけ送れる）。"])
+        qs = out["ask"]["questions"]
+        self.assertEqual([q["header"] for q in qs], ["感想"])
+        self.w.answer(qs, {qs[0]["question"]: "質問: 画像も送れますか"})
+        code, out, err = self.send_answered()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.srv.finish_bodies[0]["note"], "質問: 画像も送れますか")
+
+
 class TooLongTest(SendBase):
-    """確認しきれない長さの会話は「残り」に数えない（続けても確認係にかけられないので、続きに誘わない）。"""
+    """確認しきれない長さの会話は既定で送らず、未決定のまま。大きさを覚えて、次からは本文を読み直さない。"""
 
     def long_and_small(self):
         L = Lines(base=time.time() - 9000)
@@ -758,7 +953,6 @@ class TooLongTest(SendBase):
         self.w.write(Lines(base=time.time() - 3000).user("小さな会話").assistant())
         with mock.patch.object(agentlog, "CHECKER_CAP", 2):                  # 「1 会話で上限を超える」を小さく作る
             res = self.w.list()
-        self.assertEqual(res["too_long_count"], 0)                             # この一覧の外には無い
         return [it["session_id"] for it in res["items"] if it.get("too_long")][0]
 
     def nudge(self):
@@ -766,14 +960,13 @@ class TooLongTest(SendBase):
         self.assertEqual(agentlog.main(["nudge", "--data-dir", self.w.data], stdout=out), 0)
         return json.loads(out.getvalue())["systemMessage"] if out.getvalue().strip() else None
 
-    def test_not_remaining_but_too_long_count(self):
+    def test_not_sent_by_default_and_remembered(self):
         long_sid = self.long_and_small()
         self.w.check()
         code, out, err = self.send(check=False)
         self.assertEqual(code, 0, err)
         res = json.loads(out)
-        self.assertEqual((res["sent_count"], res["deferred_unconfirmed"], res["too_long_count"], res["remaining"]),
-                         (1, 0, 1, 0))
+        self.assertEqual((res["sent_count"], res["deferred_unconfirmed"], res["too_long_count"]), (1, 0, 1))
         self.assertNotIn(long_sid, self.w.state()["sessions"])                 # 外したとは記録しない（未決定のまま）
         self.assertIn(long_sid, self.w.state()["too_long"])
         # 朝の案内は、確認しきれない長さの会話だけなら出さない。書き足しても長いまま
@@ -781,39 +974,28 @@ class TooLongTest(SendBase):
         self.assertIsNone(self.nudge())
         self.w.write(Lines(base=time.time() - 60).user("新しい会話").assistant())
         self.assertIn("未送信の会話が 1 件", self.nudge())
-
-    def test_left_out_of_a_full_round_is_counted_separately(self):
-        self.long_and_small()
-        self.w.check()
-        self.assertEqual(self.send(check=False)[0], 0)
+        # 次の一覧にも出る（本文は読み直さない）
         self.srv.finished = False
-        now = time.time()
-        for i in range(2):
-            self.w.write(Lines(base=now - 600 + i * 60).user("新しい会話 %d" % i).assistant())
-        with mock.patch.object(agentlog, "ROUND_SIZE", 2), mock.patch.object(agentlog, "CHECKER_CAP", 2):
+        read = []
+        real = agentlog.conversation_layer
+
+        def spy(item):
+            read.append(item["session_id"])
+            return real(item)
+        with mock.patch.object(agentlog, "conversation_layer", spy):
             r2 = self.w.list()
-        self.assertEqual((r2["count"], r2["remaining"], r2["too_long_count"]), (2, 0, 1))
-        self.w.check()
-        code, out, err = self.send(check=False)
-        self.assertEqual(code, 0, err)
-        res = json.loads(out)
-        self.assertEqual((res["sent_count"], res["too_long_count"], res["remaining"]), (2, 1, 0))
+        self.assertEqual([it.get("too_long") for it in r2["items"]], [True, None])
+        self.assertNotIn(long_sid, read)
 
     def test_include_sends_it_and_forgets_it(self):
         long_sid = self.long_and_small()
         self.w.check()
-        self.assertEqual(self.send(check=False)[0], 0)
-        self.srv.finished = False
-        with mock.patch.object(agentlog, "CHECKER_CAP", 2):
-            r2 = self.w.list()
-        self.assertEqual([(it["session_id"], it.get("too_long")) for it in r2["items"]], [(long_sid, True)])
-        self.w.check()
         code, out, err = self.send(check=False, extra=["--include", "1"])      # 「1 も送る」
         self.assertEqual(code, 0, err)
         res = json.loads(out)
-        self.assertEqual((res["sent_count"], res["too_long_count"], res["remaining"]), (1, 0, 0))
+        self.assertEqual((res["sent_count"], res["too_long_count"]), (2, 0))
         self.assertEqual(self.w.state()["sessions"][long_sid]["d"], "sent")
-        self.assertNotIn(long_sid, self.w.state()["too_long"])
+        self.assertNotIn(long_sid, self.w.state().get("too_long") or {})
 
 
 class CheckedHardeningTest(SendBase):
@@ -854,9 +1036,9 @@ class CheckedHardeningTest(SendBase):
         code, out, err = self.send(check=False, exclude="1")
         self.assertEqual(code, 0, err)
         self.srv.finished = False
-        self.w.write(Lines(base=time.time() - 30).user("次のラウンドの会話").assistant())
-        self.w.list()                                                     # 同じ会話の次のラウンド（番号は 1 から）
-        code, out, err = self.w.run("checked", stdin="%s ok" % t_old[1])  # 前のラウンドの確認係 1 の札
+        self.w.write(Lines(base=time.time() - 30).user("送ったあとの会話").assistant())
+        self.w.list()                                                     # 送ったあと同じ会話でもう一度（番号は 1 から）
+        code, out, err = self.w.run("checked", stdin="%s ok" % t_old[1])  # 前の一覧の確認係 1 の札
         self.assertEqual(code, agentlog.EXIT_USAGE)
         self.assertIn("札ではない", err)
         self.assertEqual(self.w.pending()["checker_results"], {})
