@@ -12,7 +12,8 @@
     reask    読めない番号 → 同じターンで聞き直す → AI のメモ（ヒアドキュメント）も許可の確認なしで届く
     afk      答えずに放置（askUserQuestionTimeout 60s）→ 何も届かない
     control  対照: allowed-tools から Bash を外すと許可ダイアログを検出する（検出の仕組みが効いている確認）
-    many     60 件（長いタイトル）を 1 回の選択画面に出す（80 行の端末で最後の会話と質問の行まで見える）→ 全部届く
+    many     60 件（長いタイトル）を 24 行 × 80 桁（macOS の Terminal の既定）で 1 回の選択画面に出す。最後の会話・
+             質問の行・選択肢が見え、PageUp で 1 件目と見出しまで戻れる → そのまま答えて全部届く
 """
 import fcntl
 import http.server
@@ -275,9 +276,11 @@ class Screen(object):
         self.rows, self.cols = rows, cols
         self.g = [[" "] * cols for _ in range(rows)]
         self.r = self.c = 0
+        self.back = []          # 画面の上に押し出された行（端末のスクロールで戻って見られる）
+        self.cleared_back = 0   # スクロールの履歴を消した回数（ESC [3J）
 
     def _scroll(self):
-        self.g.pop(0)
+        self.back.append(self.g.pop(0))
         self.g.append([" "] * self.cols)
         self.r = self.rows - 1
 
@@ -314,8 +317,10 @@ class Screen(object):
                         self.g[self.r][self.c:] = [" "] * (self.cols - self.c)
                         for rr in range(self.r + 1, self.rows):
                             self.g[rr] = [" "] * self.cols
-                    elif mode in (2, 3):
+                    elif mode == 2:
                         self.g = [[" "] * self.cols for _ in range(self.rows)]
+                    elif mode == 3:
+                        self.back, self.cleared_back = [], self.cleared_back + 1
                 elif f == "K":
                     mode = args[0] if args else 0
                     if mode == 0:
@@ -344,8 +349,8 @@ class Screen(object):
                     self.g[self.r][self.c + 1] = ""
                 self.c += w
 
-    def text(self):
-        return "\n".join("".join(row).rstrip() for row in self.g)
+    def text(self, back=False):
+        return "\n".join("".join(row).rstrip() for row in (self.back if back else []) + self.g)
 
 
 def flat(s):
@@ -379,12 +384,15 @@ class Term(object):
                 with self.lock:
                     self.buf += data
 
-    def screen(self):
-        """いま端末に見えている画面。"""
+    def screen(self, back=False):
+        """いま端末に見えている画面（back なら、スクロールで戻って見られる行も）。"""
+        return self.emulate().text(back)
+
+    def emulate(self):
         sc = Screen(self.rows, self.cols)
         with self.lock:
             sc.feed(self.buf)
-        return sc.text()
+        return sc
 
     def mark(self):
         with self.lock:
@@ -398,9 +406,11 @@ class Term(object):
         t0 = time.time()
         while time.time() - t0 < timeout:
             s = flat(self.text(since))
-            for n in needles:
-                if flat(n) in s:
-                    return n
+            for k in range(2):      # 流れてきた文字列と、いまの画面（狭い端末では文字が飛び飛びに描かれる）の両方で探す
+                for n in needles:
+                    if flat(n) in s:
+                        return n
+                s = flat(self.screen()) if k == 0 else s
             time.sleep(0.3)
         return None
 
@@ -521,7 +531,7 @@ def run_scenario(name):
     extra = {"askUserQuestionTimeout": "60s"} if name == "afk" else {}
     w = make_world(root, inbox, mcp, extra, control=(name == "control"), many=56 if name == "many" else 0)
     model_env = dict(w["env"], ANTHROPIC_BASE_URL=model.base)
-    term = Term(["claude", "--plugin-dir", w["plugin"]], model_env, w["work"], rows=80 if name == "many" else 60)
+    term = Term(["claude", "--plugin-dir", w["plugin"]], model_env, w["work"], rows=24 if name == "many" else 60, cols=80 if name == "many" else 140)
     ok, notes = True, []
 
     def check(cond, msg):
@@ -546,14 +556,24 @@ def run_scenario(name):
         if found != "送らない会話は":
             raise RuntimeError("no screen")
         shown = term.text(m0)
-        check("連絡先あり" in flat(shown) and "請求書の集計" in shown, "1 問目に一覧（タイトルと目印）が出る")
+        check("請求書の集計" in shown, "1 問目に一覧のタイトルが出る")
         if name == "many":
             term.wait("外さずに送る", since=m0, timeout=10)
             time.sleep(1.5)
             sc = term.screen()
             check("60." in sc and "送らない会話は" in sc and "外さずに送る" in sc,
-                  "60 件目・質問の行・選択肢まで画面に見える")
+                  "24 行の画面に 60 件目・質問の行・選択肢が見える")
             check("ほかに" not in sc, "60 件なら「ほかに N 件」は出ない")
+            seen = sc
+            for _ in range(12):                 # 上へスクロール（PageUp）して、1 件目と見出しまで戻れるか
+                term.send(b"\x1b[5~", 0.8)
+                seen += "\n" + term.screen()
+                if "未送信の会話が 60 件" in seen:
+                    break
+            check("未送信の会話が 60 件" in seen and "\n│ 1. " in seen,
+                  "PageUp で 1 件目と見出しまで戻って見られる")
+            for _ in range(12):
+                term.send(b"\x1b[6~", 0.5)     # 元の位置へ（PageDown）
         if name == "afk":
             done = term.wait("答えがなかった", *PERMISSION_WORDS, since=m0, timeout=150)
         else:
@@ -565,7 +585,7 @@ def run_scenario(name):
                 term.type("3番以外" if name == "reask" else "3")
                 term.send(b"\r", 1.0)
             m1 = term.mark()
-            if not term.wait("昨日使ってみて", since=m0, timeout=20):
+            if not term.wait("わからなかったこと・質問も", since=m0, timeout=20):
                 raise RuntimeError("no Q2")
             if name == "none":
                 term.send(b"\x1b[B", 0.3)
@@ -583,7 +603,7 @@ def run_scenario(name):
                 check(again == "番号として読めなかった", "読めない番号は同じターンで聞き直す（%s）" % again)
                 time.sleep(2.0)     # 伝える文と同じメッセージで選択画面が開く
                 term.send(b"\r", 1.0)
-                term.wait("昨日使ってみて", since=m2, timeout=20)
+                term.wait("わからなかったこと・質問も", since=m2, timeout=20)
                 term.send(b"\r", 1.0)
                 if term.wait("Submit", since=m2, timeout=10):
                     term.send(b"\r", 1.0)
@@ -637,7 +657,8 @@ def run_scenario(name):
     except Exception as e:
         ok = False
         notes.append("FAIL 例外 %r" % e)
-        notes.append("---- 画面の最後\n" + term.text()[-2500:])
+        notes.append("---- 画面の最後\n" + term.text()[-1500:])
+        notes.append("---- いまの画面\n" + term.screen())
         notes.append("INFO 道具の順: %s" % model.log)
     finally:
         term.close()

@@ -130,22 +130,6 @@ class Reading(Base):
         self.assertNotIn("書きかけ".encode("utf-8"), body)
         self.assertIn(b"\xff", body)    # 読めない文字も手を加えずに送る
 
-    def test_marks_for_contacts_and_card_numbers_in_tool_results(self):
-        a = Lines().user("メールを調べて").tool("Bash", {"command": "cat a"}, result="担当: taro.yamada@acme.co.jp")
-        b = Lines().user("決済のログ").tool("Read", {"file_path": "x"}, result="card=4242 4242 4242 4242 ok")
-        c = Lines().user("自分のアドレスは hanako@acme.co.jp").tool("Bash", {"command": "git log"},
-                                                                  result="Author: x <1234+x@users.noreply.github.com>")
-        d = Lines().user("電話").tool("Bash", {"command": "cat b"}, result="TEL 03-1234-5678")
-        for L in (a, b, c, d):
-            self.w.write(L)
-        self.w.list()
-        lines = {it["session_id"]: it["n"] for it in self.w.pending()["items"]}
-        q = self.first_question()
-        self.assertIn("%d. メールを調べて（連絡先あり）" % lines[a.sid], q)
-        self.assertIn("%d. 決済のログ（カード番号あり）" % lines[b.sid], q)
-        self.assertIn("%d. 自分のアドレスは hanako@acme.co.jp\n" % lines[c.sid], q + "\n")
-        self.assertIn("%d. 電話（連絡先あり）" % lines[d.sid], q)
-
     def test_the_selection_screen(self):
         self.w.write(Lines().user("請求書の集計").assistant())
         res = self.w.list()
@@ -155,7 +139,7 @@ class Reading(Base):
         self.assertEqual(qs[0]["question"].splitlines(), [
             "未送信の会話が 1 件ある。外したもの以外を のぶろう に送る。", "", "1. 請求書の集計", "",
             "送らない会話は？（外すなら入力欄に番号。例: 3, 5-7）"])
-        self.assertEqual([o["label"] for o in qs[0]["options"]], [agentlog.NONE_LABEL, agentlog.ALL_LABEL])
+        self.assertEqual([o["label"] for o in qs[0]["options"]], [agentlog.NONE_LABEL, agentlog.PASS_LABEL])
         self.assertEqual([o["label"] for o in qs[1]["options"]], list(agentlog.NOTE_OPTIONS))
         self.assertFalse(qs[0]["multiSelect"] or qs[1]["multiSelect"])
         self.assertNotIn("session_id", json.dumps(res))     # 出力は質問だけ（会話 ID・パスは控えにだけ）
@@ -262,7 +246,7 @@ class Sending(Base):
 
     def test_same_content_packs_the_same(self):
         tmp = self.w.tmp
-        it = {"session_id": self.L.sid, "path": self.path, "offset": os.path.getsize(self.path), "subs": [],
+        it = {"session_id": self.L.sid, "offset": os.path.getsize(self.path), "subs": [],
               "title": "t", "project": "", "last_activity": None}
         os.makedirs(os.path.join(tmp, "a"))
         os.makedirs(os.path.join(tmp, "b"))

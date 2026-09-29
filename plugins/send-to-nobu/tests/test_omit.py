@@ -58,13 +58,30 @@ class OmitTest(unittest.TestCase):
 
     def test_untouched_lines_are_byte_identical(self):
         for row in ({"type": "user", "message": {"content": "base64 って何？"}},
-                    {"type": "user", "toolUseResult": {"encoding": "base64", "base64": "QUJD"}},
-                    {"type": "user", "x": {"base64": "QUJD", "type": "text"}},
                     {"type": "user", "message": {"content": [{"type": "image", "source": {"type": "url", "url": "https://x"}}]}}):
             raw = dumps(row)
             new, n = agentlog.omit_blob(raw)
             self.assertIs(new, raw)
             self.assertEqual(n, 0)
+
+    def test_read_tool_pdf_result(self):
+        # Read の PDF の結果は file の中に type が無い。media type が無くても base64 は抜く（ラベルは unknown）
+        row = {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t1", "content": [
+            {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": PDF}}]}]},
+            "toolUseResult": {"type": "pdf", "file": {"filePath": "/tmp/a.pdf", "base64": PDF, "originalSize": 1009}}}
+        new, n = agentlog.omit_blob(dumps(row))
+        self.assertEqual(n, 2)
+        self.assertNotIn(PDF[:100].encode(), new)
+        obj = json.loads(new)
+        self.assertEqual(obj["toolUseResult"]["file"], {"filePath": "/tmp/a.pdf", "originalSize": 1009,
+                                                        "base64": "[OMITTED:unknown 1009 bytes]"})
+
+    def test_any_base64_string_is_omitted(self):
+        for row in ({"type": "user", "toolUseResult": {"encoding": "base64", "base64": "QUJD"}},
+                    {"type": "user", "x": {"base64": "QUJD", "type": "text"}}):
+            new, n = agentlog.omit_blob(dumps(row))
+            self.assertEqual(n, 1)
+            self.assertIn(b"[OMITTED:unknown 3 bytes]", new)
 
     def test_already_omitted_is_not_counted_again(self):
         row = {"message": {"content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png",

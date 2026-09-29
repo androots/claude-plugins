@@ -15,7 +15,7 @@ from helpers import SEND_CMD, SEND_CMD_NS, FakeInbox, Lines, Patched, World, age
 
 KEY = "sk-ant-api03-" + "Q1w2E3r4T5y6U7i8O9p0" * 4
 PNG = base64.b64encode(b"\x89PNG" + b"\x00" * 3000).decode()
-NONE, ALL = agentlog.NONE_LABEL, agentlog.ALL_LABEL
+NONE, PASS = agentlog.NONE_LABEL, agentlog.PASS_LABEL
 
 
 class Base(unittest.TestCase):
@@ -88,12 +88,11 @@ class OnlyWhatWasShown(Base):
         self.assertEqual(sorted(self.w.listed()), sorted([L.sid, late.sid]))
 
     def test_sixty_fit_in_one_screen_with_shorter_titles(self):
-        # 60 件・長いタイトル・全部に目印でも、1 回の選択画面に 1 行 1 件で全部出る（タイトルを縮めて収める）
+        # 60 件・長いタイトルでも、1 回の選択画面に 1 行 1 件で全部出る（タイトルを縮めて 2,000 字の内側に収める）
         long = "とても長いタイトルの会話で、どれが何の話かを見分けるために書き足した説明をさらに足した %02d"
         convs = []
         for i in range(60):
-            L = Lines(base=time.time() - 9000 + i * 100).user("指示 %d" % i)
-            L.tool("Bash", {"command": "cat x"}, result="TEL 03-1234-5678 card 4242 4242 4242 4242")
+            L = Lines(base=time.time() - 9000 + i * 100).user("指示 %d" % i).assistant()
             convs.append(L.meta("custom-title", customTitle=long % i))
             self.w.write(L)
         self.w.list()
@@ -104,8 +103,8 @@ class OnlyWhatWasShown(Base):
         self.assertTrue(q.endswith("送らない会話は？（外すなら入力欄に番号。例: 3, 5-7）"))
         rows = [line for line in q.splitlines() if re.match(r"^\d+\. ", line)]
         self.assertEqual(len(rows), 60)                         # 1 行 1 件
-        self.assertTrue(all("…（連絡先あり・カード番号あり）" in r for r in rows))
-        self.assertLess(len(rows[0]), len("1. ") + agentlog.TITLE_CHARS + len("（連絡先あり・カード番号あり）"))
+        self.assertTrue(all(r.endswith("…") for r in rows))
+        self.assertLess(len(rows[0]), len("1. ") + agentlog.TITLE_CHARS)
         self.assertEqual(self.w.pending()["items"][59]["title"], long % 59)   # 送るタイトルは縮めない
         self.w.answer_simple(exclude="60")
         code, res = self.send()
@@ -239,15 +238,22 @@ class AnswerRequired(Base):
             self.assertEqual(agentlog.parse_numbers(text, count), want, text)
         self.assertIsNone(agentlog.parse_numbers("2-1", count))
 
-    def test_send_everything_or_nothing(self):
-        self.w.answer_simple(exclude=ALL, note="今日は送らないでおく")
+    def test_not_today_sends_nothing_and_keeps_them_for_next_time(self):
+        self.w.answer_simple(exclude=PASS, note="今日は感想だけ")
         code, res = self.send()
         self.assertEqual(code, 0, res)
         self.assertEqual(self.inbox.objects, {})
-        self.assertEqual(self.finish()["sent"], [])
-        self.assertEqual(self.finish()["note"], "今日は送らないでおく")
-        self.assertEqual(self.finish()["excluded_count"], 2)
-        self.assertEqual(res["say"], "感想を送った（会話は 2 件外した）")
+        self.assertEqual((self.finish()["sent"], self.finish()["note"], self.finish()["excluded_count"]),
+                         ([], "今日は感想だけ", 0))
+        self.assertIn("次の /send-to-nobu でまた出る", res["say"])
+        self.assertEqual(self.w.state()["sessions"], {})       # 外したとは記録しない
+        self.w.next_day()
+        self.w.list()
+        self.assertEqual(sorted(self.w.listed()), sorted([self.a.sid, self.b.sid]))
+        self.w.answer_simple(exclude=PASS, note="特になし")
+        code, res = self.w.run("send")
+        self.assertEqual((code, res["say"]), (0, "会話は今日は送らない（次の /send-to-nobu でまた出る）"))
+        self.assertEqual(self.w.state()["sessions"], {})
 
     def test_the_answer_line_can_arrive_a_moment_later(self):
         saved = agentlog.ANSWER_WAIT
@@ -338,12 +344,6 @@ class UsersWords(Base):
         self.send("--assistant-note", "-", stdin="start_submission が 1 回失敗した\n")
         self.assertEqual(self.finish()["note"], "使えてる")
         self.assertEqual(self.finish()["assistant_note"], "start_submission が 1 回失敗した")
-
-    def test_assistant_note_with_a_title_is_not_sent(self):
-        self.w.answer_simple()
-        self.send("--assistant-note", "-", stdin="「請求書の集計」を送るときに詰まった")
-        self.assertNotIn("assistant_note", self.finish())
-
 
 class SendSession(Base):
     """5. 送信用の会話と、一覧の出力を含む会話は一覧に出さない。一覧は送信用の会話の中でしか出さない。"""

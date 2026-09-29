@@ -21,7 +21,6 @@ import os
 import re
 import shutil
 import ssl
-import stat
 import sys
 import tempfile
 import time
@@ -56,7 +55,7 @@ ALLOWED_PUT_PREFIXES = ("https://storage.googleapis.com/",)
 CONFIG_DIR = None             # テストだけが差し替える（ふだんは $CLAUDE_CONFIG_DIR か ~/.claude）
 
 NONE_LABEL = "なし（全部送る）"
-ALL_LABEL = "全部送らない"
+PASS_LABEL = "今日は送らない（次回また出る）"
 NOTE_QUESTION = "昨日使ってみてどうだった？わからなかったこと・質問も（自由に書くなら入力欄に）"
 NOTE_OPTIONS = ("特になし", "順調に使えてる")
 
@@ -146,18 +145,6 @@ def remove_quietly(path):
         os.unlink(path)
     except OSError:
         pass
-
-
-def open_nofollow(path):
-    """シンボリックリンクを追わずに、ふつうのファイルだけを開く。"""
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise OSError("not a regular file")
-        return os.fdopen(fd, "rb")
-    except BaseException:
-        os.close(fd)
-        raise
 
 
 def config_dir():
@@ -339,7 +326,8 @@ def _b64_size(data):
 
 
 def _omit_obj(obj, counter):
-    """`source.type == "base64"` の data と、Read の画像結果 `{"base64", "type": "image/png"}` の base64 を印に置き換える。"""
+    """`source.type == "base64"` の data と、`base64` キーの文字列（Read の画像・PDF の結果）を印に置き換える。
+    印のラベルは media type があればそれ、無ければ unknown。"""
     if isinstance(obj, dict):
         src = obj.get("source")
         if isinstance(src, dict) and src.get("type") == "base64":
@@ -349,8 +337,8 @@ def _omit_obj(obj, counter):
                 src["data"] = "%s%s %d bytes]" % (_OMITTED_PREFIX, media, _b64_size(data))
                 counter[0] += 1
         data, media = obj.get("base64"), obj.get("type")
-        if (isinstance(data, str) and not data.startswith(_OMITTED_PREFIX)
-                and isinstance(media, str) and _MEDIA_TYPE_RE.match(media)):
+        if isinstance(data, str) and not data.startswith(_OMITTED_PREFIX):
+            media = media if isinstance(media, str) and _MEDIA_TYPE_RE.match(media) else "unknown"
             obj["base64"] = "%s%s %d bytes]" % (_OMITTED_PREFIX, media, _b64_size(data))
             counter[0] += 1
         values = obj.values()
@@ -471,46 +459,6 @@ def squash(text, limit):
     return t if len(t) <= limit else t[:limit - 1] + "…"
 
 
-# ツールの結果にある連絡先・カード番号らしきもの（本人が外すかを決める目印。中身は持たない）
-_EMAIL_RE = re.compile(r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]{1,64}@(?:[A-Za-z0-9-]{1,63}\.)+[A-Za-z]{2,24}(?![A-Za-z0-9-])")
-_EMAIL_IGNORE = re.compile(r"(?:^|[._+-])no-?reply[._+-]?|@(?:[a-z0-9-]+\.)*(?:example\.(?:com|org|net)"
-                           r"|users\.noreply\.github\.com)$", re.I)
-_PHONE_RE = re.compile(r"(?<![\d.-])(?:0\d{1,4}-\d{1,4}-\d{3,4}|0[5789]0\d{8}|\+81[- ]?\d{1,4}[- ]?\d{1,4}[- ]?\d{3,4})"
-                       r"(?![\d.-])")
-_CARD_RE = re.compile(r"(?<![\d.])(?:4\d{3}|5[1-5]\d{2}|2[2-7]\d{2}|3[47]\d{2}|35\d{2}|6\d{3})(?:[ -]?\d{4}){2}[ -]?\d{2,4}"
-                      r"(?![\d.])")
-MARK_LABELS = (("contact", "連絡先あり"), ("card", "カード番号あり"))
-
-
-def _is_card(digits):
-    """13〜19 桁・同じ数字の並びではない・Luhn のチェック数字が合う。"""
-    total = 0
-    for i, ch in enumerate(reversed(digits)):
-        d = int(ch) * (2 if i % 2 else 1)
-        total += d - 9 if d > 9 else d
-    return 13 <= len(digits) <= 19 and len(set(digits)) > 1 and total % 10 == 0
-
-
-def tool_marks(d, marks):
-    """ツールの結果（tool_result・toolUseResult）の文字列から目印を marks に足す。"""
-    content = d["message"].get("content") if isinstance(d.get("message"), dict) else None
-    stack = [b.get("content") for b in content if isinstance(b, dict) and b.get("type") == "tool_result"] \
-        if isinstance(content, list) else []
-    stack.append(d.get("toolUseResult"))
-    while stack and len(marks) < 2:
-        o = stack.pop()
-        if isinstance(o, dict):
-            stack.extend(o.values())
-        elif isinstance(o, list):
-            stack.extend(o)
-        elif isinstance(o, str) and len(o) >= 6:
-            if "contact" not in marks and (_PHONE_RE.search(o) or ("@" in o and any(
-                    not _EMAIL_IGNORE.search(m.group(0)) for m in _EMAIL_RE.finditer(o)))):
-                marks.add("contact")
-            if "card" not in marks and any(_is_card(re.sub(r"\D", "", m.group(0))) for m in _CARD_RE.finditer(o)):
-                marks.add("card")
-
-
 class Scan(object):
     """会話ファイル 1 本を読んだ結果。"""
 
@@ -521,7 +469,6 @@ class Scan(object):
         self.end = 0                # 読み終えた位置（書きかけの最終行は含めない）
         self.marker = False         # 一覧の出力や控えの中身が残っている
         self.sdk = self.other_entry = False
-        self.marks = set()
 
     def title(self):
         """最後の custom-title > 最後の ai-title > 最初の指示。秘密は伏せる。"""
@@ -540,7 +487,7 @@ class Scan(object):
 def scan(path, quick=False, baseline=None):
     """会話ファイルを先頭から読む。quick なら、最初の指示（と基準より後の時刻）がわかったら目印だけを探す。"""
     s = Scan()
-    with open_nofollow(path) as fh:
+    with open(path, "rb") as fh:
         for raw in fh:
             if not raw.endswith(b"\n"):
                 break   # 書きかけの最終行は読まない（送るのもここまで）
@@ -570,23 +517,19 @@ def scan(path, quick=False, baseline=None):
             kind, text = classify(d)
             if kind and s.first is None:
                 s.first, s.first_text = kind, text
-            if not quick and t == "user" and len(s.marks) < 2:
-                if b'"base64"' in raw:
-                    _omit_obj(d, [0])
-                tool_marks(d, s.marks)
     return s
 
 
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
-_SEG_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
-MAX_REL_DEPTH = 6
+# サーバーの契約の rel の形（各段 [A-Za-z0-9_.-]{1,128}・深さ 6 まで・.jsonl か .json）。外れると送信ごと 400 になる
+_REL_RE = re.compile(r"^(?:[A-Za-z0-9_.-]{1,128}/){0,5}[A-Za-z0-9_.-]{1,122}\.jsonl?$")
 
 
 def iter_sessions():
-    """projects/*/<uuid>.jsonl（リンクは追わない）。同じ会話 ID が複数あれば新しい方。[(sid, path, stat)]。"""
+    """projects/*/<uuid>.jsonl。同じ会話 ID が複数あれば新しい方。[(sid, path, stat)]。"""
     found = {}
     try:
-        projects = [p for p in os.scandir(projects_dir()) if p.is_dir(follow_symlinks=False)]
+        projects = [p for p in os.scandir(projects_dir()) if p.is_dir()]
     except OSError:
         return []
     for pe in projects:
@@ -599,10 +542,10 @@ def iter_sessions():
             if not e.name.endswith(".jsonl") or not _UUID_RE.match(sid):
                 continue
             try:
-                st = e.stat(follow_symlinks=False)
+                st = e.stat()
             except OSError:
                 continue
-            if stat.S_ISREG(st.st_mode) and (sid not in found or st.st_mtime > found[sid][1].st_mtime):
+            if e.is_file() and (sid not in found or st.st_mtime > found[sid][1].st_mtime):
                 found[sid] = (e.path, st)
     return [(sid, p, st) for sid, (p, st) in sorted(found.items())]
 
@@ -614,51 +557,28 @@ def find_session_path(sid):
     return None
 
 
-def session_dir_of(main_path):
-    """会話ディレクトリ <sid>/。リンクなら None。"""
-    d = main_path[:-len(".jsonl")]
-    try:
-        return d if stat.S_ISDIR(os.lstat(d).st_mode) else None
-    except OSError:
-        return None
-
-
-def _rel_ok(rel):
-    segs = rel.split("/")
-    return (len(segs) <= MAX_REL_DEPTH and all(_SEG_RE.match(x) and x not in (".", "..") for x in segs)
-            and rel.endswith((".jsonl", ".json")))
-
-
-def subagent_files(session_dir):
-    """<session>/subagents/ 以下の .jsonl と .json（入れ子も。リンクはたどらない）。[(rel, path, size)]。"""
+def subagent_files(main_path):
+    """会話の <sid>/subagents/ 以下の .jsonl と .json（入れ子も）。[(rel, path, size)]。"""
     out = []
-    root = os.path.join(session_dir, "subagents") if session_dir else None
-    try:
-        if root is None or not stat.S_ISDIR(os.lstat(root).st_mode):
-            return out
-    except OSError:
-        return out
+    root = os.path.join(main_path[:-len(".jsonl")], "subagents")
     for dp, dns, fns in os.walk(root):
+        dns.sort()
         rel_dir = os.path.relpath(dp, root)
-        parts = [] if rel_dir == "." else rel_dir.split(os.sep)
-        dns[:] = sorted(x for x in dns if not os.path.islink(os.path.join(dp, x)))
         for fn in sorted(fns):
-            rel = "/".join(parts + [fn])
-            if not _rel_ok(rel):
-                continue
+            rel = fn if rel_dir == "." else "/".join(rel_dir.split(os.sep) + [fn])
             try:
-                st = os.lstat(os.path.join(dp, fn))
+                size = os.path.getsize(os.path.join(dp, fn))
             except OSError:
                 continue
-            if stat.S_ISREG(st.st_mode):
-                out.append((rel, os.path.join(dp, fn), st.st_size))
+            if _REL_RE.match(rel):
+                out.append((rel, os.path.join(dp, fn), size))
     return out
 
 
 def has_turn_after(path, offset):
     """offset 以降に user / assistant 行があるか（開いて閉じただけで足されるメタ行は数えない）。"""
     try:
-        with open_nofollow(path) as fh:
+        with open(path, "rb") as fh:
             if os.fstat(fh.fileno()).st_size < offset:
                 return True     # 書き直された
             fh.seek(offset)
@@ -673,7 +593,7 @@ def has_turn_after(path, offset):
 
 def file_has_marker(path):
     try:
-        with open_nofollow(path) as fh:
+        with open(path, "rb") as fh:
             return any(_MARKER_B in raw for raw in fh)
     except OSError:
         return False
@@ -727,7 +647,7 @@ def candidates(state, current):
             if rec.get("size") == st.st_size and rec.get("mtime") == int(st.st_mtime):
                 continue
             if (not has_turn_after(path, int(rec.get("offset") or 0))
-                    and _sub_sig(subagent_files(session_dir_of(path))) == [rec.get("sub_n", 0), rec.get("sub_bytes", 0)]):
+                    and _sub_sig(subagent_files(path)) == [rec.get("sub_n", 0), rec.get("sub_bytes", 0)]):
                 continue
         elif st.st_mtime < state["baseline"]:
             continue
@@ -739,12 +659,7 @@ def candidates(state, current):
 
 def cleanup_old(data_dir):
     """0.4 までの置きもの（確認係に読ませた本文など）を消す。"""
-    review = os.path.join(data_dir, "review")
-    try:
-        if stat.S_ISDIR(os.lstat(review).st_mode):
-            shutil.rmtree(review, ignore_errors=True)
-    except OSError:
-        pass
+    shutil.rmtree(os.path.join(data_dir, "review"), ignore_errors=True)
     for name in ("scan-cache.json", "excluded-uuids.json", "lock"):
         remove_quietly(os.path.join(data_dir, name))
 
@@ -814,9 +729,7 @@ def build_questions(items, more):
     for width in (TITLE_CHARS, 32, 26, 20, 16, 12, 8):  # 収まるまでタイトルを短くする（1 行 1 件のまま）
         lines = ["未送信の会話が %d 件ある。外したもの以外を のぶろう に送る。" % len(items), ""]
         for it in items:
-            tags = "・".join(label for key, label in MARK_LABELS if key in it["marks"])
-            lines.append("%d. %s%s" % (it["n"], squash(it["title"], width) or "（タイトルなし）",
-                                       "（%s）" % tags if tags else ""))
+            lines.append("%d. %s" % (it["n"], squash(it["title"], width) or "（タイトルなし）"))
         if more:
             lines.append("（ほかに %d 件。送ったあと、もう一度 /send-to-nobu で出る）" % more)
         lines += ["", "送らない会話は？（外すなら入力欄に番号。例: 3, 5-7）"]
@@ -824,7 +737,7 @@ def build_questions(items, more):
             break
     return [{"question": "\n".join(lines), "header": "送らない", "multiSelect": False,
              "options": [{"label": NONE_LABEL, "description": "外さずに送る"},
-                         {"label": ALL_LABEL, "description": "今回はどれも送らない（感想は送れる）"}]},
+                         {"label": PASS_LABEL, "description": "どの会話も外さず、次の /send-to-nobu でまた出す（感想は送れる）"}]},
             note_q]
 
 
@@ -839,17 +752,17 @@ def cmd_list(args, out):
     for csid, path, st, rec in candidates(state, sid):
         try:
             s = scan(path)
-            subs = subagent_files(session_dir_of(path))
+            subs = subagent_files(path)
         except OSError:
             continue
         if not s.listable(rec, state["baseline"], st.st_mtime) or any(file_has_marker(p) for _, p, _ in subs):
             continue
         last = s.last_ts if s.last_ts is not None else st.st_mtime
-        rows.append({"session_id": csid, "path": path, "offset": s.end, "size": st.st_size, "mtime": int(st.st_mtime),
+        rows.append({"session_id": csid, "offset": s.end, "size": st.st_size, "mtime": int(st.st_mtime),
                      "subs": [[rel, size] for rel, _, size in subs], "sub_n": len(subs),
                      "sub_bytes": sum(size for _, _, size in subs), "title": s.title(),
                      "project": squash(mask_text(home_short(s.cwd))[0], PROJECT_MAX),
-                     "last_activity": iso_utc(last), "last_ts": last, "marks": sorted(s.marks)})
+                     "last_activity": iso_utc(last), "last_ts": last})
     rows.sort(key=lambda r: (r["last_ts"], r["session_id"]))
     items = rows[:LIST_MAX]     # 極端に多いときだけ古い方から。残りは送ったあとの一覧に出る
     for n, it in enumerate(items, 1):
@@ -858,7 +771,7 @@ def cmd_list(args, out):
     while items and js_len(questions[0]["question"]) > QUESTION_MAX:   # 見えない会話は控えに入れない
         items = items[:-1]
         questions = build_questions(items, len(rows) - len(items))
-    with open_nofollow(cur_path) as fh:
+    with open(cur_path, "rb") as fh:
         session_offset = os.fstat(fh.fileno()).st_size   # これより後の答えだけを数える
     write_json(pending_path(data_dir), {
         LIST_MARKER: 1, "v": PENDING_V, "session": sid, "session_offset": session_offset, "created": now,
@@ -891,7 +804,7 @@ def read_answer(path, offset, questions, used=()):
     エラー・聞き直しに使った答え（used）。いくつもあれば最後のもの。無ければ None。
     """
     want, asked, found = _shape(questions), set(), None
-    with open_nofollow(path) as fh:
+    with open(path, "rb") as fh:
         fh.seek(offset)
         for raw in fh:
             d = parse_line(raw)
@@ -943,19 +856,19 @@ def _annotation(annotations, question):
 
 
 def decide(pending, answers, annotations):
-    """答え → (外す番号, 感想)。外す質問に明示の答えが無い・番号が読めないときは聞き直す（Stop）。"""
-    exclude, count = set(), len(pending["items"])
+    """答え → (外す番号, 感想, 今日は送らない)。外す質問に明示の答えが無い・番号が読めないときは聞き直す（Stop）。"""
+    exclude, count, skip = set(), len(pending["items"]), False
     q = pending.get("exclude_question")
     if q:
         a = answers.get(q).strip() if isinstance(answers.get(q), str) else ""
-        extra = _annotation(annotations, q)
-        got = (set() if a == NONE_LABEL else set(range(1, count + 1)) if a == ALL_LABEL
-               else parse_numbers(a, count) if a else None)
+        extra = "" if a == PASS_LABEL else _annotation(annotations, q)
+        skip = a == PASS_LABEL
+        got = (set() if a in (NONE_LABEL, PASS_LABEL) else parse_numbers(a, count) if a else None)
         if got is not None and extra:
             more = parse_numbers(extra, count)
             got = None if more is None else got | more
         if got is None:
-            said = a if a and a not in (NONE_LABEL, ALL_LABEL) else extra
+            said = a if a and a != NONE_LABEL else extra
             say = ("「%s」は番号として読めなかった。外すなら入力欄に番号だけ（例: 3, 5-7）、外さないなら「%s」を選んでね"
                    % (squash(said, 30), NONE_LABEL) if said
                    else "送らない会話の質問に答えがなかった。「%s」か番号で答えてね" % NONE_LABEL)
@@ -964,41 +877,17 @@ def decide(pending, answers, annotations):
     nq = pending["note_question"]
     a = answers.get(nq).strip() if isinstance(answers.get(nq), str) else ""
     note = "\n".join(t for t in ("" if a == NOTE_OPTIONS[0] else a, _annotation(annotations, nq)) if t)
-    return exclude, note
+    return exclude, note, skip
 
 
 # ---------------------------------------------------------------- 固めて送る
-
-
-def _main_path_ok(it):
-    """控えの会話ファイルが projects/<dir>/<sid>.jsonl そのもの（リンクでない・ふつうのファイル）か。"""
-    path, sid = it.get("path"), it.get("session_id")
-    if not isinstance(path, str) or not _UUID_RE.match(sid or "") or os.path.basename(path) != sid + ".jsonl":
-        return None
-    expected = os.path.join(os.path.realpath(projects_dir()), os.path.basename(os.path.dirname(path)), sid + ".jsonl")
-    try:
-        ok = stat.S_ISREG(os.lstat(path).st_mode) and os.path.realpath(path) == expected
-    except OSError:
-        return None
-    return path if ok else None
-
-
-def _sub_path_ok(session_dir, rel):
-    p = os.path.join(session_dir, "subagents", *rel.split("/")) if session_dir and _rel_ok(rel) else None
-    try:
-        if p and stat.S_ISREG(os.lstat(p).st_mode) and \
-                os.path.realpath(p) == os.path.join(os.path.realpath(session_dir), "subagents", *rel.split("/")):
-            return p
-    except OSError:
-        pass
-    return None
 
 
 def pack_file(src, dst, limit, jsonl):
     """src の先頭 limit バイト（一覧の時点の中身）を、画像を抜いて秘密を伏せて gzip（mtime=0）。
     .json は丸ごと読めたときだけ。戻り値 {"bytes", "sha256", "redactions", "local"} か None。"""
     redactions = 0
-    with open_nofollow(src) as fin:
+    with open(src, "rb") as fin:
         if jsonl:
             chunks = _lines_upto(fin, limit)
         else:
@@ -1030,15 +919,15 @@ def _lines_upto(fh, limit):
 
 def pack_session(it, tmp):
     """送る会話 1 本を一覧の時点の中身で固める。(ファイルの並び, 送信票の 1 件)。"""
-    path = _main_path_ok(it)
-    if path is None or os.lstat(path).st_size < it["offset"]:
-        raise Stop("一覧のあとで会話のファイルが動いた。%s" % AGAIN)
     sid = it["session_id"]
+    path = find_session_path(sid)      # 控えにはパスを持たない。会話 ID から引き直す
+    if path is None or os.path.getsize(path) < it["offset"]:
+        raise Stop("一覧のあとで会話のファイルが動いた。%s" % AGAIN)
     main = pack_file(path, os.path.join(tmp, sid + ".jsonl.gz"), it["offset"], True)
     files = [dict(main, session_id=sid, rel=None)]
-    sdir = session_dir_of(path)
-    for i, (rel, size) in enumerate(it["subs"]):
-        p = _sub_path_ok(sdir, rel)
+    now_subs = {rel: p for rel, p, _ in subagent_files(path)}
+    for i, (rel, size) in enumerate(it["subs"]):      # 一覧の時点にあったものを、その時点の大きさまで
+        p = now_subs.get(rel)
         r = pack_file(p, os.path.join(tmp, "%s-%04d.gz" % (sid, i)), size, rel.endswith(".jsonl")) if p else None
         if r:
             files.append(dict(r, session_id=sid, rel=rel))
@@ -1061,18 +950,6 @@ class ApiError(Stop):
 _OPENER = None
 
 
-def _ssl_context():
-    """CA 証明書が読めない Python（python.org 版で証明書を入れていない等）は macOS のシステムの束を使う。"""
-    ctx = ssl.create_default_context()
-    try:
-        empty = ctx.cert_store_stats().get("x509_ca", 0) == 0
-    except Exception:
-        empty = True
-    if empty and os.path.exists("/etc/ssl/cert.pem"):
-        ctx.load_verify_locations(cafile="/etc/ssl/cert.pem")
-    return ctx
-
-
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """リダイレクトは追わない（引換券やファイルが別の場所に渡らないように）。"""
 
@@ -1081,7 +958,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def build_opener(use_proxy=True):
-    handlers = [_NoRedirect(), urllib.request.HTTPSHandler(context=_ssl_context())]
+    handlers = [_NoRedirect(), urllib.request.HTTPSHandler(context=ssl.create_default_context())]
     if not use_proxy:
         handlers.append(urllib.request.ProxyHandler({}))
     return urllib.request.build_opener(*handlers)
@@ -1182,8 +1059,10 @@ def record(data_dir, now, sent, excluded):
     write_json(state_path(data_dir), state)
 
 
-def result_say(sent, excluded, note, more):
+def result_say(sent, excluded, note, more, skip=False):
     ex = "%d 件外した" % excluded
+    if skip:
+        return ("感想を送った。" if note else "") + "会話は今日は送らない（次の /send-to-nobu でまた出る）"
     if sent:
         say = "%d 件送った" % sent + ("・" + ex if excluded else "")
     elif note:
@@ -1210,7 +1089,7 @@ def cmd_send(args, out, stdin):
     if not got:
         raise Stop("選択画面の答えがなかったので、何も送っていない。送るときは %s" % AGAIN)
     try:
-        exclude, note = decide(pending, got[0], got[1])
+        exclude, note, skip = decide(pending, got[0], got[1])
     except Stop:
         pending["used"] = used + [got[2]]       # 聞き直した答えは二度と読まない（新しい答えを待つ）
         write_json(pending_path(data_dir), pending)
@@ -1218,12 +1097,9 @@ def cmd_send(args, out, stdin):
     note = mask_text(note)[0][:NOTE_MAX]
     items = pending["items"]
     excluded = [it for it in items if it["n"] in exclude]
-    to_send = [it for it in items if it["n"] not in exclude]
+    to_send = [] if skip else [it for it in items if it["n"] not in exclude]   # 今日は送らない: 何も記録しない
     anote = stdin.read() if args.assistant_note == "-" else (args.assistant_note or "")
     anote = mask_text(anote.strip())[0][:ASSISTANT_NOTE_MAX]
-    folded = re.sub(r"\s+", "", anote)
-    if any(len(t) >= 4 and t in folded for t in (re.sub(r"\s+", "", it["title"]) for it in items)):
-        anote = ""      # AI のメモに一覧のタイトルが入っていたら送らない
     if to_send or note:
         api_base = (args.api_base or "").strip().rstrip("/")
         if api_base not in ALLOWED_API_BASES or not (args.code or "").strip():
@@ -1241,7 +1117,7 @@ def cmd_send(args, out, stdin):
             shutil.rmtree(tmp, ignore_errors=True)
     record(data_dir, now, to_send, excluded)
     remove_quietly(pending_path(data_dir))
-    emit(out, say=result_say(len(to_send), len(excluded), note, pending.get("more")), next=END,
+    emit(out, say=result_say(len(to_send), len(excluded), note, pending.get("more"), skip), next=END,
          sent=len(to_send), excluded=len(excluded))
     return 0
 
