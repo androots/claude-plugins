@@ -766,7 +766,7 @@ class AskAnswerTest(SendBase):
         qs = out["ask"]["questions"]
         self.assert_fits_ask(qs)
         self.assertEqual([q["header"] for q in qs], ["外す", "送る", "感想"])
-        self.assertEqual([o["label"] for o in qs[0]["options"]], ["1. 会話 00（第三者への発言）", "外さない"])
+        self.assertEqual([o["label"] for o in qs[0]["options"]], ["1. 会話 00（第三者への発言）", "なし（全部送る）"])
         self.assertEqual([o["label"] for o in qs[1]["options"]], ["3. 会話 02（確認できなかった）", "送らない"])
         self.assertEqual(out["display"]["items"][:2], ["1. 会話 00", "2. 会話 01"])
         # 一覧は最初の質問の頭に入れる（AI の本文に頼らず、選択画面で本人に必ず見せる）
@@ -799,7 +799,7 @@ class AskAnswerTest(SendBase):
         self.assertEqual(fin["note"], "わからないことがあった。コマンドの意味")
         self.assertEqual(fin["excluded_count"], 1)
 
-    def test_unanswered_questions_change_nothing(self):
+    def test_unanswered_exclude_question_leans_to_excluding_cautions(self):
         self.convs(3)
         self.check(caution=[1], ok=[2], unknown=[3])
         qs = self.w.ask()
@@ -807,8 +807,44 @@ class AskAnswerTest(SendBase):
         code, out, err = self.send_answered()
         self.assertEqual(code, 0, err)
         res = json.loads(out)
-        self.assertEqual((res["sent_count"], res["excluded_count"], res["deferred_unconfirmed"]), (2, 0, 1))
+        # 気をつけた方がいい 1 番は外す側に倒す。ほかは送る（未確認の 3 番は既定どおり送らない）
+        self.assertEqual((res["sent_count"], res["excluded_count"], res["deferred_unconfirmed"], res["unanswered_excluded"]),
+                         (1, 1, 1, 1))
         self.assertEqual(self.srv.finish_bodies[0]["note"], "")
+
+    def test_none_option_sends_everything_and_numbers_win_over_none(self):
+        self.convs(3)
+        self.check(caution=[1, 2], ok=[3])
+        qs = self.w.ask()
+        self.assertEqual([o["label"] for o in qs[0]["options"]],
+                         ["1. 会話 00（第三者への発言）", "2. 会話 01（第三者への発言）", "なし（全部送る）"])
+        self.w.answer(qs, {qs[0]["question"]: "なし（全部送る）"})
+        code, out, err = self.send_answered()
+        self.assertEqual(code, 0, err)
+        res = json.loads(out)
+        self.assertEqual((res["sent_count"], res["excluded_count"], res["unanswered_excluded"]), (3, 0, 0))
+
+    def test_numbers_win_when_none_is_also_selected(self):
+        self.convs(3)
+        self.check(caution=[1, 2], ok=[3])
+        qs = self.w.ask()
+        self.w.answer(qs, {qs[0]["question"]: "2. 会話 01（第三者への発言）, なし（全部送る）, 3"})
+        code, out, err = self.send_answered()
+        self.assertEqual(code, 0, err)
+        self.assertEqual((json.loads(out)["sent_count"], json.loads(out)["excluded_count"]), (1, 2))
+
+    def test_unanswered_last_question_also_covers_cautions_not_in_the_options(self):
+        self.convs(12)
+        self.check(caution=range(1, 11), ok=[11, 12])
+        qs = self.w.ask()
+        self.assertEqual([q["header"] for q in qs], ["外す 1/3", "外す 2/3", "外す 3/3", "感想"])
+        self.assertEqual([len(q["options"]) for q in qs[:3]], [4, 4, 4])     # 3 件 + 「なし（全部送る）」
+        # 1 つ目は「なし」、2 つ目は 1 件だけ、3 つ目（と入りきらなかった 10 番）は答えなかった
+        self.w.answer(qs, {qs[0]["question"]: "なし（全部送る）", qs[1]["question"]: qs[1]["options"][0]["label"]})
+        code, out, err = self.send_answered()
+        self.assertEqual(code, 0, err)
+        res = json.loads(out)
+        self.assertEqual((res["excluded_count"], res["unanswered_excluded"], res["sent_count"]), (5, 4, 7))
 
     def test_numbers_typed_in_the_input_field(self):
         self.convs(6)
@@ -824,7 +860,7 @@ class AskAnswerTest(SendBase):
         self.convs(3)
         self.check(ok=[1, 2, 3])
         qs = self.w.ask()
-        self.assertEqual([o["label"] for o in qs[0]["options"]], ["外さない", "今回は全部外す"])
+        self.assertEqual([o["label"] for o in qs[0]["options"]], ["なし（全部送る）", "今回は全部外す"])
         self.w.answer(qs, {qs[0]["question"]: "9"})
         code, out, err = self.send_answered()
         self.assertEqual(code, agentlog.EXIT_BAD_ANSWER, err)
@@ -839,7 +875,7 @@ class AskAnswerTest(SendBase):
         self.convs(2)
         self.check(ok=[1, 2])
         qs = self.w.ask()
-        self.w.answer(qs, {qs[0]["question"]: "外さない"})
+        self.w.answer(qs, {qs[0]["question"]: "なし（全部送る）"})
         code, out, err = self.send_answered(extra=["--exclude", "1"])
         self.assertEqual(code, agentlog.EXIT_USAGE)
         code, out, err = self.send_answered(stdin="AI が書いた感想")
@@ -853,7 +889,7 @@ class AskAnswerTest(SendBase):
         self.convs(2)
         self.check(ok=[1, 2])
         qs = self.w.ask()
-        self.w.answer(qs, {qs[0]["question"]: "外さない"})
+        self.w.answer(qs, {qs[0]["question"]: "なし（全部送る）"})
         self.w.reply("2 は外して")                                           # 送る前に止まって、返事で答え直した
         code, out, err = self.send_answered(extra=["--exclude", "2"])
         self.assertEqual(code, 0, err)
@@ -920,15 +956,16 @@ class AskAnswerTest(SendBase):
         qs = out["ask"]["questions"]
         self.assert_fits_ask(qs)
         self.assertEqual([q["header"] for q in qs], ["外す 1/2", "外す 2/2", "送る", "感想"])
-        shown_ex = [o["label"] for q in qs[:2] for o in q["options"]]
-        self.assertEqual(len(shown_ex), 8)
-        # 選択肢に無い 13 番は入力欄に書けば外せる
+        shown_ex = [o["label"] for q in qs[:2] for o in q["options"] if o["label"] != "なし（全部送る）"]
+        self.assertEqual(len(shown_ex), 6)
+        # 選択肢に無い 13 番は入力欄に書けば外せる。答えた質問では、選ばなかった会話は送る
         self.w.answer(qs, {qs[0]["question"]: shown_ex[0], qs[1]["question"]: "13",
                            qs[2]["question"]: qs[2]["options"][0]["label"] + ", 20"})
         code, out, err = self.send_answered()
         self.assertEqual(code, 0, err)
         res = json.loads(out)
-        self.assertEqual((res["excluded_count"], res["deferred_unconfirmed"], res["sent_count"]), (2, 7, 21))
+        self.assertEqual((res["excluded_count"], res["deferred_unconfirmed"], res["sent_count"], res["unanswered_excluded"]),
+                         (2, 7, 21, 0))
 
     def test_nothing_to_send_still_asks_for_the_note(self):
         self.w.list()

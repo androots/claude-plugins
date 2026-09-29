@@ -109,7 +109,8 @@ Bash で実行する:
 7. 終了コードで分ける:
    - 0 → 出力の JSON から 1 行で「`sent_count` 件送った・`excluded_count` 件外した」（0 件で感想だけなら「感想を送った」）。
      `deferred_unconfirmed` が 1 以上なら「確認できなかった `deferred_unconfirmed` 件は今回は送っていない（次の /send-to-nobu でもう一度確かめる）」、
-     `too_long_count` が 1 以上なら「確認しきれない長さの `too_long_count` 件は今回は送っていない」と添える。それで終わり
+     `too_long_count` が 1 以上なら「確認しきれない長さの `too_long_count` 件は今回は送っていない」、
+     `unanswered_excluded` が 1 以上なら「未回答だったので、気をつけた方がいい `unanswered_excluded` 件は外した」と添える。それで終わり
    - 3（同じ履歴を共有している）→ 出力の `ask.questions` をそのまま AskUserQuestion で聞き、答えのあと 6 の send をもう一度（同じ `<code>`）
    - 7（答えが読めない。一覧に無い番号など）→ エラーの 1 行を伝え、5 と同じ `ask.questions` で聞き直し、答えのあと send をもう一度（1 回だけ）
    - 4（引換券が使えない・使用済み）→ 6 の start_submission からもう一度だけ

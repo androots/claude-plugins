@@ -2081,18 +2081,18 @@ DEFAULT_OFF_REASONS = {"too_long": "確認しきれない長さ", "too_much": "�
 CONFIRM_SEND, CONFIRM_EXCLUDE = "それでも送る", "送る方の会話も外す"
 NOTE_QUESTION = "昨日の感想・わからなかったこと・質問は？（自由に書くなら入力欄に）"
 NOTE_OPTIONS = ["なし", "順調に使えている"]
-EXCLUDE_NONE, EXCLUDE_ALL = "外さない", "今回は全部外す"
+EXCLUDE_NONE, EXCLUDE_ALL = "なし（全部送る）", "今回は全部外す"
 INCLUDE_NONE = "送らない"
 
 
-def _balanced_chunks(xs, k):
-    """xs を k 個以下のかたまりに、なるべく同じ大きさで分ける（1 つ ASK_OPTIONS 個まで）。"""
+def _balanced_chunks(xs, k, per):
+    """xs を k 個以下のかたまりに、なるべく同じ大きさで分ける（1 つ per 個まで）。(かたまり, 入りきらなかった分)。"""
     if not xs:
-        return []
-    k = max(1, min(k, (len(xs) + ASK_OPTIONS - 1) // ASK_OPTIONS))
-    xs = xs[:k * ASK_OPTIONS]            # 入りきらない会話は、入力欄に番号を書いてもらう
+        return [], []
+    k = max(1, min(k, (len(xs) + per - 1) // per))
+    xs, rest = xs[:k * per], xs[k * per:]    # 入りきらない会話は、入力欄に番号を書いてもらう
     size = (len(xs) + k - 1) // k
-    return [xs[i:i + size] for i in range(0, len(xs), size)][:k]
+    return [xs[i:i + size] for i in range(0, len(xs), size)][:k], rest
 
 
 def _option_label(n, title, reasons):
@@ -2105,6 +2105,8 @@ def build_ask(items, convs, overview=()):
 
     外す会話（既定で送る会話のうち、気をつけた方がいい会話）・送る会話（既定では送らない会話）・感想。
     質問は 4 つまで、選択肢は 2〜4 個。入りきらない会話の番号は入力欄（Type something）に書いてもらう。
+    外す質問には「なし（全部送る）」を必ず入れる。外す質問に答えなかったら、その質問の会話（入りきらなかった分は
+    最後の外す質問が受け持つ）を外す側に倒す（unanswered）。
     overview（一覧）は最初の質問の頭に入れる（選択画面にそのまま出る）。
     """
     by_n = {it["n"]: it for it in items}
@@ -2126,7 +2128,8 @@ def build_ask(items, convs, overview=()):
         elif reasons:
             ex.append((n, _option_label(n, it.get("title"), reasons[:2])))
     # 質問の数を配る: 外す（気をつける会話）を優先。送る会話があれば 1 つは残す
-    need_ex, need_in = (len(ex) + ASK_OPTIONS - 1) // ASK_OPTIONS, (len(inc) + ASK_OPTIONS - 1) // ASK_OPTIONS
+    per_ex = ASK_OPTIONS - 1                     # 外す質問は「なし（全部送る）」で 1 つ使う
+    need_ex, need_in = (len(ex) + per_ex - 1) // per_ex, (len(inc) + ASK_OPTIONS - 1) // ASK_OPTIONS
     q_in = min(need_in, ASK_CONVERSATION_QUESTIONS - max(1, min(need_ex, ASK_CONVERSATION_QUESTIONS - (1 if inc else 0))))
     q_ex = ASK_CONVERSATION_QUESTIONS - q_in
     questions, qmap = [], []
@@ -2142,11 +2145,12 @@ def build_ask(items, convs, overview=()):
     if not by_n:
         pass
     elif ex:
-        chunks = _balanced_chunks(ex, q_ex)
+        chunks, rest = _balanced_chunks(ex, q_ex, per_ex)
         for i, chunk in enumerate(chunks, 1):
             part = " %d/%d" % (i, len(chunks)) if len(chunks) > 1 else ""
             add("exclude", "外す" + part, "外す会話は？（気をつけた方がいい会話%s。ほかに外す番号は入力欄に）" % part,
-                chunk, EXCLUDE_NONE if len(chunk) < 2 else None)
+                chunk, EXCLUDE_NONE)
+            qmap[-1]["unanswered"] = [n for n, _ in chunk] + ([n for n, _ in rest] if i == len(chunks) else [])
     else:
         add("exclude", "外す", "外す会話は？（外すなら番号を入力欄に）",
             [], None, multi=False)
@@ -2154,7 +2158,7 @@ def build_ask(items, convs, overview=()):
         questions[-1]["options"] = [{"label": EXCLUDE_NONE, "description": ""},
                                     {"label": EXCLUDE_ALL, "description": "今回はどの会話も送らない"}]
     if inc:
-        chunks = _balanced_chunks(inc, q_in)
+        chunks, _rest = _balanced_chunks(inc, q_in, ASK_OPTIONS)
         for i, chunk in enumerate(chunks, 1):
             part = " %d/%d" % (i, len(chunks)) if len(chunks) > 1 else ""
             add("include", "送る" + part, "送る会話は？（既定では送らない会話%s。選んだものだけ送る。ほかの番号は入力欄に）" % part,
@@ -2180,15 +2184,21 @@ def _annotation_text(annotations, question):
 
 
 def parse_answers(ask, answers, annotations, numbers):
-    """選択画面の答え → (外す番号, 送る番号, 感想)。一覧に無い番号は EXIT_BAD_ANSWER。"""
-    exclude, include, notes = set(), set(), []
+    """選択画面の答え → (外す番号, 送る番号, 感想, 答えなかったので外した番号)。一覧に無い番号は EXIT_BAD_ANSWER。
+
+    答えなかった外す質問の、気をつけた方がいい会話は外す（安全側）。答えなかった送る質問・感想は何もしない。
+    「なし（全部送る）」とほかの番号を同時に選んだら、番号の方を採る。
+    """
+    exclude, include, notes, unanswered = set(), set(), [], set()
     for q in ask["map"]:
         a = answers.get(q["question"])
         extra = _annotation_text(annotations, q["question"])
         if not isinstance(a, str):
             a = ""
         if not a and not extra:
-            continue                                      # 答えなかった質問（外す・送るなら「なし」）
+            if q["kind"] == "exclude":
+                unanswered.update(int(n) for n in q.get("unanswered") or [])
+            continue
         labels = q["labels"]
         if q["kind"] == "note":
             text = a.strip()
@@ -2215,7 +2225,8 @@ def parse_answers(ask, answers, annotations, numbers):
         if all_:
             chosen.update(numbers)
         (exclude if q["kind"] == "exclude" else include).update(chosen)
-    return exclude, include - exclude, "\n".join(notes)
+    exclude |= unanswered
+    return exclude, include - exclude, "\n".join(notes), unanswered
 
 
 def find_ask_answer(path, offset, questions):
@@ -2731,7 +2742,7 @@ def _cmd_send(args, out, stdin):
         # 選択画面（AskUserQuestion）の答えを、会話ログから直接読む。AI には番号も感想も渡させない
         if args.exclude is not None or args.include is not None:
             raise Fail("選択画面の答えがある。外す・送る番号は答えから読むので --exclude・--include は渡さない", EXIT_USAGE)
-        explicit, included, user_note = parse_answers(ask, answer[0], answer[1], set(items))
+        explicit, included, user_note, unanswered = parse_answers(ask, answer[0], answer[1], set(items))
     else:
         # 逃げ道: 一覧のあとの本人の返事（/send-to-nobu <返事>）を AI が読み取って渡す
         if args.exclude is None:
@@ -2743,7 +2754,7 @@ def _cmd_send(args, out, stdin):
         if explicit & included:
             raise Fail("同じ番号が --exclude と --include の両方にある: %s"
                        % ",".join(map(str, sorted(explicit & included))), EXIT_USAGE)
-        user_note = None
+        user_note, unanswered = None, set()
 
     def decide(explicit):
         # 確認係が確認できなかった会話は、送ると選ばれない限り今回は送らない。本人の判断ではないので「外した」とは
@@ -2828,6 +2839,7 @@ def _cmd_send(args, out, stdin):
         clear_reviews(data_dir)
         result = {"submission_id": None, "sent_count": 0, "excluded_count": len(excluded_items),
                   "deferred_unconfirmed": len(deferred - too_long), "too_long_count": len(too_long),
+                  "unanswered_excluded": len(unanswered),
                   "subagent_count": 0, "bytes": 0, "redactions": 0, "omitted": 0}
         if assistant_note:
             result["assistant_note_sent"] = False  # 送るものも感想もない日はサーバーに何も送らない
@@ -2892,6 +2904,7 @@ def _cmd_send(args, out, stdin):
         "excluded_count": len(excluded_items),
         "deferred_unconfirmed": len(deferred - too_long),
         "too_long_count": len(too_long),
+        "unanswered_excluded": len(unanswered),
         "subagent_count": sum(len(p["sent"]["subagents"]) for p in packed),
         "bytes": sum(f["bytes"] for f in files),
         "redactions": sum(p["sent"]["redactions"] for p in packed),
