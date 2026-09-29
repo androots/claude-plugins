@@ -23,6 +23,8 @@ import argparse
 import collections
 import concurrent.futures
 import datetime
+import errno
+import fcntl
 import gzip
 import hashlib
 import http.client
@@ -226,6 +228,61 @@ def resolve_data_dir(arg):
     if os.path.dirname(os.path.realpath(path)) != os.path.realpath(plugins_data_root()):
         raise Fail("--data-dir がプラグインのデータディレクトリの中ではない", EXIT_USAGE)
     return path
+
+
+LOCK_WAIT = 90                  # ほかの処理（別の会話の送信など）が終わるのを待つ上限の秒数
+
+
+class DataLock(object):
+    """データディレクトリの読み書き（控え・状態）を直列にするロック（fcntl.flock）。
+
+    同じプロセスの中で入れ子にしてもよい（外側のロックだけが本物）。プロセスが落ちればロックも外れる。
+    blocking=False なら取れないときに待たず、acquired が False になる。
+    """
+    _depth = 0
+
+    def __init__(self, data_dir, blocking=True):
+        self.path = os.path.join(data_dir, "lock")
+        self.blocking = blocking
+        self.fd = None
+        self.acquired = False
+
+    def __enter__(self):
+        if DataLock._depth:
+            DataLock._depth += 1
+            self.acquired = True
+            return self
+        os.makedirs(os.path.dirname(self.path), mode=0o700, exist_ok=True)
+        fd = os.open(self.path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        t0 = time.time()
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as e:
+                if e.errno not in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+                    os.close(fd)
+                    raise
+                if not self.blocking:
+                    os.close(fd)
+                    return self
+                if time.time() - t0 > LOCK_WAIT:
+                    os.close(fd)
+                    raise Fail("ほかの send-to-nobu の処理（別の会話の送信など）が終わらない。少し待ってからもう一度")
+                time.sleep(0.2)
+        self.fd = fd
+        self.acquired = True
+        DataLock._depth = 1
+        return self
+
+    def __exit__(self, *exc):
+        if not self.acquired:
+            return False
+        DataLock._depth -= 1
+        if self.fd is not None:
+            os.close(self.fd)   # 閉じるとロックも外れる
+            self.fd = None
+        return False
 
 
 def session_id_from_env():
@@ -1067,10 +1124,12 @@ def cmd_nudge(args, out):
             return 0
         msg = "未送信の会話が %d 件 → 新しい会話で /send-to-nobu と打つと のぶろう に送れます" % n
         out.write(json.dumps({"systemMessage": msg}, ensure_ascii=False) + "\n")
-        fresh = read_json(state_path(data_dir), None)
-        if isinstance(fresh, dict):
-            fresh["nudged_day"] = today
-            write_json_atomic(state_path(data_dir), fresh)
+        with DataLock(data_dir, blocking=False) as lock:
+            if lock.acquired:   # 起動を待たせない。取れなければ印を付けない（次の起動でまた出るだけ）
+                fresh = read_json(state_path(data_dir), None)
+                if isinstance(fresh, dict):
+                    fresh["nudged_day"] = today
+                    write_json_atomic(state_path(data_dir), fresh)
     except Exception:
         pass  # 起動を邪魔しない
     return 0
@@ -1234,7 +1293,8 @@ REVIEW_PARTS_PER_CHECKER = 3    # 確認係 1 体が読むファイルの数（�
 CHECKER_CAP = 36                # 1 ラウンドの確認係の総数（約 36 万字）。1 会話でこれを超える会話は確認係にかけない
 CHECKER_CONCURRENCY = 12        # 同時に動かす確認係の数（Claude Code の同時実行の上限 20 に余裕を持たせる）
 CHECK_WAIT = 12                 # checked --wait が 1 回に待つ秒数（AI がターンを終えずに答えを待つため）
-CHECK_TIMEOUT = 300             # 一覧を出してからこの秒数たっても答えが無い確認係は「確認できなかった」にする
+CHECK_TIMEOUT = 300             # 投げてからこの秒数たっても答えが無い確認係は「確認できなかった」にする
+ROUND_TIMEOUT = 900             # 一覧を出してからこの秒数で、答えの無い確認係（まだ投げていない分も）をすべて打ち切る
 TICKET_LEN = 12                 # 確認係の札の長さ（16 進）
 REVIEW_KEEP = 86400             # 残った確認用ファイルを消すまでの時間
 
@@ -1598,6 +1658,11 @@ def build_round(items, shown, unchecked, layers, review_dir):
 
 
 def cmd_list(args, out):
+    with DataLock(resolve_data_dir(args.data_dir)):
+        return _cmd_list(args, out)
+
+
+def _cmd_list(args, out):
     data_dir = resolve_data_dir(args.data_dir)
     sid = session_id_from_env()
     cur_path = require_send_session(sid)
@@ -1679,7 +1744,8 @@ def cmd_list(args, out):
                "tickets": {c["ticket"]: c["id"] for c in checkers},
                "checker_list": [{"id": c["id"], "ticket": c["ticket"], "n": c["n"], "parts": c["parts"],
                                  "prompt": c["prompt"]} for c in checkers],
-               "launched": [c["id"] for c in checkers[:CHECKER_CONCURRENCY]], "checker_results": {}}
+               "launched": [c["id"] for c in checkers[:CHECKER_CONCURRENCY]],
+               "launched_at": {str(c["id"]): now for c in checkers[:CHECKER_CONCURRENCY]}, "checker_results": {}}
     write_json_atomic(pending_path(data_dir), pending)
     out.write(json.dumps(result, ensure_ascii=False) + "\n")
     return 0
@@ -1770,26 +1836,54 @@ def cmd_checked(args, out):
 
     会話の結果は、その会話の確認係全員の結果で決める: 1 体でも caution → caution、1 体でも unknown・失敗・
     未着 → 確認できなかった（unconfirmed。今回は送らない）、全員 ok → ok。missing が空になるまで一覧は出さない。
+    --wait は答えを渡さずに少し待ってから今の状況を返す（待つのはロックの外。控えは待ったあとに読み直す）。
     """
     data_dir = resolve_data_dir(args.data_dir)
     sid = session_id_from_env()
     require_send_session(sid)
-    now = _now()
-    pending = load_pending(data_dir, sid, now)
-    tickets = pending.get("tickets") or {}
-    results = dict(pending.get("checker_results") or {})
-    all_ids = [str(c["id"]) for c in pending.get("checker_list") or []]
-    deadline = float(pending.get("created_ts") or now) + CHECK_TIMEOUT
     if args.wait:
-        # 答えを持たずに呼ばれた: 少し待ってから今の状況を返す（そのあいだに届いた答えは、AI が次の checked で渡す）
         incoming = []
-        if not pending.get("timed_out") and any(c not in results for c in all_ids):
-            _sleep(max(0.0, min(CHECK_WAIT, deadline - now)))
-            now = _now()
+        with DataLock(data_dir):
+            pause = _wait_seconds(load_pending(data_dir, sid, _now()), _now())
+        if pause > 0:
+            _sleep(pause)
     else:
         incoming = _read_checker_results(args.stdin)
-    if pending.get("timed_out"):
-        incoming = []  # 打ち切ったあと（一覧はもう出た）に届いた答えでは、結果を変えない
+    with DataLock(data_dir):
+        now = _now()
+        pending = load_pending(data_dir, sid, now)
+        result = _apply_checked(pending, incoming, now)
+        write_json_atomic(pending_path(data_dir), pending)
+    out.write(json.dumps(result, ensure_ascii=False) + "\n")
+    return 0
+
+
+def _deadlines(pending, results):
+    """答えの無い確認係ごとの打ち切り時刻（投げてから CHECK_TIMEOUT。まだ投げていない分は無し）と、ラウンドの打ち切り時刻。"""
+    created = float(pending.get("created_ts") or 0)
+    launched_at = pending.get("launched_at") or {}
+    per = {}
+    for c in pending.get("launched") or []:
+        if str(c) not in results:
+            per[str(c)] = float(launched_at.get(str(c), created)) + CHECK_TIMEOUT
+    return per, created + ROUND_TIMEOUT
+
+
+def _wait_seconds(pending, now):
+    """--wait が眠る秒数。答えがそろっている・打ち切り済みなら 0。次の打ち切り時刻は越えない。"""
+    results = pending.get("checker_results") or {}
+    if pending.get("closed") or all(str(c["id"]) in results for c in pending.get("checker_list") or []):
+        return 0.0
+    per, round_end = _deadlines(pending, results)
+    return max(0.0, min([CHECK_WAIT, round_end - now] + [t - now for t in per.values()]))
+
+
+def _apply_checked(pending, incoming, now):
+    """答えを控えに足し、打ち切り・次の波・会話ごとの結果を決める。pending を書き換え、出力を返す。"""
+    tickets = pending.get("tickets") or {}
+    results = dict(pending.get("checker_results") or {})
+    if pending.get("closed"):
+        incoming = []  # 答えがそろって一覧を出したあとに届いた答えでは、結果を変えない
     bad = [r.get("ticket") for r in incoming if not isinstance(r.get("ticket"), str) or r["ticket"] not in tickets]
     if bad:
         # 前のラウンドの札・偽の札・札の無い答えは、今のラウンドの答えとして受け付けない（入力ごと止める）
@@ -1806,16 +1900,19 @@ def cmd_checked(args, out):
                     reasons.append(code)
         reasons = reasons[:6]
         old = results.get(cid)
-        if old is None or _SEVERITY[verdict] > _SEVERITY[old["verdict"]]:
+        if old is None or old.get("timed_out") or _SEVERITY[verdict] > _SEVERITY[old["verdict"]]:
+            # 時間切れで unknown にした確認係も、一覧を出す前に届いた本物の答えで置き換える
             results[cid] = {"verdict": verdict, "reasons": reasons if verdict == "caution" else []}
         elif _SEVERITY[verdict] == _SEVERITY[old["verdict"]] == _SEVERITY["caution"]:
             old["reasons"] = (old["reasons"] + [x for x in reasons if x not in old["reasons"]])[:6]
-    # 打ち切り: 一覧を出してから CHECK_TIMEOUT たっても答えの無い確認係（まだ投げていない分も）は unknown にする
-    if not pending.get("timed_out") and now >= deadline and any(c not in results for c in all_ids):
-        for c in all_ids:
-            if c not in results:
-                results[c] = {"verdict": "unknown", "reasons": [], "timed_out": True}
-        pending["timed_out"] = True
+
+    # 打ち切り: 投げてから CHECK_TIMEOUT たった確認係、ラウンドが ROUND_TIMEOUT たったら残り全部を unknown にする
+    per, round_end = _deadlines(pending, results)
+    expired = [c for c, t in per.items() if now >= t]
+    if now >= round_end:
+        expired = [str(c["id"]) for c in pending.get("checker_list") or [] if str(c["id"]) not in results]
+    for c in expired:
+        results[c] = {"verdict": "unknown", "reasons": [], "timed_out": True}
     pending["checker_results"] = results
 
     # 次の波: 同時に動いている確認係（投げたが答えが無い）が CHECKER_CONCURRENCY 体になるまで、まだ投げていない分を出す
@@ -1824,6 +1921,10 @@ def cmd_checked(args, out):
     queue = [c for c in pending.get("checker_list") or [] if c["id"] not in launched and str(c["id"]) not in results]
     to_launch = queue[:max(0, CHECKER_CONCURRENCY - len(in_flight))]
     pending["launched"] = launched + [c["id"] for c in to_launch]
+    launched_at = dict(pending.get("launched_at") or {})
+    for c in to_launch:
+        launched_at[str(c["id"])] = now
+    pending["launched_at"] = launched_at
 
     missing, convs, summary = [], [], {"ok": 0, "caution": 0, "unconfirmed": 0}
     for it in pending["items"]:
@@ -1854,14 +1955,14 @@ def cmd_checked(args, out):
         it["checked"] = entry["result"] if entry["result"] in ("ok", "caution") else None
         summary[entry["result"]] += 1
         convs.append(entry)
-    write_json_atomic(pending_path(data_dir), pending)
+    if not missing:
+        pending["closed"] = True   # 一覧を出す。このあとの答えでは結果を変えない
     result = {"missing": sorted(missing),
               "launch": [{"ticket": c["ticket"], "prompt": c["prompt"]} for c in to_launch],
               "summary": summary, "conversations": convs, "display": display_summary(convs)}
-    if pending.get("timed_out"):
+    if any(r.get("timed_out") for r in results.values()):
         result["timed_out"] = True
-    out.write(json.dumps(result, ensure_ascii=False) + "\n")
-    return 0
+    return result
 
 
 def display_summary(convs):
@@ -2391,6 +2492,12 @@ def sweep_old_packs(data_dir, now):
 
 
 def cmd_send(args, out, stdin):
+    # 送信はまるごと直列に（同じ一覧を 2 回送らない・状態の書き込みを取り合わない）
+    with DataLock(resolve_data_dir(args.data_dir)):
+        return _cmd_send(args, out, stdin)
+
+
+def _cmd_send(args, out, stdin):
     data_dir = resolve_data_dir(args.data_dir)
     sid = session_id_from_env()
     cur_path = require_send_session(sid)

@@ -2,6 +2,7 @@
 """send: 偽サーバー（標準ライブラリの HTTP サーバー）で /v1/uploads・PUT・/v1/finish を往復する。"""
 
 import base64
+import fcntl
 import glob
 import gzip
 import io
@@ -657,17 +658,93 @@ class WaitAndTimeoutTest(SendBase):
         self.assertEqual([c["result"] for c in json.loads(out)["conversations"]],
                          ["caution", "unconfirmed", "unconfirmed"])
 
-    def test_timeout_also_covers_checkers_never_launched(self):
+    def many(self):
         L = Lines(base=time.time() - 3600)
         for i in range(100):
             L.user("指示 %02d " % i + "あ" * 900).assistant("返事 %02d " % i + "い" * 900)
         self.w.write(L)
         with mock.patch.object(agentlog, "REVIEW_PART_CHARS", 3000):
             res = self.w.list()
-        created = self.w.pending()["created_ts"]
         self.assertGreater(res["checkers_total"], agentlog.CHECKER_CONCURRENCY)
-        out = self.wait(now=created + agentlog.CHECK_TIMEOUT)
+        return res, self.w.pending()["created_ts"]
+
+    def test_timeout_counts_from_each_launch_and_the_round_has_a_cap(self):
+        res, created = self.many()
+        total, first = res["checkers_total"], [c["ticket"] for c in res["launch"]]
+        T = agentlog.CHECK_TIMEOUT
+        # 最初の波は投げてから 5 分で打ち切り。空いた枠に次の波が出る（まとめて打ち切らない）
+        out = self.wait(now=created + T)
+        second = [c["ticket"] for c in out["launch"]]
+        self.assertEqual(len(second), min(agentlog.CHECKER_CONCURRENCY, total - len(first)))
+        self.assertEqual(len(out["missing"]), total - len(first))
+        self.assertTrue(out["timed_out"])
+        # 最初の波の答えが遅れて届いた: 一覧を出す前なら、時間切れの unknown を本物の答えで置き換える
+        code, o, err = self.w.run("checked", stdin="%s ok" % first[0], now=created + T + 10)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.w.pending()["checker_results"]["1"], {"verdict": "ok", "reasons": []})
+        # 次の波はまだ 5 分たっていない
+        self.slept.clear()
+        out = self.wait(now=created + T + 60)
+        self.assertEqual(self.slept, [agentlog.CHECK_WAIT])
+        self.assertEqual(len(out["missing"]), total - len(first))
+        # ラウンド全体は一覧から 15 分で、まだ投げていない分も含めて打ち切る
+        out = self.wait(now=created + agentlog.ROUND_TIMEOUT)
         self.assertEqual((out["missing"], out["launch"], out["conversations"][0]["why"]), ([], [], "unknown"))
+
+    def test_wait_reads_the_pending_again_after_sleeping(self):
+        created = self.three()
+        t = self.w.tickets()
+
+        def another_checked_while_sleeping(seconds):
+            self.slept.append(seconds)
+            code, out, err = self.w.run("checked", stdin="%s caution client" % t[2], now=created + 15)
+            self.assertEqual(code, 0, err)
+        agentlog._sleep = another_checked_while_sleeping
+        out = self.wait(now=created + 10)
+        self.assertEqual(self.slept, [agentlog.CHECK_WAIT])
+        self.assertEqual(out["missing"], [1, 3])                           # 待っている間に渡された答えが消えない
+        self.assertEqual(self.w.pending()["checker_results"]["2"]["verdict"], "caution")
+
+
+class LockTest(SendBase):
+    """控え・状態の読み書きは fcntl.flock で直列にする。"""
+
+    def hold(self):
+        os.makedirs(self.w.data, exist_ok=True)
+        fd = os.open(os.path.join(self.w.data, "lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        self.addCleanup(os.close, fd)
+
+    def test_commands_wait_for_the_lock_and_give_up(self):
+        now = time.time()
+        self.w.write(Lines(base=now - 600).user("会話").assistant())
+        self.w.list()
+        self.hold()
+        with mock.patch.object(agentlog, "LOCK_WAIT", 0.3):
+            for argv in (("checked",), ("list",)):
+                code, out, err = self.w.run(*argv)
+                self.assertEqual(code, 1, argv)
+                self.assertIn("ほかの send-to-nobu の処理", err)
+            code, out, err = self.send(check=False)
+            self.assertEqual(code, 1, err)
+        self.assertEqual(self.srv.upload_calls, 0)
+
+    def test_nudge_does_not_wait(self):
+        self.w.write(Lines().user("指示").assistant())
+        self.hold()
+        out = io.StringIO()
+        t0 = time.time()
+        self.assertEqual(agentlog.main(["nudge", "--data-dir", self.w.data], stdout=out), 0)
+        self.assertLess(time.time() - t0, 2)
+        self.assertIn("未送信の会話が 1 件", out.getvalue())
+        self.assertNotIn("nudged_day", self.w.state())                     # 取れなければ印を付けない（次の起動でまた出る）
+
+    def test_nested_lock_in_one_process(self):
+        with agentlog.DataLock(self.w.data) as a:
+            with agentlog.DataLock(self.w.data) as b:
+                self.assertTrue(a.acquired and b.acquired)
+        with agentlog.DataLock(self.w.data, blocking=False) as c:        # 外れている
+            self.assertTrue(c.acquired)
 
 
 class TooLongTest(SendBase):
