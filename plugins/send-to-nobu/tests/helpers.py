@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-"""テスト用の合成フィクスチャと、契約どおりに振る舞う偽サーバー。
+"""テスト用の合成の会話ログと、契約どおりに振る舞う偽の受け口。
 
-本物の会話ログは使わない。行の形（キー名・type・origin.kind など）だけを実データに合わせてある。
-テスト用の差し替え（会話ログの場所・いまの時刻・送り先）は CLI ではなくモジュールの変数で行う。
+本物の会話ログは読まない。設定ディレクトリは毎回の一時ディレクトリで、そうなっていなければ止まる。
+行の形（キー名・type・origin.kind・toolUseResult など）だけを実データに合わせてある。
 """
 
 import datetime
@@ -12,7 +12,6 @@ import http.server
 import io
 import json
 import os
-import re
 import shutil
 import sys
 import tempfile
@@ -25,16 +24,21 @@ sys.path.insert(0, os.path.join(os.path.dirname(HERE), "scripts"))
 
 import agentlog  # noqa: E402
 
-HOME = os.path.expanduser("~")
-CWD = os.path.join(HOME, "work", "billing")
+REAL_CONFIG = os.path.realpath(os.path.join(os.path.expanduser("~"), ".claude"))
+TMP_ROOT = os.path.realpath(tempfile.gettempdir())
+CWD = os.path.join(os.path.expanduser("~"), "work", "billing")
 SEND_CMD = "<command-message>send-to-nobu</command-message>\n<command-name>/send-to-nobu</command-name>"
 SEND_CMD_NS = ("<command-message>send-to-nobu:send-to-nobu</command-message>\n"
                "<command-name>/send-to-nobu:send-to-nobu</command-name>")
 
+agentlog.ANSWER_WAIT = 0.0      # 答えの行を待たない（待つ動きは個別に試す）
 
-def send_cmd(args=""):
-    """/send-to-nobu の行（引数があれば <command-args> 付き）。"""
-    return SEND_CMD + ("\n<command-args>%s</command-args>" % args if args else "")
+
+def assert_sandboxed():
+    """読む会話ログが一時ディレクトリであること。違えば全体を止める。"""
+    p = os.path.realpath(agentlog.projects_dir())
+    if not p.startswith(TMP_ROOT + os.sep) or p.startswith(REAL_CONFIG):
+        raise SystemExit("テストの projects が一時ディレクトリではない: %s" % p)
 
 
 def iso(ts):
@@ -45,22 +49,14 @@ def new_uuid():
     return str(uuidlib.uuid4())
 
 
-def read_bytes(path):
-    with open(path, "rb") as f:
-        return f.read()
-
-
 class Lines(object):
     """会話 1 本ぶんの行を組み立てる。時刻は base から 1 分ずつ進む（明示もできる）。"""
 
     def __init__(self, sid=None, base=None, cwd=CWD, entrypoint="cli"):
         self.sid = sid or new_uuid()
         self.base = base if base is not None else time.time() - 3600
-        self.cwd = cwd
-        self.entrypoint = entrypoint
-        self.rows = []
-        self.parent = None
-        self.tick = 0
+        self.cwd, self.entrypoint = cwd, entrypoint
+        self.rows, self.parent, self.tick = [], None, 0
 
     def _ts(self, at):
         if at is None:
@@ -68,57 +64,35 @@ class Lines(object):
             at = self.base + self.tick * 60
         return iso(at)
 
-    def _msg(self, typ, content, at=None, uid=None, **extra):
-        uid = uid or new_uuid()
-        row = {"parentUuid": self.parent, "isSidechain": False, "type": typ,
-               "message": {"role": typ, "content": content}, "uuid": uid, "timestamp": self._ts(at),
-               "userType": "external", "entrypoint": self.entrypoint, "cwd": self.cwd, "sessionId": self.sid,
-               "version": "2.1.283", "gitBranch": "main"}
+    def msg(self, typ, content, at=None, **extra):
+        uid = new_uuid()
+        row = {"parentUuid": self.parent, "isSidechain": False, "type": typ, "message": {"role": typ, "content": content},
+               "uuid": uid, "timestamp": self._ts(at), "userType": "external", "entrypoint": self.entrypoint,
+               "cwd": self.cwd, "sessionId": self.sid, "version": "2.1.284", "gitBranch": "main"}
         row.update(extra)
         self.rows.append(row)
         self.parent = uid
         return self
 
     def user(self, text, **kw):
-        return self._msg("user", text, **kw)
-
-    def user_blocks(self, blocks, **kw):
-        return self._msg("user", blocks, **kw)
+        return self.msg("user", text, **kw)
 
     def assistant(self, text="了解", **kw):
-        return self._msg("assistant", [{"type": "text", "text": text}], **kw)
+        return self.msg("assistant", [{"type": "text", "text": text}], **kw)
 
-    def bash(self, command, **kw):
-        """assistant が Bash ツールを呼んだ行。"""
-        return self._msg("assistant", [{"type": "tool_use", "id": "toolu_" + new_uuid()[:8], "name": "Bash",
-                                        "input": {"command": command}}], **kw)
-
-    def tool_result(self, text="ok", **kw):
-        return self._msg("user", [{"type": "tool_result", "tool_use_id": "toolu_1", "content": text}],
-                         toolUseResult={"stdout": text}, **kw)
+    def tool(self, name, inp, result="ok", tur=None):
+        """assistant の tool_use と、その結果の user 行。"""
+        tid = "toolu_" + new_uuid().replace("-", "")[:20]
+        self.msg("assistant", [{"type": "tool_use", "id": tid, "name": name, "input": inp}])
+        return self.msg("user", [{"type": "tool_result", "tool_use_id": tid, "content": result}],
+                        toolUseResult=tur if tur is not None else {"stdout": result})
 
     def meta(self, typ, **fields):
-        row = {"type": typ, "sessionId": self.sid}
-        row.update(fields)
-        self.rows.append(row)
-        return self
-
-    def system(self, subtype, **fields):
-        row = {"parentUuid": self.parent, "isSidechain": False, "type": "system", "subtype": subtype,
-               "uuid": new_uuid(), "timestamp": self._ts(None), "cwd": self.cwd, "sessionId": self.sid}
-        row.update(fields)
-        self.rows.append(row)
+        self.rows.append(dict({"type": typ, "sessionId": self.sid}, **fields))
         return self
 
     def raw(self, data):
-        self.rows.append(data)  # bytes をそのまま 1 行として書く
-        return self
-
-    def copy_from(self, other, count=None):
-        """分岐コピー: 相手の行を uuid・timestamp ごとそのまま先頭に写す。"""
-        for row in other.rows[:count]:
-            if isinstance(row, dict):
-                self.rows.append(dict(row, sessionId=self.sid))
+        self.rows.append(data)
         return self
 
     def encode(self):
@@ -132,7 +106,7 @@ class Lines(object):
 
 
 class World(object):
-    """一時ディレクトリに projects/ とデータディレクトリを作り、CLI を中で呼ぶ。
+    """一時の設定ディレクトリ（projects/ とプラグインのデータ）を作り、CLI をこのプロセスの中で呼ぶ。
 
     いまの会話（self.current）は「最初の指示が /send-to-nobu」の会話として projects/ に置く。
     """
@@ -140,184 +114,117 @@ class World(object):
     SEND_PROJECT = "-Users-alice"
 
     def __init__(self):
-        self.tmp = tempfile.mkdtemp(prefix="stn-test-")
+        self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="stn-test-"))
         self.projects = os.path.join(self.tmp, "projects")
-        self.data = os.path.join(self.tmp, "plugins", "data", "send-to-nobu-data")   # 設定ディレクトリの形に合わせる
+        self.data = os.path.join(self.tmp, "plugins", "data", "send-to-nobu-androots")
         os.makedirs(self.projects)
-        self.saved_projects = (agentlog.CONFIG_DIR, agentlog.PROJECTS_DIR)
+        self.saved = (agentlog.CONFIG_DIR, os.environ.get("CLAUDE_CONFIG_DIR"))
         agentlog.CONFIG_DIR = self.tmp
-        agentlog.PROJECTS_DIR = self.projects
+        os.environ["CLAUDE_CONFIG_DIR"] = self.tmp
+        assert_sandboxed()
         self.current = self.start_send_session()
 
     def close(self):
-        agentlog.CONFIG_DIR, agentlog.PROJECTS_DIR = self.saved_projects
+        agentlog.CONFIG_DIR = self.saved[0]
+        if self.saved[1] is None:
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        else:
+            os.environ["CLAUDE_CONFIG_DIR"] = self.saved[1]
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def project_dir(self, name="-Users-alice-work-billing"):
-        d = os.path.join(self.projects, name)
-        os.makedirs(d, exist_ok=True)
-        return d
-
     def write(self, lines, project="-Users-alice-work-billing", mtime=None):
-        path = os.path.join(self.project_dir(project), lines.sid + ".jsonl")
+        d = os.path.join(self.projects, project)
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, lines.sid + ".jsonl")
         with open(path, "wb") as f:
             f.write(lines.encode())
         if mtime is not None:
             os.utime(path, (mtime, mtime))
         return path
 
-    def append(self, path, lines_or_bytes, mtime=None):
-        data = lines_or_bytes if isinstance(lines_or_bytes, bytes) else lines_or_bytes.encode()
+    def append(self, path, lines_or_bytes):
         with open(path, "ab") as f:
-            f.write(data)
-        if mtime is not None:
-            os.utime(path, (mtime, mtime))
+            f.write(lines_or_bytes if isinstance(lines_or_bytes, bytes) else lines_or_bytes.encode())
 
     def subagent(self, main_path, rel, lines_or_bytes):
         p = os.path.join(main_path[:-len(".jsonl")], "subagents", *rel.split("/"))
         os.makedirs(os.path.dirname(p), exist_ok=True)
-        data = lines_or_bytes if isinstance(lines_or_bytes, bytes) else lines_or_bytes.encode()
         with open(p, "wb") as f:
-            f.write(data)
+            f.write(lines_or_bytes if isinstance(lines_or_bytes, bytes) else lines_or_bytes.encode())
         return p
 
     def start_send_session(self):
         """新しい会話で /send-to-nobu を打った状態を作る。会話 ID を返す。"""
-        L = Lines(base=time.time() - 120).user(send_cmd()).user("スキル本文", isMeta=True).assistant("確認する")
+        L = Lines(base=time.time() - 120).user(SEND_CMD).user("スキル本文", isMeta=True).assistant("送る準備")
         self.write(L, project=self.SEND_PROJECT)
         return L.sid
 
-    def session_file(self, sid=None):
-        return os.path.join(self.projects, self.SEND_PROJECT, (sid or self.current) + ".jsonl")
+    def session_file(self):
+        return os.path.join(self.projects, self.SEND_PROJECT, self.current + ".jsonl")
 
-    def reply(self, text="なし", sid=None, plain=False):
-        """本人の返事を、いまの会話に足す（既定は /send-to-nobu <返事> の形）。"""
-        path = self.session_file(sid)
-        if os.path.exists(path):
-            self.append(path, Lines(sid=sid or self.current).user(text if plain else send_cmd(text)))
-
-    def answer(self, questions, answers, sid=None, annotations=None, answers_in_input=False, error=False, afk=None):
-        """本人が選択画面（AskUserQuestion）に答えた 2 行（AI の tool_use と、答えの tool_result）を、いまの会話に足す。
-
-        形は Claude Code 2.1.284 の対話で実際に残った行に合わせる（toolUseResult に questions・answers・annotations）。
-        """
-        sid = sid or self.current
-        L = Lines(sid=sid)
+    def answer(self, answers, questions=None, annotations=None, afk=None, answers_in_input=False, error=False):
+        """本人が選択画面（AskUserQuestion）に答えた 2 行を、いまの会話に足す。
+        形は Claude Code 2.1.284 の対話で残った行に合わせる（toolUseResult に questions・answers・annotations）。"""
+        questions = questions if questions is not None else self.pending()["questions"]
+        L = Lines(sid=self.current)
         tid = "toolu_" + new_uuid().replace("-", "")[:20]
-        inp = {"questions": questions}
-        if answers_in_input:
-            inp["answers"] = answers
-        L._msg("assistant", [{"type": "tool_use", "id": tid, "name": "AskUserQuestion", "input": inp,
-                              "caller": {"type": "direct"}}])
-        src = L.parent
+        inp = dict({"questions": questions}, **({"answers": answers} if answers_in_input else {}))
+        L.msg("assistant", [{"type": "tool_use", "id": tid, "name": "AskUserQuestion", "input": inp}])
         result = {"type": "tool_result", "tool_use_id": tid,
-                  "content": "The user answered: %s" % ", ".join('"%s"="%s"' % kv for kv in answers.items())}
-        extra = {"sourceToolAssistantUUID": src}
+                  "content": "User has answered your questions: " + ", ".join('"%s"="%s"' % kv for kv in answers.items())}
+        extra = {"sourceToolAssistantUUID": L.parent}
         if error:
             result["is_error"] = True
         else:
             extra["toolUseResult"] = {"questions": questions, "answers": answers, "annotations": annotations or {}}
             if afk is not None:
-                extra["toolUseResult"]["afkTimeoutMs"] = afk   # 離席で自動的に閉じた（実データにある形）
-        L._msg("user", [result], **extra)
-        self.append(self.session_file(sid), L)
+                extra["toolUseResult"]["afkTimeoutMs"] = afk
+        L.msg("user", [result], **extra)
+        self.append(self.session_file(), L)
 
-    def ask(self):
-        return (self.pending().get("ask") or {}).get("questions")
+    def answer_simple(self, exclude=agentlog.NONE_LABEL, note=agentlog.NOTE_OPTIONS[0], **kw):
+        """1 問目（外す）と 2 問目（感想）に答える。None の質問は答えない。"""
+        p = self.pending()
+        answers = {}
+        if p["exclude_question"] and exclude is not None:
+            answers[p["exclude_question"]] = exclude
+        if note is not None:
+            answers[p["note_question"]] = note
+        self.answer(answers, **kw)
 
-    def run(self, *argv, stdin="", session=None, now=None, reply=True):
-        """CLI をこのプロセスの中で呼ぶ。会話 ID は env だけ、時刻は agentlog._now の差し替え。"""
+    def run(self, *argv, stdin="", session=None, now=None):
+        """CLI を呼ぶ。いまの会話 ID は env だけ、時刻は agentlog._now の差し替え。(終了コード, 出力の JSON)。"""
+        assert_sandboxed()
         argv = list(argv) + ["--data-dir", self.data]
-        sid = self.current if session is None else session
-        if argv[0] == "send" and reply and sid:
-            self.reply("返事", sid=sid)
-        saved_env = os.environ.get("CLAUDE_CODE_SESSION_ID")
-        saved_now = agentlog._now
-        if sid:
-            os.environ["CLAUDE_CODE_SESSION_ID"] = sid
-        else:
-            os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+        saved_env, saved_now = os.environ.get("CLAUDE_CODE_SESSION_ID"), agentlog._now
+        os.environ["CLAUDE_CODE_SESSION_ID"] = session or self.current
         if now is not None:
             agentlog._now = lambda: now
-        out, err = io.StringIO(), io.StringIO()
+        out = io.StringIO()
         try:
-            code = agentlog.main(argv, stdin=io.StringIO(stdin), stdout=out, stderr=err)
+            code = agentlog.main(argv, stdin=io.StringIO(stdin), stdout=out)
         finally:
             agentlog._now = saved_now
             if saved_env is None:
                 os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
             else:
                 os.environ["CLAUDE_CODE_SESSION_ID"] = saved_env
-        return code, out.getvalue(), err.getvalue()
+        text = out.getvalue().strip()
+        return code, (json.loads(text) if text else {})
 
     def list(self, **kw):
-        code, out, err = self.run("list", **kw)
+        code, res = self.run("list", **kw)
         if code != 0:
-            raise AssertionError("list failed: %s" % err)
-        return json.loads(out)
+            raise AssertionError("list failed: %s" % res)
+        return res
 
-    def review_files(self, n):
-        """いまの一覧の n 番の確認用ファイル（パート順）。"""
-        d = self.pending()["output"]["review_dir"]
-        names = [x for x in os.listdir(d) if re.match(r"^%02d-\d+\.txt$" % n, x)]
-        return [os.path.join(d, x) for x in sorted(names, key=lambda x: int(x.split("-")[1].split(".")[0]))]
+    def titles(self):
+        """いまの一覧の番号 → タイトル。"""
+        return {it["n"]: it["title"] for it in self.pending()["items"]}
 
-    def review_blocks(self, n):
-        """いまの一覧の n 番の確認用ファイルを読み、[(話し手, 本文)] にする。"""
-        lines = []
-        for path in self.review_files(n):
-            with open(path, encoding="utf-8") as f:
-                lines += [l for l in f.read().split("\n")
-                          if not l.startswith("# ") and not re.match(r"^（\d+/\d+ ここまで）$", l)]
-        blocks = []
-        for line in lines:
-            m = re.match(r"^【(本人|AI|サブエージェントへの指示|サブエージェント)】$", line)
-            if m:
-                blocks.append([m.group(1), []])
-            elif blocks:
-                blocks[-1][1].append(line)
-        return [(who, "\n".join(body).strip()) for who, body in blocks]
-
-    def human(self, n):
-        """n 番の会話で、確認係に「本人の指示」として渡る本文。"""
-        return [t for who, t in self.review_blocks(n) if who == "本人"]
-
-    def checker_results(self, ok="all", caution=None, unknown=None):
-        """番号の指定から、確認係ごとの答えの並びを作る（書かなかった会話の確認係は未着のまま）。"""
-        p = self.pending()
-        ids = {it["n"]: it.get("checkers") or [] for it in p["items"]}
-        ticket = {c["id"]: c["ticket"] for c in p["checker_list"]}
-
-        def nums(spec):
-            if spec == "all":
-                return sorted(ids)
-            if not spec or spec == "none":
-                return []
-            return sorted(agentlog.parse_numbers(spec, ids, "test"))
-        out = []
-        for verdict, spec in (("ok", ok), ("caution", caution), ("unknown", unknown)):
-            for n in nums(spec):
-                for k, c in enumerate(ids[n]):
-                    v = verdict if (verdict != "caution" or k == 0) else "ok"
-                    out.append({"ticket": ticket[c], "verdict": v, "reasons": ["テストの理由"] if v == "caution" else []})
-        return out
-
-    def check(self, ok="all", caution=None, unknown=None, session=None, results=None):
-        """確認係の結果を控えに渡す（既定は全部 ok）。checked の出力を返す。"""
-        if results is None:
-            results = self.checker_results(ok, caution, unknown)
-        code, out, err = self.run("checked", stdin=json.dumps(results, ensure_ascii=False), session=session)
-        if code != 0:
-            raise AssertionError("checked failed: %s" % err)
-        return json.loads(out)
-
-    def tickets(self):
-        """いまの一覧の確認係の番号 → 札。"""
-        return {c["id"]: c["ticket"] for c in self.pending()["checker_list"]}
-
-    def checkers(self):
-        """いまの一覧の確認係すべて（控え）。"""
-        return self.pending()["checker_list"]
+    def listed(self):
+        """いまの一覧に出た会話 ID（番号順）。"""
+        return [it["session_id"] for it in self.pending()["items"]]
 
     def state(self):
         return agentlog.read_json(os.path.join(self.data, "state.json"), None)
@@ -325,8 +232,12 @@ class World(object):
     def pending(self):
         return agentlog.read_json(os.path.join(self.data, "pending.json"), None)
 
+    def next_day(self):
+        """翌朝、新しい会話で /send-to-nobu を打つ。"""
+        self.current = self.start_send_session()
 
-# ---------------------------------------------------------------- 偽サーバー
+
+# ---------------------------------------------------------------- 偽の受け口
 
 
 class FakeInbox(object):
@@ -335,20 +246,12 @@ class FakeInbox(object):
     CODE = "abcdefghijklmnopqrstuvwxyz"
 
     def __init__(self):
-        self.objects = {}          # object -> {"body", "sha256"}
-        self.issued = {}           # token -> {"object", "headers"}
-        self.upload_batches = []   # 1 回の /v1/uploads で来た件数
-        self.upload_calls = 0
-        self.uploads_status = None  # 例: (400, "invalid_argument")
-        self.uploads_redirect = False
-        self.put_url_base = None   # 署名 URL の先頭を差し替える（許可されていない先を返す試験）
-        self.put_attempts = {}     # object -> 回数
-        self.put_delay = 0.0
-        self.fail_put = {}         # object に含まれる文字列 -> 先頭何回 503 にするか
-        self.forbid_put = set()    # ここに含まれる文字列を持つ object は 403
-        self.finish_bodies = []
-        self.finish_lose_first = False
+        self.objects, self.issued, self.finish_bodies = {}, {}, []
+        self.upload_batches = []
         self.finished = False
+        self.finish_lose_first = False     # 送信票は置けたが返事が届かなかった（502）
+        self.put_url_base = None
+        self.redirect_uploads = False
         self.redirect_hits = 0
         self.lock = threading.Lock()
         inbox = self
@@ -357,42 +260,35 @@ class FakeInbox(object):
             def log_message(self, *a):
                 pass
 
-            def _json(self, status, obj):
+            def _json(self, status, obj, headers=()):
                 data = json.dumps(obj).encode()
                 self.send_response(status)
+                for k, v in headers:
+                    self.send_header(k, v)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
 
-            def _err(self, status, code, details=None):
-                body = {"error": {"code": code, "message": "テスト用のエラー"}}
-                if details:
-                    body["error"]["details"] = details
-                self._json(status, body)
+            def _err(self, status, code, headers=()):
+                self._json(status, {"error": {"code": code, "message": "テスト用のエラー"}}, headers)
 
             def _body(self):
-                n = int(self.headers.get("Content-Length") or 0)
-                return self.rfile.read(n)
+                return self.rfile.read(int(self.headers.get("Content-Length") or 0))
 
             def do_POST(self):
                 body = self._body()
-                if self.path.startswith("/elsewhere"):
+                if self.path == "/elsewhere":
                     inbox.redirect_hits += 1
                     return self._json(200, {"uploads": []})
                 if self.headers.get("Authorization") != "Bearer " + inbox.CODE:
                     return self._err(401, "unauthorized")
                 req = json.loads(body.decode())
                 if self.path == "/v1/uploads":
-                    inbox.upload_calls += 1
-                    if inbox.uploads_redirect:
-                        self.send_response(307)
-                        self.send_header("Location", "http://127.0.0.1:%d/elsewhere" % inbox.port)
-                        self.send_header("Content-Length", "0")
-                        self.end_headers()
-                        return
-                    if inbox.uploads_status:
-                        return self._err(*inbox.uploads_status)
+                    if inbox.redirect_uploads:
+                        return self._err(307, "moved", [("Location", "http://127.0.0.1:%d/elsewhere" % inbox.port)])
+                    if inbox.finished:
+                        return self._err(401, "unauthorized")
                     return self._uploads(req)
                 if self.path == "/v1/finish":
                     return self._finish(req)
@@ -406,7 +302,7 @@ class FakeInbox(object):
                 out = []
                 for f in files:
                     obj = "raw/androots/alice/claude-code/%s" % f["session_id"]
-                    obj += (".jsonl.gz" if f["rel"] is None else "/subagents/%s.gz" % f["rel"])
+                    obj += ".jsonl.gz" if f["rel"] is None else "/subagents/%s.gz" % f["rel"]
                     token = hashlib.sha256(obj.encode()).hexdigest()[:16]
                     headers = {"Content-Type": "application/gzip", "x-goog-meta-sha256": f["sha256"],
                                "x-goog-content-length-range": "%d,%d" % (f["bytes"], f["bytes"])}
@@ -420,29 +316,17 @@ class FakeInbox(object):
             def do_PUT(self):
                 token = self.path.split("/put/", 1)[-1].split("?", 1)[0]
                 body = self._body()
-                if inbox.put_delay:
-                    time.sleep(inbox.put_delay)
                 with inbox.lock:
                     issued = inbox.issued.get(token)
                 if not issued:
                     return self._err(404, "not_found")
-                obj = issued["object"]
-                with inbox.lock:
-                    inbox.put_attempts[obj] = inbox.put_attempts.get(obj, 0) + 1
-                    attempt = inbox.put_attempts[obj]
-                if any(k in obj for k in inbox.forbid_put):
-                    return self._err(403, "forbidden")
-                for k, n in inbox.fail_put.items():
-                    if k in obj and attempt <= n:
-                        return self._err(503, "unavailable")
-                # 署名対象ヘッダーがそのまま付いているか
-                for k, v in issued["headers"].items():
+                for k, v in issued["headers"].items():   # 署名に含めたヘッダーがそのまま付いているか
                     if self.headers.get(k) != v:
                         return self._err(403, "signature_mismatch")
                 if hashlib.sha256(body).hexdigest() != issued["headers"]["x-goog-meta-sha256"]:
                     return self._err(400, "sha_mismatch")
                 with inbox.lock:
-                    inbox.objects[obj] = {"body": body, "sha256": issued["headers"]["x-goog-meta-sha256"]}
+                    inbox.objects[issued["object"]] = body
                 self.send_response(200)
                 self.send_header("Content-Length", "0")
                 self.end_headers()
@@ -450,58 +334,54 @@ class FakeInbox(object):
             def _finish(self, req):
                 if inbox.finished:
                     return self._err(409, "already_finished")
-                if not {"sent", "excluded_count", "note", "plugin_version"} <= set(req) \
-                        or set(req) - {"sent", "excluded_count", "note", "plugin_version", "assistant_note"}:
+                keys = {"sent", "excluded_count", "note", "plugin_version"}
+                if not keys <= set(req) or set(req) - keys - {"assistant_note"}:
+                    return self._err(400, "invalid_argument")    # 契約に無いキーは 400
+                if not req["sent"] and not req["note"]:
                     return self._err(400, "invalid_argument")
-                sent = req.get("sent") or []
-                if not sent and not req.get("note"):
-                    return self._err(400, "invalid_argument")
-                bad = []
-                for s in sent:
+                for s in req["sent"]:
                     base = "raw/androots/alice/claude-code/%s" % s["session_id"]
                     checks = [(base + ".jsonl.gz", s["bytes"], s["sha256"])]
                     checks += [(base + "/subagents/%s.gz" % a["rel"], a["bytes"], a["sha256"]) for a in s["subagents"]]
                     for obj, size, sha in checks:
                         got = inbox.objects.get(obj)
-                        if not got or len(got["body"]) != size or got["sha256"] != sha:
-                            bad.append(obj)
-                if bad:
-                    return self._err(422, "size_mismatch", bad)
+                        if got is None or len(got) != size or hashlib.sha256(got).hexdigest() != sha:
+                            return self._err(422, "size_mismatch")
                 inbox.finish_bodies.append(req)
                 inbox.finished = True
                 if inbox.finish_lose_first and len(inbox.finish_bodies) == 1:
-                    return self._err(502, "bad_gateway")  # 置けたが返事が届かなかった
-                self._json(200, {"submission_id": "20260928T090312Z-1a2b3c4d",
-                                 "object": "submissions/androots/alice/20260928T090312Z-1a2b3c4d.json",
-                                 "sent_count": len(sent),
-                                 "subagent_count": sum(len(s["subagents"]) for s in sent)})
+                    return self._err(502, "bad_gateway")
+                self._json(200, {"submission_id": "20260929T090312Z-1a2b3c4d", "object": "submissions/x.json",
+                                 "sent_count": len(req["sent"]), "subagent_count": 0})
 
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.port = self.server.server_address[1]
         self.base = "http://127.0.0.1:%d" % self.port
-        self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.05},
-                                       daemon=True)
-        self.thread.start()
+        threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
 
     def close(self):
         self.server.shutdown()
         self.server.server_close()
 
-    def object_lines(self, obj):
-        return gzip.decompress(self.objects[obj]["body"])
+    def body(self, sid, rel=None):
+        """受け口に届いた会話の中身（gzip を解いたバイト列）。無ければ None。"""
+        obj = "raw/androots/alice/claude-code/%s" % sid + (".jsonl.gz" if rel is None else "/subagents/%s.gz" % rel)
+        got = self.objects.get(obj)
+        return gzip.decompress(got) if got is not None else None
+
+    def sent_ids(self):
+        return sorted({o.split("/")[4].split(".")[0] for o in self.objects})
 
 
 class Patched(object):
-    """偽サーバー向けに agentlog の送り先・待ち時間・通信を差し替える（テストコードからだけ）。"""
+    """偽の受け口に向けて送り先・待ち時間・通信を差し替える（テストコードからだけ）。"""
 
     def __init__(self, inbox):
-        self.saved = (agentlog.ALLOWED_API_BASES, agentlog.ALLOWED_PUT_PREFIXES, agentlog.BACKOFF_BASE,
-                      agentlog._OPENER)
+        self.saved = (agentlog.ALLOWED_API_BASES, agentlog.ALLOWED_PUT_PREFIXES, agentlog.BACKOFF_BASE, agentlog._OPENER)
         agentlog.ALLOWED_API_BASES = (inbox.base,)
         agentlog.ALLOWED_PUT_PREFIXES = (inbox.base + "/put/",)
         agentlog.BACKOFF_BASE = 0.001
-        agentlog._OPENER = agentlog.build_opener(use_proxy=False)  # OS のプロキシ設定を使わない
+        agentlog._OPENER = agentlog.build_opener(use_proxy=False)
 
     def restore(self):
-        (agentlog.ALLOWED_API_BASES, agentlog.ALLOWED_PUT_PREFIXES, agentlog.BACKOFF_BASE,
-         agentlog._OPENER) = self.saved
+        agentlog.ALLOWED_API_BASES, agentlog.ALLOWED_PUT_PREFIXES, agentlog.BACKOFF_BASE, agentlog._OPENER = self.saved

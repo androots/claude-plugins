@@ -1,7 +1,7 @@
 {
   "name": "send-to-nobu",
-  "version": "0.4.0",
-  "description": "Claude Code の会話ログを のぶろう に送る。毎朝 /send-to-nobu で一覧を見て、外すものと感想を答えるだけ",
+  "version": "0.5.0",
+  "description": "Claude Code の会話ログを のぶろう に送る。毎朝 /send-to-nobu で一覧を見て、送らない会話と感想を答えるだけ",
   "author": {
     "name": "androots"
   },
