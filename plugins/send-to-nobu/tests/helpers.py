@@ -257,7 +257,7 @@ class World(object):
         """番号の指定から、確認係ごとの答えの並びを作る（書かなかった会話の確認係は未着のまま）。"""
         p = self.pending()
         ids = {it["n"]: it.get("checkers") or [] for it in p["items"]}
-        ticket = {c["id"]: c["ticket"] for c in p["output"]["checkers"]}
+        ticket = {c["id"]: c["ticket"] for c in p["checker_list"]}
 
         def nums(spec):
             if spec == "all":
@@ -284,7 +284,11 @@ class World(object):
 
     def tickets(self):
         """いまの一覧の確認係の番号 → 札。"""
-        return {c["id"]: c["ticket"] for c in self.pending()["output"]["checkers"]}
+        return {c["id"]: c["ticket"] for c in self.pending()["checker_list"]}
+
+    def checkers(self):
+        """いまの一覧の確認係すべて（控え）。"""
+        return self.pending()["checker_list"]
 
     def state(self):
         return agentlog.read_json(os.path.join(self.data, "state.json"), None)

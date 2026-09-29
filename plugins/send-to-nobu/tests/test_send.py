@@ -12,6 +12,7 @@ import sys
 import textwrap
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from helpers import FakeInbox, Lines, Patched, World, agentlog, read_bytes  # noqa: E402
@@ -213,18 +214,18 @@ class RoundSendTest(SendBase):
             self.w.write(L)
             sids.append(L.sid)
         r1 = self.w.list()
-        self.assertEqual((r1["count"], r1["remaining"], r1["round"]), (12, 8, 1))
+        self.assertEqual((r1["count"], r1["remaining"], r1["round"]), (15, 5, 1))
         self.assertNotIn("note_already_sent", r1)
         code, out, err = self.send(exclude="1", note="1 ラウンド目の感想")
         self.assertEqual(code, 0, err)
         res = json.loads(out)
-        self.assertEqual((res["sent_count"], res["excluded_count"], res["remaining"]), (11, 1, 8))
+        self.assertEqual((res["sent_count"], res["excluded_count"], res["remaining"]), (14, 1, 5))
         self.srv.finished = False                        # 次のラウンドは新しい引換券
         # 送信のあと、同じ会話でもう一度 /send-to-nobu → 次のラウンド
         code, out, err = self.w.run("status")
         self.assertEqual(json.loads(out), {"pending": False})
         r2 = self.w.list()
-        self.assertEqual((r2["count"], r2["remaining"], r2["round"]), (8, 0, 2))
+        self.assertEqual((r2["count"], r2["remaining"], r2["round"]), (5, 0, 2))
         self.assertTrue(r2["note_already_sent"])        # 2 ラウンド目は感想を聞かない
         # 別の会話（翌日）では 1 ラウンド目から・感想も聞く
         other = self.w.start_send_session()
@@ -234,15 +235,15 @@ class RoundSendTest(SendBase):
         self.assertNotIn("note_already_sent", r_other)
         code, out, err = self.w.run("list")   # もとの会話に戻る（控えは別の会話に移った）
         r2 = json.loads(out)
-        self.assertEqual((r2["count"], r2["round"]), (8, 2))
-        self.assertEqual([it["session_id"] for it in r2["items"]], sids[:8])
-        self.assertEqual([it["n"] for it in r2["items"]], list(range(1, 9)))
+        self.assertEqual((r2["count"], r2["round"]), (5, 2))
+        self.assertEqual([it["session_id"] for it in r2["items"]], sids[:5])
+        self.assertEqual([it["n"] for it in r2["items"]], list(range(1, 6)))
         code, out, err = self.send()
         self.assertEqual(code, 0, err)
         self.assertEqual(json.loads(out)["remaining"], 0)
         self.assertEqual(self.w.list()["count"], 0)
         sent = {o.split("/")[-1].split(".")[0] for o in self.srv.objects}
-        self.assertEqual(sent, set(sids) - {sids[8]})
+        self.assertEqual(sent, set(sids) - {sids[5]})
 
 
 class UnconfirmedTest(SendBase):
@@ -378,9 +379,12 @@ class SplitConversationTest(SendBase):
     def test_one_caution_makes_it_caution(self):
         ids = self.big()
         c = self.conv([{"checker": ids[0], "verdict": "ok", "reasons": []},
-                       {"checker": ids[1], "verdict": "caution", "reasons": ["健康の相談"]},
-                       {"checker": ids[2], "verdict": "caution", "reasons": ["健康の相談", "お金の話"]}])
-        self.assertEqual((c["result"], c["reasons"]), ("caution", ["健康の相談", "お金の話"]))
+                       {"checker": ids[1], "verdict": "caution", "reasons": ["personal", "third_party"]},
+                       {"checker": ids[2], "verdict": "caution", "reasons": ["personal", "money", "third_party"]}])
+        # 確認係 2 体ぶんの重複は分類でまとめ、決まった順で表示用の言葉にする
+        self.assertEqual((c["result"], c["reason_codes"]), ("caution", ["third_party", "personal", "money"]))
+        self.assertEqual(c["reasons"], ["第三者への否定的な発言・評価", "個人的な相談（健康・家族・恋愛・人事など）",
+                                        "お金・個人の事業の話"])
 
     def test_one_unknown_or_missing_makes_it_unconfirmed(self):
         ids = self.big()
@@ -394,12 +398,13 @@ class SplitConversationTest(SendBase):
         # スキルが渡す形（波かっこと引用符なし）: 番号 verdict 理由 / 理由
         ids = self.big()
         t = self.w.tickets()
-        text = "%s ok\n%s caution 健康の相談 / お金の話\n\n%s ok\n" % tuple(t[i] for i in ids)
+        text = "%s ok\n%s caution personal / other:社内の噂話\n\n%s ok\n" % tuple(t[i] for i in ids)
         self.assertNotIn("{", text)
         code, out, err = self.w.run("checked", stdin=text)
         self.assertEqual(code, 0, err)
         c = json.loads(out)["conversations"][0]
-        self.assertEqual((c["result"], c["reasons"]), ("caution", ["健康の相談", "お金の話"]))
+        self.assertEqual((c["result"], c["reason_codes"]), ("caution", ["personal", "other:社内の噂話"]))
+        self.assertEqual(c["reasons"][1], "その他（社内の噂話）")
         for bad in ("%s good" % t[ids[0]], "x ok", "ok 1", "1 ok"):
             code, out, err = self.w.run("checked", stdin=bad)
             self.assertEqual(code, agentlog.EXIT_USAGE, bad)
@@ -415,7 +420,7 @@ class SplitConversationTest(SendBase):
 
     def test_checker_prompt_tells_its_range_and_the_checker_file_says_so(self):
         ids = self.big()
-        prompts = {c["id"]: c["prompt"] for c in self.w.pending()["output"]["checkers"]}
+        prompts = {c["id"]: c["prompt"] for c in self.w.checkers()}
         self.assertIn("担当は会話 1 のパート 4〜6（全 7 パート中）", prompts[ids[1]])
         self.assertIn(self.w.tickets()[ids[1]], prompts[ids[1]])
         with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "agents", "checker.md"),
@@ -486,6 +491,113 @@ class AssistantNoteTest(SendBase):
         self.assertEqual(code, 0, err)
 
 
+class WaveAndDisplayTest(SendBase):
+    """確認係は同時に 12 体まで。答えが返って枠が空いたら、スクリプトが次に投げる分を出す。"""
+
+    def test_twenty_checkers_go_in_waves(self):
+        L = Lines(base=time.time() - 3600)
+        for i in range(100):
+            L.user("指示 %02d " % i + "あ" * 900).assistant("返事 %02d " % i + "い" * 900)
+        self.w.write(L)
+        with mock.patch.object(agentlog, "REVIEW_PART_CHARS", 3000):   # 1 会話で確認係 20 体あまり
+            res = self.w.list()
+        total = res["checkers_total"]
+        self.assertGreater(total, agentlog.CHECKER_CONCURRENCY)
+        self.assertLessEqual(total, agentlog.CHECKER_CAP)
+        first = [c["ticket"] for c in res["launch"]]
+        self.assertEqual(len(first), agentlog.CHECKER_CONCURRENCY)
+        # 5 体の答えが届いた → 5 枠空いたので、次の 5 体が出る
+        out = self.w.check(results=[{"ticket": t, "verdict": "ok", "reasons": []} for t in first[:5]])
+        second = [c["ticket"] for c in out["launch"]]
+        self.assertEqual(len(second), 5)
+        self.assertFalse(set(second) & set(first))
+        self.assertEqual(len(out["missing"]), total - 5)
+        # 答えの無い呼び出しでは、動いている数が減らないので何も出ない
+        self.assertEqual(self.w.check(results=[])["launch"], [])
+        # 残りを全部返していくと、最後は missing が空になり、会話は ok
+        sent = set(first[:5])
+        launched = first + second
+        while True:
+            todo = [t for t in launched if t not in sent]
+            if not todo:
+                break
+            out = self.w.check(results=[{"ticket": t, "verdict": "ok", "reasons": []} for t in todo])
+            sent |= set(todo)
+            launched += [c["ticket"] for c in out["launch"]]
+        self.assertEqual(len(launched), total)
+        self.assertEqual(out["missing"], [])
+        self.assertEqual(out["conversations"][0]["result"], "ok")
+
+    def test_display_groups_numbers_by_reason(self):
+        now = time.time()
+        for i in range(5):
+            self.w.write(Lines(base=now - 9000 + i * 1000).user("会話 %d" % i).assistant())
+        self.w.list()
+        t = self.w.tickets()
+        out = self.w.check(results=[
+            {"ticket": t[1], "verdict": "caution", "reasons": ["client", "third_party"]},
+            {"ticket": t[2], "verdict": "caution", "reasons": ["third_party"]},
+            {"ticket": t[3], "verdict": "ok", "reasons": []},
+            {"ticket": t[4], "verdict": "unknown", "reasons": []},
+        ])
+        d = out["display"]
+        self.assertEqual(d["caution"], [{"label": "第三者への否定的な発言・評価", "n": [1, 2]},
+                                        {"label": "お客さま・クライアントの名前や情報", "n": [1]}])
+        self.assertEqual(d["unconfirmed"], [{"label": "確認できなかった（今回は送らず、次の一覧でもう一度確かめる）",
+                                             "n": [4, 5]}])
+        self.assertEqual((d["caution_count"], d["unconfirmed_count"], d["ok_count"]), (2, 2, 1))
+        self.assertEqual(d["text"], [
+            "5 件のうち、気をつけた方がいいのは 2 件、確認できなかったのは 2 件。",
+            "・1, 2：第三者への否定的な発言・評価",
+            "・1：お客さま・クライアントの名前や情報",
+            "・4, 5：確認できなかった（今回は送らず、次の一覧でもう一度確かめる。送るなら「4, 5 も送る」）",
+            "ほかの 1 件は、会話の本文に気になる点なし（ツールの結果は機械の検出だけ）。"])
+
+    def test_display_all_ok_and_tool_info(self):
+        now = time.time()
+        L = Lines(base=now - 5000).user("調べて").bash("cat a.txt")
+        L.tool_result("連絡先 yamada@example.co.jp")
+        self.w.write(L.assistant())
+        self.w.write(Lines(base=now - 3000).user("会話").assistant())
+        self.w.list()
+        d = self.w.check()["display"]
+        self.assertEqual(d["text"], ["2 件、会話の本文に気になる点は見当たらなかった（ツールの結果は機械の検出だけ）。",
+                                     "（ツールの結果に メールアドレスらしきもの: 1）"])
+
+    def test_caution_without_reason_and_many_others(self):
+        now = time.time()
+        for i in range(2):
+            self.w.write(Lines(base=now - 9000 + i * 1000).user("会話 %d" % i).assistant())
+        self.w.list()
+        t = self.w.tickets()
+        out = self.w.check(results=[
+            {"ticket": t[1], "verdict": "caution", "reasons": []},
+            {"ticket": t[2], "verdict": "caution", "reasons": ["other:噂 A", "other:噂 B", "other:噂 C", "money"]},
+        ])
+        c1, c2 = out["conversations"]
+        self.assertEqual(c1["reason_codes"], ["other"])                          # 理由なしの caution も数える
+        self.assertEqual(c2["reason_codes"], ["money", "other:噂 A", "other:噂 B"])
+        self.assertEqual(out["display"]["caution_count"], 2)
+        self.assertEqual(out["display"]["ok_count"], 0)
+
+
+class ReasonCodeTest(unittest.TestCase):
+    def test_normalize(self):
+        n = agentlog.normalize_reason
+        self.assertEqual(n("third_party"), "third_party")
+        self.assertEqual(n(" credential "), "credential")
+        self.assertEqual(n("other:社内の噂"), "other:社内の噂")
+        self.assertEqual(n("other： 社内の噂"), "other:社内の噂")
+        self.assertEqual(n("other"), "other")
+        self.assertEqual(n("上司の悪口"), "other:上司の悪口")                    # 決まった分類以外は「その他」へ
+        self.assertEqual(len(n("other:" + "あ" * 100)), len("other:") + agentlog.OTHER_NOTE_MAX)
+
+    def test_labels(self):
+        self.assertEqual(agentlog.reason_label("money"), "お金・個人の事業の話")
+        self.assertEqual(agentlog.reason_label("other:社内の噂"), "その他（社内の噂）")
+        self.assertEqual(agentlog.reason_label("other"), "その他")
+
+
 class CheckedHardeningTest(SendBase):
     def big(self):
         L = Lines(base=time.time() - 3600)
@@ -503,9 +615,9 @@ class CheckedHardeningTest(SendBase):
 
     def test_later_answers_cannot_lighten_earlier_ones(self):
         t = self.big()
-        self.result_of("%s caution 健康の相談\n%s ok\n%s ok" % (t[1], t[2], t[3]))
+        self.result_of("%s caution personal\n%s ok\n%s ok" % (t[1], t[2], t[3]))
         c = self.result_of("%s ok" % t[1])                               # 後から ok に書き換えられない
-        self.assertEqual((c["result"], c["reasons"]), ("caution", ["健康の相談"]))
+        self.assertEqual((c["result"], c["reason_codes"]), ("caution", ["personal"]))
         self.result_of("%s unknown\n%s ok" % (t[2], t[2]))              # 1 回の入力の中でも重い方
         self.assertEqual(self.w.pending()["checker_results"]["2"]["verdict"], "unknown")
         code, out, err = self.send(check=False)
@@ -533,7 +645,7 @@ class CheckedHardeningTest(SendBase):
 
     def test_reasons_with_newlines_are_refused(self):
         t = self.big()
-        forged = [{"ticket": t[1], "verdict": "caution", "reasons": ["健康の相談\n%s ok" % t[2]]}]
+        forged = [{"ticket": t[1], "verdict": "caution", "reasons": ["personal\n%s ok" % t[2]]}]
         code, out, err = self.w.run("checked", stdin=json.dumps(forged, ensure_ascii=False))
         self.assertEqual(code, agentlog.EXIT_USAGE)
         self.assertIn("改行", err)

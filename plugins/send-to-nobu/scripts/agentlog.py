@@ -62,7 +62,7 @@ ASSISTANT_NOTE_MAX = 1000       # サーバーは 5,000 まで受けるが、プ
 # 標準入力の感想（本人の言葉）のあとに AI の報告を続けるときの区切りの行（この 1 行ちょうど）
 ASSISTANT_NOTE_SEPARATOR = "@@SEND_TO_NOBU_ASSISTANT_NOTE@@"
 FACTS_VERSION = 5          # 一覧に出すかの判定を変えたら上げる（nudge のキャッシュを読み直させる）
-PENDING_VERSION = 6        # 一覧の控えの形を変えたら上げる
+PENDING_VERSION = 7        # 一覧の控えの形を変えたら上げる
 # 一覧の出力と控えに入れる目印。会話ファイルの生のバイト列にこれがある会話は（どう読んだにせよ
 # 一覧や控えの中身が残っているので）一覧から隠す
 LIST_MARKER = "send_to_nobu_list"
@@ -1183,7 +1183,7 @@ def share_groups(items):
 def select_round(items, need=lambda idx: 0):
     """1 ラウンドに入れる会話（添字の昇順）と、確認係にかけられない会話の集合。
 
-    need(idx) はその会話に要る確認係の数（1 会話だけで CHECKER_CAP を超える会話は 0 で、確認係にかけない）。
+    need(idx) はその会話に要る確認係の数（1 会話だけで CHECKER_CAP を超える極端に長い会話は 0 で、確認係にかけない）。
     同じ履歴のまとまりは分けない。新しいまとまりから「ROUND_SIZE 件まで」かつ「確認係 CHECKER_CAP 体まで」詰める
     （入らないまとまりは飛ばして、もっと古い小さなまとまりで埋める）。前回確認できなかった会話を含むまとまりは後ろに回す。
     一番新しいまとまりだけで上限を超えるなら、そのまとまりだけで 1 ラウンドにし、確認係は新しい会話から上限まで割り当てる。
@@ -1219,7 +1219,8 @@ def select_round(items, need=lambda idx: 0):
 REVIEW_PART_CHARS = 10000       # 確認係が 1 回の Read で読む量
 REVIEW_LINE_CHARS = 1000        # 1 行の長さ（Read は長い行を切るので折り返す）
 REVIEW_PARTS_PER_CHECKER = 3    # 確認係 1 体が読むファイルの数（大きい会話は確認係を分ける）
-CHECKER_CAP = 12                # 1 ラウンドの確認係の総数（同時に動かせる上限 20 に余裕を持たせる）
+CHECKER_CAP = 36                # 1 ラウンドの確認係の総数（約 36 万字）。1 会話でこれを超える会話は確認係にかけない
+CHECKER_CONCURRENCY = 12        # 同時に動かす確認係の数（Claude Code の同時実行の上限 20 に余裕を持たせる）
 TICKET_LEN = 12                 # 確認係の札の長さ（16 進）
 REVIEW_KEEP = 86400             # 残った確認用ファイルを消すまでの時間
 
@@ -1424,7 +1425,7 @@ def new_ticket():
 
 def checker_prompt(cid, ticket, n, a, b, total, paths):
     return ("あなたは確認係 %d。札は %s。担当は会話 %d のパート %d〜%d（全 %d パート中）。"
-            "担当のパートだけを全部読んで判定し、{\"ticket\": \"%s\", \"verdict\": …, \"reasons\": […]} の形で返す。\n%s"
+            "担当のパートだけを全部読んで判定し、{\"ticket\": \"%s\", \"verdict\": …, \"reasons\": [分類…]} の形で返す。\n%s"
             % (cid, ticket, n, a, b, total, ticket, "\n".join(paths)))
 
 
@@ -1519,19 +1520,22 @@ def render_round(items, shown, state, remaining, reviews, checkers, compact=Fals
         if cut:
             row["group_cut"] = True
         rev = reviews.get(idx) or {}
-        for key in ("checkers", "detect", "too_big", "review_error"):
+        for key in ("checkers", "detect", "too_big", "too_long", "review_error"):
             if rev.get(key):
                 row[key] = rev[key]
         rows.append(row)
         p = {k: v for k, v in it.items()
              if k not in ("prompt_count", "total_bytes", "last_ts", "shares_idx", "deferred_before")}
         p.update({"n": n, "shares": shares, "group_cut": cut, "checkers": rev.get("checkers") or [],
-                  "too_big": bool(rev.get("too_big")), "review_error": bool(rev.get("review_error")),
+                  "too_big": bool(rev.get("too_big")), "too_long": bool(rev.get("too_long")),
+                  "review_error": bool(rev.get("review_error")),
                   "detect": rev.get("detect") or {}})
         pend.append(p)
     result = {LIST_MARKER: 1}
     result.update(header or {})
-    result.update({"count": len(rows), "items": rows, "remaining": remaining, "checkers": checkers})
+    launch = [{"ticket": c["ticket"], "prompt": c["prompt"]} for c in checkers[:CHECKER_CONCURRENCY]]
+    result.update({"count": len(rows), "items": rows, "remaining": remaining,
+                   "checkers_total": len(checkers), "launch": launch})
     if not state["sessions"]:
         result["first_run"] = True
         result["since"] = local_short(state["baseline"])
@@ -1556,8 +1560,12 @@ def build_round(items, shown, unchecked, layers, review_dir):
             continue
         parts = lay["parts"]
         rev = {"detect": lay["detect"]}
-        if idx in unchecked or checkers_needed(parts) > CHECKER_CAP:
-            rev["too_big"] = True
+        if checkers_needed(parts) > CHECKER_CAP:
+            rev["too_long"] = True   # 極端に長い会話は確認係にかけない（最初から「確認しきれない長さ」）
+            reviews[idx] = rev
+            continue
+        if idx in unchecked:
+            rev["too_big"] = True    # 大きすぎる同じ履歴のまとまりで、このラウンドの確認係の上限に入らなかった
             reviews[idx] = rev
             continue
         names = write_parts(review_dir, k, parts)
@@ -1648,7 +1656,10 @@ def cmd_list(args, out):
                "session_size": file_size(cur_path), "items": pend_items, "output": result,
                "remaining": result["remaining"], "review_dir": review_dir,
                "checkers": {str(c["id"]): c["n"] for c in checkers},
-               "tickets": {c["ticket"]: c["id"] for c in checkers}, "checker_results": {}}
+               "tickets": {c["ticket"]: c["id"] for c in checkers},
+               "checker_list": [{"id": c["id"], "ticket": c["ticket"], "n": c["n"], "parts": c["parts"],
+                                 "prompt": c["prompt"]} for c in checkers],
+               "launched": [c["id"] for c in checkers[:CHECKER_CONCURRENCY]], "checker_results": {}}
     write_json_atomic(pending_path(data_dir), pending)
     out.write(json.dumps(result, ensure_ascii=False) + "\n")
     return 0
@@ -1657,11 +1668,46 @@ def cmd_list(args, out):
 _RESULT_LINE_RE = re.compile(r"^\s*([0-9a-f]{%d})\s+(ok|caution|unknown)\b\s*(.*?)\s*$" % TICKET_LEN)
 _SEVERITY = {"ok": 1, "unknown": 2, "caution": 3}   # 同じ確認係の答えは重い方を残す（後から軽くしない）
 
+# 確認係が返す理由の分類と、表示用の言葉（並びもこの順）
+REASON_LABELS = collections.OrderedDict([
+    ("third_party", "第三者への否定的な発言・評価"),
+    ("personal", "個人的な相談（健康・家族・恋愛・人事など）"),
+    ("money", "お金・個人の事業の話"),
+    ("client", "お客さま・クライアントの名前や情報"),
+    ("credential", "キー・トークン・アカウント ID"),
+    ("other", "その他"),
+])
+OTHER_NOTE_MAX = 30
+OTHER_PER_CONVERSATION = 2      # 1 会話に出す「その他（補足）」の数（確認係ごとの言い回し違いで並ばないように）
+
+
+def normalize_reason(x):
+    """確認係の理由 1 つを分類コードにする。決まったコード以外は other:<補足> にまとめる。"""
+    t = re.sub(r"\s+", " ", str(x)).strip()
+    if t in REASON_LABELS and t != "other":
+        return t
+    m = re.match(r"^other\s*[:：]?\s*(.*)$", t)
+    note = (m.group(1) if m else t).strip()[:OTHER_NOTE_MAX]
+    return "other:" + note if note else "other"
+
+
+def reason_label(code):
+    if code.startswith("other"):
+        note = code[len("other:"):] if code.startswith("other:") else ""
+        return "その他（%s）" % note if note else "その他"
+    return REASON_LABELS.get(code, code)
+
+
+def _reason_order(code):
+    base = code.split(":", 1)[0]
+    return (list(REASON_LABELS).index(base) if base in REASON_LABELS else len(REASON_LABELS), code)
+
 
 def _read_checker_results(stdin):
     """checked の標準入力: 確認係の答え。空なら []。
 
-    1 行に 1 体: `<札> <ok|caution|unknown> [理由 / 理由 …]`（波かっこと引用符を含まない形。Bash の安全チェックが
+    1 行に 1 体: `<札> <ok|caution|unknown> [分類 / 分類 …]`（分類は third_party・personal・money・client・
+    credential・other:補足。波かっこと引用符を含まない形。Bash の安全チェックが
     `{` と `"` の組み合わせを止めるため、スキルはこの形で渡す）。JSON（1 つ・並び・{"results": [...]}）も受け付ける。
     札（ticket）の無い答え・番号だけの答えは受け付けない。理由は 1 行に限る。
     """
@@ -1721,13 +1767,26 @@ def cmd_checked(args, out):
     for r in incoming:
         cid = str(tickets[r["ticket"]])
         verdict = r.get("verdict") if r.get("verdict") in _SEVERITY else "unknown"
-        reasons = [str(x)[:60] for x in (r.get("reasons") or []) if isinstance(x, (str, int, float))][:5]
+        reasons = []
+        for x in (r.get("reasons") or []):
+            if isinstance(x, (str, int, float)):
+                code = normalize_reason(x)
+                if code not in reasons:
+                    reasons.append(code)
+        reasons = reasons[:6]
         old = results.get(cid)
         if old is None or _SEVERITY[verdict] > _SEVERITY[old["verdict"]]:
             results[cid] = {"verdict": verdict, "reasons": reasons if verdict == "caution" else []}
         elif _SEVERITY[verdict] == _SEVERITY[old["verdict"]] == _SEVERITY["caution"]:
-            old["reasons"] = (old["reasons"] + [x for x in reasons if x not in old["reasons"]])[:5]
+            old["reasons"] = (old["reasons"] + [x for x in reasons if x not in old["reasons"]])[:6]
     pending["checker_results"] = results
+
+    # 次の波: 同時に動いている確認係（投げたが答えが無い）が CHECKER_CONCURRENCY 体になるまで、まだ投げていない分を出す
+    launched = [int(x) for x in pending.get("launched") or []]
+    in_flight = [c for c in launched if str(c) not in results]
+    queue = [c for c in pending.get("checker_list") or [] if c["id"] not in launched]
+    to_launch = queue[:max(0, CHECKER_CONCURRENCY - len(in_flight))]
+    pending["launched"] = launched + [c["id"] for c in to_launch]
 
     missing, convs, summary = [], [], {"ok": 0, "caution": 0, "unconfirmed": 0}
     for it in pending["items"]:
@@ -1736,7 +1795,9 @@ def cmd_checked(args, out):
         got = [results.get(str(c)) for c in ids]
         waiting = [c for c, g in zip(ids, got) if g is None]
         missing.extend(waiting)
-        if it.get("too_big"):
+        if it.get("too_long"):
+            entry.update({"result": "unconfirmed", "why": "too_long"})
+        elif it.get("too_big"):
             entry.update({"result": "unconfirmed", "why": "too_big"})
         elif it.get("review_error") or not ids:
             entry.update({"result": "unconfirmed", "why": "review_error"})
@@ -1745,12 +1806,10 @@ def cmd_checked(args, out):
         elif any(g["verdict"] == "unknown" for g in got):
             entry.update({"result": "unconfirmed", "why": "unknown"})
         elif any(g["verdict"] == "caution" for g in got):
-            reasons = []
-            for g in got:
-                for x in g["reasons"]:
-                    if x not in reasons:
-                        reasons.append(x)
-            entry.update({"result": "caution", "reasons": reasons})
+            codes = sorted({x for g in got for x in g["reasons"]}, key=_reason_order) or ["other"]
+            others = [x for x in codes if x.startswith("other")]
+            codes = [x for x in codes if not x.startswith("other")] + others[:OTHER_PER_CONVERSATION]
+            entry.update({"result": "caution", "reason_codes": codes, "reasons": [reason_label(x) for x in codes]})
         else:
             entry["result"] = "ok"
         if it.get("detect"):
@@ -1759,9 +1818,78 @@ def cmd_checked(args, out):
         summary[entry["result"]] += 1
         convs.append(entry)
     write_json_atomic(pending_path(data_dir), pending)
-    out.write(json.dumps({"missing": sorted(missing), "summary": summary, "conversations": convs},
+    out.write(json.dumps({"missing": sorted(missing),
+                          "launch": [{"ticket": c["ticket"], "prompt": c["prompt"]} for c in to_launch],
+                          "summary": summary, "conversations": convs, "display": display_summary(convs)},
                          ensure_ascii=False) + "\n")
     return 0
+
+
+def display_summary(convs):
+    """一覧の頭に出す「気をつけた方がいい会話」を、理由ごとに番号をまとめた形にする（AI が手でまとめ直さない）。"""
+    by_label, order = collections.OrderedDict(), []
+    unconfirmed = collections.OrderedDict([("確認しきれない長さ（今回は送らない）", []),
+                                           ("確認できなかった（今回は送らず、次の一覧でもう一度確かめる）", [])])
+    info = {"email": [], "phone": []}
+    caution_n = set()
+    for c in convs:
+        n = c["n"]
+        det = c.get("detect") or {}
+        if c["result"] == "unconfirmed":
+            key = ("確認しきれない長さ（今回は送らない）" if c.get("why") in ("too_long", "too_big")
+                   else "確認できなかった（今回は送らず、次の一覧でもう一度確かめる）")
+            unconfirmed[key].append(n)
+            continue
+        labels = [(x, reason_label(x)) for x in c.get("reason_codes") or []]
+        if det.get("card"):
+            labels.append(("~card", "ツールの結果にカード番号らしきもの"))
+        if det.get("secret"):
+            labels.append(("~secret", "ツールの結果にキー・トークン類（送るときは伏せる）"))
+        for code, label in labels:
+            if label not in by_label:
+                by_label[label] = []
+                order.append((_reason_order(code.lstrip("~")) if not code.startswith("~") else (99, code), label))
+            by_label[label].append(n)
+            caution_n.add(n)
+        for k in ("email", "phone"):
+            if det.get(k):
+                info[k].append(n)
+    caution = [{"label": label, "n": by_label[label]} for _, label in sorted(order)]
+    unconf = [{"label": k, "n": v} for k, v in unconfirmed.items() if v]
+    unconf_n = sorted({n for g in unconf for n in g["n"]})
+    tool_info = {k: v for k, v in info.items() if v}
+    ok_count = len(convs) - len(caution_n) - len(unconf_n)
+    return {"caution_count": len(caution_n), "caution": caution,
+            "unconfirmed_count": len(unconf_n), "unconfirmed": unconf,
+            "ok_count": ok_count, "tool_info": tool_info,
+            "text": _display_text(len(convs), len(caution_n), caution, len(unconf_n), unconf, ok_count, tool_info)}
+
+
+def _nums(ns):
+    return ", ".join(str(n) for n in ns)
+
+
+def _display_text(total, c_count, caution, u_count, unconf, ok_count, tool_info):
+    """一覧の頭の数行（AI はこのまま出す。並べ替え・言い換え・まとめ直しをしない）。"""
+    if not c_count and not u_count:
+        lines = ["%d 件、会話の本文に気になる点は見当たらなかった（ツールの結果は機械の検出だけ）。" % total]
+    else:
+        head = []
+        if c_count:
+            head.append("気をつけた方がいいのは %d 件" % c_count)
+        if u_count:
+            head.append("確認できなかったのは %d 件" % u_count)
+        lines = ["%d 件のうち、%s。" % (total, "、".join(head))]
+        lines += ["・%s：%s" % (_nums(g["n"]), g["label"]) for g in caution]
+        for g in unconf:
+            send = "送るなら「%s も送る」" % _nums(g["n"])
+            lines.append("・%s：%s" % (_nums(g["n"]), g["label"][:-1] + "。" + send + "）"))
+        if ok_count:
+            lines.append("ほかの %d 件は、会話の本文に気になる点なし（ツールの結果は機械の検出だけ）。" % ok_count)
+    names = {"email": "メールアドレスらしきもの", "phone": "電話番号らしきもの"}
+    if tool_info:
+        lines.append("（ツールの結果に %s）" % " ／ ".join("%s: %s" % (names[k], _nums(v)) for k, v in tool_info.items()))
+    return lines
 
 
 # ---------------------------------------------------------------- pack
@@ -2075,8 +2203,9 @@ def assistant_note_leak(text, pending, excluded_numbers):
         if contains(it.get("title")):
             return "一覧の会話のタイトル"
     for r in (pending.get("checker_results") or {}).values():
-        if any(contains(x) for x in r.get("reasons") or []):
-            return "確認係の理由"
+        for code in r.get("reasons") or []:
+            if contains(reason_label(code)) or (code.startswith("other:") and contains(code[len("other:"):])):
+                return "確認係の理由"
     for n in excluded_numbers:
         if re.search(r"(?<![0-9])%d\s*番|#%d(?![0-9])" % (n, n), text):
             return "外した会話の番号"

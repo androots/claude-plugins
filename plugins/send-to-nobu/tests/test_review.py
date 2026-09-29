@@ -99,7 +99,7 @@ class ReviewFileTest(unittest.TestCase):
         self.assertNotIn("転職", out)
         res = json.loads(out)
         self.assertEqual(res["items"][0]["checkers"], [1])
-        self.assertEqual(res["checkers"][0]["prompt"].split("\n")[1], os.path.join(res["review_dir"], "01-1.txt"))
+        self.assertEqual(res["launch"][0]["prompt"].split("\n")[1], os.path.join(res["review_dir"], "01-1.txt"))
 
 
     def test_parts_end_with_a_marker_and_are_small(self):
@@ -110,7 +110,7 @@ class ReviewFileTest(unittest.TestCase):
         res = self.w.list()
         files = self.w.review_files(1)
         self.assertGreater(len(files), 3)
-        self.assertTrue(all(c["parts"][1] - c["parts"][0] < 3 for c in res["checkers"]))
+        self.assertTrue(all(c["parts"][1] - c["parts"][0] < 3 for c in self.w.checkers()))
         for k, path in enumerate(files, 1):
             with open(path, encoding="utf-8") as f:
                 text = f.read()
