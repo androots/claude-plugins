@@ -4,6 +4,7 @@
 import base64
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -85,6 +86,42 @@ class OnlyWhatWasShown(Base):
         self.w.next_day()
         self.w.list()
         self.assertEqual(sorted(self.w.listed()), sorted([L.sid, late.sid]))
+
+    def test_sixty_fit_in_one_screen_with_shorter_titles(self):
+        # 60 件・長いタイトル・全部に目印でも、1 回の選択画面に 1 行 1 件で全部出る（タイトルを縮めて収める）
+        long = "とても長いタイトルの会話で、どれが何の話かを見分けるために書き足した説明をさらに足した %02d"
+        convs = []
+        for i in range(60):
+            L = Lines(base=time.time() - 9000 + i * 100).user("指示 %d" % i)
+            L.tool("Bash", {"command": "cat x"}, result="TEL 03-1234-5678 card 4242 4242 4242 4242")
+            convs.append(L.meta("custom-title", customTitle=long % i))
+            self.w.write(L)
+        self.w.list()
+        q = self.w.pending()["questions"][0]["question"]
+        self.assertEqual(self.w.listed(), [c.sid for c in convs])
+        self.assertLessEqual(agentlog.js_len(q), 2000)            # 選択画面は 2,000 字で切る
+        self.assertNotIn("ほかに", q)
+        self.assertTrue(q.endswith("送らない会話は？（外すなら入力欄に番号。例: 3, 5-7）"))
+        rows = [line for line in q.splitlines() if re.match(r"^\d+\. ", line)]
+        self.assertEqual(len(rows), 60)                         # 1 行 1 件
+        self.assertTrue(all("…（連絡先あり・カード番号あり）" in r for r in rows))
+        self.assertLess(len(rows[0]), len("1. ") + agentlog.TITLE_CHARS + len("（連絡先あり・カード番号あり）"))
+        self.assertEqual(self.w.pending()["items"][59]["title"], long % 59)   # 送るタイトルは縮めない
+        self.w.answer_simple(exclude="60")
+        code, res = self.send()
+        self.assertEqual((code, res["say"]), (0, "59 件送った・1 件外した"))
+
+    def test_every_listed_conversation_is_inside_the_visible_text(self):
+        # 絵文字（UTF-16 で 2 字）だけの長いタイトルでも、控えの会話はすべて 2,000 字の内側に出る
+        for i in range(60):
+            L = Lines(base=time.time() - 9000 + i * 100).user("x").assistant()
+            self.w.write(L.meta("custom-title", customTitle="😀" * 60 + " %d" % i))
+        self.w.list()
+        q = self.w.pending()["questions"][0]["question"]
+        self.assertLessEqual(agentlog.js_len(q), 2000)
+        for it in self.w.pending()["items"]:
+            self.assertIn("\n%d. " % it["n"], q)
+        self.assertEqual(len(self.w.pending()["items"]) + self.w.pending()["more"], 60)
 
     def test_too_many_shows_the_oldest_and_the_rest_comes_next(self):
         saved = agentlog.LIST_MAX

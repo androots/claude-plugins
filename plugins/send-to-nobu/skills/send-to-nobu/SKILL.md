@@ -2,6 +2,7 @@
 name: send-to-nobu
 description: 自分の Claude Code の会話を のぶろう に送る（毎朝、新しい会話で /send-to-nobu）。送らない会話と感想は選択画面で答える
 disable-model-invocation: true
+model: opus
 allowed-tools:
   - mcp__plugin_send-to-nobu_agent-log-inbox__start_submission
   - Bash(/usr/bin/python3 ${CLAUDE_PLUGIN_ROOT}/scripts/agentlog.py *)

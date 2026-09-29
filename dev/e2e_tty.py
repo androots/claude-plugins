@@ -12,6 +12,7 @@
     reask    読めない番号 → 同じターンで聞き直す → AI のメモ（ヒアドキュメント）も許可の確認なしで届く
     afk      答えずに放置（askUserQuestionTimeout 60s）→ 何も届かない
     control  対照: allowed-tools から Bash を外すと許可ダイアログを検出する（検出の仕組みが効いている確認）
+    many     60 件（長いタイトル）を 1 回の選択画面に出す（80 行の端末で最後の会話と質問の行まで見える）→ 全部届く
 """
 import fcntl
 import http.server
@@ -28,6 +29,7 @@ import tempfile
 import termios
 import threading
 import time
+import unicodedata
 import uuid
 
 REPO_PLUGIN = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "plugins", "send-to-nobu")
@@ -266,6 +268,86 @@ def screen(buf):
     return t
 
 
+class Screen(object):
+    """最後の画面（行 × 桁）を再現する小さな端末もどき。全角は 2 桁。"""
+
+    def __init__(self, rows, cols):
+        self.rows, self.cols = rows, cols
+        self.g = [[" "] * cols for _ in range(rows)]
+        self.r = self.c = 0
+
+    def _scroll(self):
+        self.g.pop(0)
+        self.g.append([" "] * self.cols)
+        self.r = self.rows - 1
+
+    def feed(self, data):
+        t = re.sub(r"\x1b\][^\x07\x1b]*(\x07|\x1b\\)", "", data.decode("utf-8", "replace"))
+        i = 0
+        while i < len(t):
+            ch = t[i]
+            if ch == "\x1b":
+                m = re.match(r"\x1b\[([0-9;?<>=]*)([ -/]*)([@-~])", t[i:])
+                if not m:
+                    i += 2
+                    continue
+                i += m.end()
+                args = [int(x) if x.isdigit() else 0 for x in m.group(1).lstrip("?<>=").split(";")] if m.group(1) else []
+                n = (args[0] if args and args[0] else 1)
+                f = m.group(3)
+                if f == "A":
+                    self.r = max(0, self.r - n)
+                elif f == "B":
+                    self.r = min(self.rows - 1, self.r + n)
+                elif f == "C":
+                    self.c = min(self.cols - 1, self.c + n)
+                elif f == "D":
+                    self.c = max(0, self.c - n)
+                elif f == "G":
+                    self.c = min(self.cols - 1, n - 1)
+                elif f in "Hf":
+                    self.r = min(self.rows - 1, (args[0] if args and args[0] else 1) - 1)
+                    self.c = min(self.cols - 1, (args[1] if len(args) > 1 and args[1] else 1) - 1)
+                elif f == "J":
+                    mode = args[0] if args else 0
+                    if mode == 0:
+                        self.g[self.r][self.c:] = [" "] * (self.cols - self.c)
+                        for rr in range(self.r + 1, self.rows):
+                            self.g[rr] = [" "] * self.cols
+                    elif mode in (2, 3):
+                        self.g = [[" "] * self.cols for _ in range(self.rows)]
+                elif f == "K":
+                    mode = args[0] if args else 0
+                    if mode == 0:
+                        self.g[self.r][self.c:] = [" "] * (self.cols - self.c)
+                    elif mode == 2:
+                        self.g[self.r] = [" "] * self.cols
+                continue
+            i += 1
+            if ch == "\r":
+                self.c = 0
+            elif ch == "\n":
+                self.r += 1
+                if self.r >= self.rows:
+                    self._scroll()
+            elif ch == "\x08":
+                self.c = max(0, self.c - 1)
+            elif ch >= " ":
+                w = 2 if unicodedata.east_asian_width(ch) in "WF" else 1
+                if self.c + w > self.cols:
+                    self.c = 0
+                    self.r += 1
+                    if self.r >= self.rows:
+                        self._scroll()
+                self.g[self.r][self.c] = ch
+                if w == 2 and self.c + 1 < self.cols:
+                    self.g[self.r][self.c + 1] = ""
+                self.c += w
+
+    def text(self):
+        return "\n".join("".join(row).rstrip() for row in self.g)
+
+
 def flat(s):
     return re.sub(r"\s+", "", s)
 
@@ -279,6 +361,7 @@ class Term(object):
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
         os.kill(self.pid, signal.SIGWINCH)
         self.buf = b""
+        self.rows, self.cols = rows, cols
         self.lock = threading.Lock()
         self.alive = True
         threading.Thread(target=self._reader, daemon=True).start()
@@ -295,6 +378,13 @@ class Term(object):
                     break
                 with self.lock:
                     self.buf += data
+
+    def screen(self):
+        """いま端末に見えている画面。"""
+        sc = Screen(self.rows, self.cols)
+        with self.lock:
+            sc.feed(self.buf)
+        return sc.text()
 
     def mark(self):
         with self.lock:
@@ -338,7 +428,7 @@ class Term(object):
 # ---------------------------------------------------------------- 準備
 
 
-def make_world(root, inbox, mcp, settings_extra=None, control=False):
+def make_world(root, inbox, mcp, settings_extra=None, control=False, many=0):
     home = os.path.join(root, "home")
     cfg = os.path.join(root, "cfg")
     work = os.path.join(home, "work")
@@ -399,6 +489,9 @@ def make_world(root, inbox, mcp, settings_extra=None, control=False):
     d = Lines(base=now - 3000).user("取引先リストを整理して")
     d.tool("Bash", {"command": "cat list.csv"}, result="山田商事,03-1234-5678").assistant()
     put(d.meta("ai-title", aiTitle="取引先リストの整理"))
+    for i in range(many):
+        put(Lines(base=now - 20000 + i * 60).user("指示 %d" % i).assistant().meta(
+            "ai-title", aiTitle="とても長いタイトルの会話で、どれが何の話かを見分けるための説明 %02d" % i))
     # 出さない会話: 前の送信用の会話・自動実行
     old_send = Lines(base=now - 6000).user("<command-message>send-to-nobu</command-message>\n"
                                            "<command-name>/send-to-nobu</command-name>").assistant("一覧")
@@ -426,9 +519,9 @@ def run_scenario(name):
     inbox, model = FakeInbox(), FakeModel()
     mcp = FakeMCP(inbox)
     extra = {"askUserQuestionTimeout": "60s"} if name == "afk" else {}
-    w = make_world(root, inbox, mcp, extra, control=(name == "control"))
+    w = make_world(root, inbox, mcp, extra, control=(name == "control"), many=56 if name == "many" else 0)
     model_env = dict(w["env"], ANTHROPIC_BASE_URL=model.base)
-    term = Term(["claude", "--plugin-dir", w["plugin"]], model_env, w["work"])
+    term = Term(["claude", "--plugin-dir", w["plugin"]], model_env, w["work"], rows=80 if name == "many" else 60)
     ok, notes = True, []
 
     def check(cond, msg):
@@ -454,10 +547,17 @@ def run_scenario(name):
             raise RuntimeError("no screen")
         shown = term.text(m0)
         check("連絡先あり" in flat(shown) and "請求書の集計" in shown, "1 問目に一覧（タイトルと目印）が出る")
+        if name == "many":
+            term.wait("外さずに送る", since=m0, timeout=10)
+            time.sleep(1.5)
+            sc = term.screen()
+            check("60." in sc and "送らない会話は" in sc and "外さずに送る" in sc,
+                  "60 件目・質問の行・選択肢まで画面に見える")
+            check("ほかに" not in sc, "60 件なら「ほかに N 件」は出ない")
         if name == "afk":
             done = term.wait("答えがなかった", *PERMISSION_WORDS, since=m0, timeout=150)
         else:
-            if name == "none":
+            if name in ("none", "many"):
                 term.send(b"\r", 1.0)                      # なし（全部送る）
             else:
                 term.send(b"\x1b[B", 0.3)
@@ -499,7 +599,10 @@ def run_scenario(name):
             check(done == "件送った", "送り終わった（%s）" % done)
             fin = inbox.finish_bodies[-1] if inbox.finish_bodies else {}
             sent = sorted(s["session_id"] for s in fin.get("sent", []))
-            want = sorted(ids.values()) if name in ("none", "reask") else sorted([ids["a"], ids["b"], ids["d"]])
+            want = (sorted(ids.values()) if name in ("none", "reask") else sorted([ids["a"], ids["b"], ids["d"]])
+                    if name == "numbers" else None)
+            if name == "many":
+                want = sent if len(sent) == 60 and set(ids.values()) <= set(sent) else ["60 件ではない"]
             check(sent == want, "送った会話が一覧どおり（%d 件）" % len(sent))
             check(fin.get("excluded_count") == (1 if name == "numbers" else 0), "外した件数 %s" % fin.get("excluded_count"))
             check(fin.get("note") == ("e2e の感想です。MCP のログインで迷った" if name == "none" else ""),
@@ -547,7 +650,7 @@ def run_scenario(name):
 
 
 if __name__ == "__main__":
-    names = sys.argv[1:] or ["none", "numbers", "reask", "afk", "control"]
+    names = sys.argv[1:] or ["none", "numbers", "reask", "afk", "control", "many"]
     results = [run_scenario(n) for n in names]
     print("ALL OK" if all(results) else "SOME FAILED")
     sys.exit(0 if all(results) else 1)

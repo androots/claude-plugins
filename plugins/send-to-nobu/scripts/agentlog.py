@@ -32,8 +32,11 @@ import urllib.request
 FIRST_RUN_DAYS = 7            # 初回は直近 7 日の会話だけ
 DAY_START_HOUR = 6            # 朝の知らせの日の区切り（ローカル時刻）
 NUDGE_BUDGET = 6.0            # 朝の知らせが会話を読む時間の上限（フックの timeout は 10 秒）
-LIST_MAX = 30                 # 一覧に出す会話の数（選択画面に収まる行数。残りは次の一覧で）
-TITLE_CHARS = 40              # 一覧に出すタイトルの長さ
+LIST_MAX = 60                 # 1 回の選択画面に出す会話の上限（超える極端な件数のときだけ、残りは次の一覧で）
+# 1 問目の本文の上限。Claude Code の選択画面は質問文を 2,000 字（UTF-16）で「…」に切る。切れた先の会話は
+# 本人に見えないまま送られてしまうので、必ずこれより短く（件数が多いときはタイトルを縮める）
+QUESTION_MAX = 1900
+TITLE_CHARS = 40              # 一覧に出すタイトルの長さ（件数が多いと、ここから縮める）
 TITLE_MAX, PROJECT_MAX = 200, 300
 NOTE_MAX = 20000              # サーバーの上限
 ASSISTANT_NOTE_MAX = 1000
@@ -795,6 +798,11 @@ def home_short(path):
     return "~" + path[len(home):] if path == home or path.startswith(home + os.sep) else path
 
 
+def js_len(text):
+    """選択画面が数える長さ（UTF-16。絵文字などは 2）。"""
+    return len(text.encode("utf-16-le")) // 2
+
+
 def build_questions(items, more):
     """選択画面の質問。1 問目の本文に、結論と番号つきのタイトル一覧を入れる（AI の本文に頼らず本人に見せる）。"""
     note_q = {"question": NOTE_QUESTION, "header": "感想", "multiSelect": False,
@@ -803,14 +811,17 @@ def build_questions(items, more):
     if not items:
         note_q["question"] = "送る会話はない（感想・質問だけ送れる）。\n\n" + NOTE_QUESTION
         return [note_q]
-    lines = ["未送信の会話が %d 件ある。外したもの以外を のぶろう に送る。" % len(items), ""]
-    for it in items:
-        tags = "・".join(label for key, label in MARK_LABELS if key in it["marks"])
-        lines.append("%d. %s%s" % (it["n"], squash(it["title"], TITLE_CHARS) or "（タイトルなし）",
-                                   "（%s）" % tags if tags else ""))
-    if more:
-        lines.append("（ほかに %d 件。送ったあと、もう一度 /send-to-nobu で出る）" % more)
-    lines += ["", "送らない会話は？（外すなら入力欄に番号。例: 3, 5-7）"]
+    for width in (TITLE_CHARS, 32, 26, 20, 16, 12, 8):  # 収まるまでタイトルを短くする（1 行 1 件のまま）
+        lines = ["未送信の会話が %d 件ある。外したもの以外を のぶろう に送る。" % len(items), ""]
+        for it in items:
+            tags = "・".join(label for key, label in MARK_LABELS if key in it["marks"])
+            lines.append("%d. %s%s" % (it["n"], squash(it["title"], width) or "（タイトルなし）",
+                                       "（%s）" % tags if tags else ""))
+        if more:
+            lines.append("（ほかに %d 件。送ったあと、もう一度 /send-to-nobu で出る）" % more)
+        lines += ["", "送らない会話は？（外すなら入力欄に番号。例: 3, 5-7）"]
+        if js_len("\n".join(lines)) <= QUESTION_MAX:
+            break
     return [{"question": "\n".join(lines), "header": "送らない", "multiSelect": False,
              "options": [{"label": NONE_LABEL, "description": "外さずに送る"},
                          {"label": ALL_LABEL, "description": "今回はどれも送らない（感想は送れる）"}]},
@@ -840,10 +851,13 @@ def cmd_list(args, out):
                      "project": squash(mask_text(home_short(s.cwd))[0], PROJECT_MAX),
                      "last_activity": iso_utc(last), "last_ts": last, "marks": sorted(s.marks)})
     rows.sort(key=lambda r: (r["last_ts"], r["session_id"]))
-    items = rows[:LIST_MAX]     # 多すぎるときは古い方から。残りは送ったあとの一覧に出る
+    items = rows[:LIST_MAX]     # 極端に多いときだけ古い方から。残りは送ったあとの一覧に出る
     for n, it in enumerate(items, 1):
         it["n"] = n
     questions = build_questions(items, len(rows) - len(items))
+    while items and js_len(questions[0]["question"]) > QUESTION_MAX:   # 見えない会話は控えに入れない
+        items = items[:-1]
+        questions = build_questions(items, len(rows) - len(items))
     with open_nofollow(cur_path) as fh:
         session_offset = os.fstat(fh.fileno()).st_size   # これより後の答えだけを数える
     write_json(pending_path(data_dir), {
