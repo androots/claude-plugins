@@ -105,6 +105,11 @@ def _now():
     return time.time()
 
 
+def _sleep(seconds):
+    """待つ（テストで差し替える）。"""
+    time.sleep(seconds)
+
+
 # ---------------------------------------------------------------- 時刻・入出力
 
 
@@ -1228,6 +1233,8 @@ REVIEW_LINE_CHARS = 1000        # 1 行の長さ（Read は長い行を切るの
 REVIEW_PARTS_PER_CHECKER = 3    # 確認係 1 体が読むファイルの数（大きい会話は確認係を分ける）
 CHECKER_CAP = 36                # 1 ラウンドの確認係の総数（約 36 万字）。1 会話でこれを超える会話は確認係にかけない
 CHECKER_CONCURRENCY = 12        # 同時に動かす確認係の数（Claude Code の同時実行の上限 20 に余裕を持たせる）
+CHECK_WAIT = 12                 # checked --wait が 1 回に待つ秒数（AI がターンを終えずに答えを待つため）
+CHECK_TIMEOUT = 300             # 一覧を出してからこの秒数たっても答えが無い確認係は「確認できなかった」にする
 TICKET_LEN = 12                 # 確認係の札の長さ（16 進）
 REVIEW_KEEP = 86400             # 残った確認用ファイルを消すまでの時間
 
@@ -1771,7 +1778,18 @@ def cmd_checked(args, out):
     pending = load_pending(data_dir, sid, now)
     tickets = pending.get("tickets") or {}
     results = dict(pending.get("checker_results") or {})
-    incoming = _read_checker_results(args.stdin)
+    all_ids = [str(c["id"]) for c in pending.get("checker_list") or []]
+    deadline = float(pending.get("created_ts") or now) + CHECK_TIMEOUT
+    if args.wait:
+        # 答えを持たずに呼ばれた: 少し待ってから今の状況を返す（そのあいだに届いた答えは、AI が次の checked で渡す）
+        incoming = []
+        if not pending.get("timed_out") and any(c not in results for c in all_ids):
+            _sleep(max(0.0, min(CHECK_WAIT, deadline - now)))
+            now = _now()
+    else:
+        incoming = _read_checker_results(args.stdin)
+    if pending.get("timed_out"):
+        incoming = []  # 打ち切ったあと（一覧はもう出た）に届いた答えでは、結果を変えない
     bad = [r.get("ticket") for r in incoming if not isinstance(r.get("ticket"), str) or r["ticket"] not in tickets]
     if bad:
         # 前のラウンドの札・偽の札・札の無い答えは、今のラウンドの答えとして受け付けない（入力ごと止める）
@@ -1792,12 +1810,18 @@ def cmd_checked(args, out):
             results[cid] = {"verdict": verdict, "reasons": reasons if verdict == "caution" else []}
         elif _SEVERITY[verdict] == _SEVERITY[old["verdict"]] == _SEVERITY["caution"]:
             old["reasons"] = (old["reasons"] + [x for x in reasons if x not in old["reasons"]])[:6]
+    # 打ち切り: 一覧を出してから CHECK_TIMEOUT たっても答えの無い確認係（まだ投げていない分も）は unknown にする
+    if not pending.get("timed_out") and now >= deadline and any(c not in results for c in all_ids):
+        for c in all_ids:
+            if c not in results:
+                results[c] = {"verdict": "unknown", "reasons": [], "timed_out": True}
+        pending["timed_out"] = True
     pending["checker_results"] = results
 
     # 次の波: 同時に動いている確認係（投げたが答えが無い）が CHECKER_CONCURRENCY 体になるまで、まだ投げていない分を出す
     launched = [int(x) for x in pending.get("launched") or []]
     in_flight = [c for c in launched if str(c) not in results]
-    queue = [c for c in pending.get("checker_list") or [] if c["id"] not in launched]
+    queue = [c for c in pending.get("checker_list") or [] if c["id"] not in launched and str(c["id"]) not in results]
     to_launch = queue[:max(0, CHECKER_CONCURRENCY - len(in_flight))]
     pending["launched"] = launched + [c["id"] for c in to_launch]
 
@@ -1831,10 +1855,12 @@ def cmd_checked(args, out):
         summary[entry["result"]] += 1
         convs.append(entry)
     write_json_atomic(pending_path(data_dir), pending)
-    out.write(json.dumps({"missing": sorted(missing),
-                          "launch": [{"ticket": c["ticket"], "prompt": c["prompt"]} for c in to_launch],
-                          "summary": summary, "conversations": convs, "display": display_summary(convs)},
-                         ensure_ascii=False) + "\n")
+    result = {"missing": sorted(missing),
+              "launch": [{"ticket": c["ticket"], "prompt": c["prompt"]} for c in to_launch],
+              "summary": summary, "conversations": convs, "display": display_summary(convs)}
+    if pending.get("timed_out"):
+        result["timed_out"] = True
+    out.write(json.dumps(result, ensure_ascii=False) + "\n")
     return 0
 
 
@@ -2531,7 +2557,10 @@ def build_parser():
     data_dir(sub.add_parser("nudge", help="未送信の会話があれば 1 日 1 回知らせる（フック用）"))
     data_dir(sub.add_parser("status", help="いまの会話に有効な一覧の控えがあるか"))
 
-    data_dir(sub.add_parser("checked", help="確認係の結果（標準入力の JSON）を控えに足し、会話ごとの結果を返す"))
+    sp = sub.add_parser("checked", help="確認係の結果（標準入力）を控えに足し、会話ごとの結果を返す")
+    data_dir(sp)
+    sp.add_argument("--wait", action="store_true",
+                   help="答えを渡さず、少し（CHECK_WAIT 秒まで）待ってから今の状況を返す。標準入力は読まない")
 
     sp = sub.add_parser("list", help="未送信の会話の一覧")
     data_dir(sp)

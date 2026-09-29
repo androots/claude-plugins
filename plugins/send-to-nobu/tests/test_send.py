@@ -599,6 +599,77 @@ class ReasonCodeTest(unittest.TestCase):
         self.assertEqual(agentlog.reason_label("other"), "その他")
 
 
+class WaitAndTimeoutTest(SendBase):
+    """AI はターンを終えずに checked --wait で待つ。5 分たっても届かない確認係は unknown にして打ち切る。"""
+
+    def setUp(self):
+        super().setUp()
+        self.slept = []
+        self._saved_sleep = agentlog._sleep
+        agentlog._sleep = self.slept.append
+
+    def tearDown(self):
+        agentlog._sleep = self._saved_sleep
+        super().tearDown()
+
+    def three(self):
+        now = time.time()
+        for i in range(3):
+            self.w.write(Lines(base=now - 9000 + i * 1000).user("会話 %d" % i).assistant())
+        self.w.list()
+        return self.w.pending()["created_ts"]
+
+    def wait(self, now=None):
+        code, out, err = self.w.run("checked", "--wait", stdin="これは読まない", now=now)
+        self.assertEqual(code, 0, err)
+        return json.loads(out)
+
+    def test_wait_sleeps_and_returns_the_state_without_reading_stdin(self):
+        created = self.three()
+        out = self.wait(now=created + 10)
+        self.assertEqual(self.slept, [agentlog.CHECK_WAIT])
+        self.assertEqual((out["missing"], out["launch"]), ([1, 2, 3], []))
+        self.assertNotIn("timed_out", out)
+        self.w.check()                                                   # 全部そろった
+        self.slept.clear()
+        out = self.wait(now=created + 20)
+        self.assertEqual((self.slept, out["missing"]), ([], []))         # そろったあとは待たない
+
+    def test_wait_does_not_pass_the_deadline(self):
+        created = self.three()
+        self.wait(now=created + agentlog.CHECK_TIMEOUT - 5)
+        self.assertEqual(self.slept, [5])
+
+    def test_timeout_turns_the_rest_into_unknown_and_freezes(self):
+        created = self.three()
+        t = self.w.tickets()
+        code, out, err = self.w.run("checked", stdin="%s caution money" % t[1], now=created + 30)
+        self.assertEqual(code, 0, err)
+        out = self.wait(now=created + agentlog.CHECK_TIMEOUT + 1)       # 5 分たった
+        self.assertTrue(out["timed_out"])
+        self.assertEqual((out["missing"], out["launch"]), ([], []))
+        self.assertEqual([(c["result"], c.get("why")) for c in out["conversations"]],
+                         [("caution", None), ("unconfirmed", "unknown"), ("unconfirmed", "unknown")])
+        # 打ち切ったあとに届いた答えでは変わらない（一覧はもう出ている）
+        code, out, err = self.w.run("checked", stdin="%s caution client\n%s ok" % (t[2], t[3]),
+                                    now=created + agentlog.CHECK_TIMEOUT + 60)
+        self.assertEqual(code, 0, err)
+        self.assertEqual([c["result"] for c in json.loads(out)["conversations"]],
+                         ["caution", "unconfirmed", "unconfirmed"])
+
+    def test_timeout_also_covers_checkers_never_launched(self):
+        L = Lines(base=time.time() - 3600)
+        for i in range(100):
+            L.user("指示 %02d " % i + "あ" * 900).assistant("返事 %02d " % i + "い" * 900)
+        self.w.write(L)
+        with mock.patch.object(agentlog, "REVIEW_PART_CHARS", 3000):
+            res = self.w.list()
+        created = self.w.pending()["created_ts"]
+        self.assertGreater(res["checkers_total"], agentlog.CHECKER_CONCURRENCY)
+        out = self.wait(now=created + agentlog.CHECK_TIMEOUT)
+        self.assertEqual((out["missing"], out["launch"], out["conversations"][0]["why"]), ([], [], "unknown"))
+
+
 class TooLongTest(SendBase):
     """確認しきれない長さの会話は「残り」に数えない（続けても確認係にかけられないので、続きに誘わない）。"""
 
