@@ -137,7 +137,8 @@ class Reading(Base):
         self.assertEqual(res["next"], agentlog.NEXT_ASK)
         self.assertEqual(len(qs), 2)
         self.assertEqual(qs[0]["question"].splitlines(), [
-            "未送信の会話が 1 件ある。外したもの以外を のぶろう に送る。", "", "1. 請求書の集計", "",
+            "未送信の会話が 1 件ある。外したもの以外を のぶろう に送る。", "AI が中身を読んだ。外す候補はなし", "",
+            "1. 請求書の集計", "",
             "送らない会話は？（外すなら入力欄に番号。例: 3, 5-7）"])
         self.assertEqual([o["label"] for o in qs[0]["options"]], [agentlog.NONE_LABEL, agentlog.PASS_LABEL])
         self.assertEqual([o["label"] for o in qs[1]["options"]], list(agentlog.NOTE_OPTIONS))
@@ -206,7 +207,7 @@ class Sending(Base):
         self.assertEqual(self.inbox.upload_batches, [100, 21])
         body = self.finish()
         self.assertEqual(sorted(body), ["excluded_count", "note", "plugin_version", "sent"])
-        self.assertEqual(body["plugin_version"], "0.5.0")
+        self.assertEqual(body["plugin_version"], "0.6.0")
         s = body["sent"][0]
         self.assertEqual(sorted(s), sorted(["session_id", "bytes", "sha256", "title", "project", "last_activity",
                                             "redactions", "subagents"]))
