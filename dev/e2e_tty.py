@@ -5,10 +5,12 @@
 - モデルは台本どおりに動く偽の Anthropic API（ANTHROPIC_BASE_URL）。スキルの手順どおりに道具を呼ぶだけ
 - MCP（whoami / start_submission）と受け口（/v1/uploads・PUT・/v1/finish）も偽物。本物のサーバーには送らない
 - プラグインは一時ディレクトリへの複製（送り先の許可リストと .mcp.json の URL だけを偽物に向ける）
+- AI の確認（判定用の claude -p）も偽物（tests/fake_claude.py）。ふだんは候補なし
 
   /usr/bin/python3 dev/e2e_tty.py [scenario ...]
     none     「なし（全部送る）」と入力欄の感想 → 全部届く・感想はそのまま
     numbers  入力欄に番号 → その会話は届かない
+    suggest  AI の確認が「個人的な相談」を候補にする → 1 問目に目印 → 「提案どおり外す」でその会話だけ届かない
     reask    読めない番号 → 同じターンで聞き直す → AI のメモ（ヒアドキュメント）も許可の確認なしで届く
     afk      答えずに放置（askUserQuestionTimeout 60s）→ 何も届かない
     control  対照: allowed-tools から Bash を外すと許可ダイアログを検出する（検出の仕組みが効いている確認）
@@ -438,7 +440,7 @@ class Term(object):
 # ---------------------------------------------------------------- 準備
 
 
-def make_world(root, inbox, mcp, settings_extra=None, control=False, many=0):
+def make_world(root, inbox, mcp, settings_extra=None, control=False, many=0, judge_flags=False):
     home = os.path.join(root, "home")
     cfg = os.path.join(root, "cfg")
     work = os.path.join(home, "work")
@@ -514,7 +516,9 @@ def make_world(root, inbox, mcp, settings_extra=None, control=False, many=0):
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(("CLAUDE", "ANTHROPIC", "OTEL")) and k not in ("CLAUDECODE",)}
     env.update(HOME=home, CLAUDE_CONFIG_DIR=cfg, TERM="xterm-256color", LANG="ja_JP.UTF-8",
-               CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1", DISABLE_AUTOUPDATER="1")
+               CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1", DISABLE_AUTOUPDATER="1",
+               SEND_TO_NOBU_CLAUDE=os.path.join(REPO_PLUGIN, "tests", "fake_claude.py"),
+               FAKE_JUDGE=json.dumps({"flag": {"個人的な相談": "私的な話"}} if judge_flags else {}, ensure_ascii=False))
     if env["CLAUDE_CONFIG_DIR"] != cfg or not os.path.realpath(env["HOME"]).startswith(TMP_ROOT):
         die("env が一時ディレクトリを指していない")
     return {"home": home, "cfg": cfg, "work": work, "plugin": plugin, "env": env,
@@ -529,7 +533,8 @@ def run_scenario(name):
     inbox, model = FakeInbox(), FakeModel()
     mcp = FakeMCP(inbox)
     extra = {"askUserQuestionTimeout": "60s"} if name == "afk" else {}
-    w = make_world(root, inbox, mcp, extra, control=(name == "control"), many=56 if name == "many" else 0)
+    w = make_world(root, inbox, mcp, extra, control=(name == "control"), many=56 if name == "many" else 0,
+                   judge_flags=(name == "suggest"))
     model_env = dict(w["env"], ANTHROPIC_BASE_URL=model.base)
     term = Term(["claude", "--plugin-dir", w["plugin"]], model_env, w["work"], rows=24 if name == "many" else 60, cols=80 if name == "many" else 140)
     ok, notes = True, []
@@ -543,6 +548,11 @@ def run_scenario(name):
     try:
         if not term.wait("❯", timeout=40):
             die("claude の入力欄が出ない:\n" + term.text()[-1500:])
+        # 2.1.28x の初回の案内（auto mode を既定にするか）。手動のまま（許可ダイアログを見るため）。出るまで少しかかる
+        if term.wait("Make auto mode your default", timeout=8):
+            time.sleep(1.0)
+            term.send(b"\x1b[B", 0.3)
+            term.send(b"\r", 1.0)
         time.sleep(2.0)
         m0 = term.mark()
         term.type("/send-to-nobu")
@@ -557,6 +567,9 @@ def run_scenario(name):
             raise RuntimeError("no screen")
         shown = term.text(m0)
         check("請求書の集計" in shown, "1 問目に一覧のタイトルが出る")
+        if name == "suggest":
+            check(flat("【候補: 私的な話】個人的な相談") in flat(shown) and "提案どおり外す（3）" in flat(shown),
+                  "AI の候補に目印と理由が付き、「提案どおり外す（3）」が出る")
         if name == "many":
             term.wait("外さずに送る", since=m0, timeout=10)
             time.sleep(1.5)
@@ -577,8 +590,8 @@ def run_scenario(name):
         if name == "afk":
             done = term.wait("答えがなかった", *PERMISSION_WORDS, since=m0, timeout=150)
         else:
-            if name in ("none", "many"):
-                term.send(b"\r", 1.0)                      # なし（全部送る）
+            if name in ("none", "many", "suggest"):
+                term.send(b"\r", 1.0)                      # 1 つ目の選択肢（なし（全部送る）/ 提案どおり外す）
             else:
                 term.send(b"\x1b[B", 0.3)
                 term.send(b"\x1b[B", 0.3)                  # 入力欄
@@ -620,11 +633,11 @@ def run_scenario(name):
             fin = inbox.finish_bodies[-1] if inbox.finish_bodies else {}
             sent = sorted(s["session_id"] for s in fin.get("sent", []))
             want = (sorted(ids.values()) if name in ("none", "reask") else sorted([ids["a"], ids["b"], ids["d"]])
-                    if name == "numbers" else None)
+                    if name in ("numbers", "suggest") else None)
             if name == "many":
                 want = sent if len(sent) == 60 and set(ids.values()) <= set(sent) else ["60 件ではない"]
             check(sent == want, "送った会話が一覧どおり（%d 件）" % len(sent))
-            check(fin.get("excluded_count") == (1 if name == "numbers" else 0), "外した件数 %s" % fin.get("excluded_count"))
+            check(fin.get("excluded_count") == (1 if name in ("numbers", "suggest") else 0), "外した件数 %s" % fin.get("excluded_count"))
             check(fin.get("note") == ("e2e の感想です。MCP のログインで迷った" if name == "none" else ""),
                   "感想は本人の言葉そのまま（%r）" % fin.get("note"))
             if name == "reask":
@@ -634,7 +647,7 @@ def run_scenario(name):
             check(KEY.encode() not in body and b"[REDACTED:anthropic_key]" in body and b"[OMITTED:image/png" in body,
                   "キーは伏せ、画像は抜いてある")
             check(inbox.body(ids["a"], "agent-abc.jsonl") is not None, "サブエージェントも届く")
-            if name == "numbers":
+            if name in ("numbers", "suggest"):
                 check(inbox.body(ids["c"]) is None, "外した 3 番は届いていない")
         # 本物の transcript（一時ディレクトリの中）に残った答えの形
         tdir = os.path.join(w["cfg"], "projects")
@@ -671,7 +684,7 @@ def run_scenario(name):
 
 
 if __name__ == "__main__":
-    names = sys.argv[1:] or ["none", "numbers", "reask", "afk", "control", "many"]
+    names = sys.argv[1:] or ["none", "numbers", "suggest", "reask", "afk", "control", "many"]
     results = [run_scenario(n) for n in names]
     print("ALL OK" if all(results) else "SOME FAILED")
     sys.exit(0 if all(results) else 1)

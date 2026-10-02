@@ -32,6 +32,10 @@ SEND_CMD_NS = ("<command-message>send-to-nobu:send-to-nobu</command-message>\n"
                "<command-name>/send-to-nobu:send-to-nobu</command-name>")
 
 agentlog.ANSWER_WAIT = 0.0      # 答えの行を待たない（待つ動きは個別に試す）
+# 判定は偽の claude -p で（本物の claude は呼ばない。子プロセスで動かす agentlog.py にも env で効く）
+FAKE_CLAUDE = os.path.join(HERE, "fake_claude.py")
+os.environ[agentlog.JUDGE_BIN_ENV] = FAKE_CLAUDE
+os.environ.pop("FAKE_JUDGE", None)
 
 
 def assert_sandboxed():
