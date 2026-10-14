@@ -278,6 +278,26 @@ class SendSession(Base):
         self.assertIsNone(self.w.pending())
         self.assertFalse(os.path.exists(os.path.join(self.w.data, "page")))
 
+    def test_the_send_to_nobu_routine_counts_as_a_send_conversation(self):
+        routine = ('<scheduled-task name="send-to-nobu" file="/Users/alice/.claude/scheduled-tasks/send-to-nobu/SKILL.md">\n'
+                   "This is an automated run of a scheduled task.\n\nsend-to-nobu スキルで今日のページを作る\n</scheduled-task>")
+        L = Lines(base=time.time() - 60).user(routine).assistant("ページを作る")
+        self.w.write(L, project=World.SEND_PROJECT)
+        other, _ = self.conv("ふつうの会話")
+        code, res = self.w.run("page", session=L.sid)
+        self.assertEqual(code, 0, res)
+        self.assertIn(other.sid, self.w.listed())
+        self.assertNotIn(L.sid, self.w.listed())
+
+    def test_another_routine_is_refused(self):
+        routine = '<scheduled-task name="daily-check" file="/x/SKILL.md">\nsend-to-nobu のページも作って\n</scheduled-task>'
+        L = Lines(base=time.time() - 60).user(routine).assistant()
+        self.w.write(L, project=World.SEND_PROJECT)
+        self.conv("ふつうの会話")
+        code, res = self.w.run("page", session=L.sid)
+        self.assertEqual(code, 1)
+        self.assertIsNone(self.w.pending())
+
     def test_the_current_conversation_is_not_listed(self):
         self.w.append(self.w.session_file(), Lines(sid=self.w.current).user("いまの会話で話す").assistant())
         res = self.w.page()

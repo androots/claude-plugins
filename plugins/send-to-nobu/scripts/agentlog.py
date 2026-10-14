@@ -64,6 +64,7 @@ NEXT_GET = ("ArtifactData で send/decision を out_dir=%s 付きで get し直�
 NEXT_RESULT = "ArtifactData で send/result に result_file を file_path で set してから say を伝える"
 NEXT_NEW_CODE = "start_submission をもう一度呼び、新しい upload_code で send をもう一度実行する（本人には聞き直さない）"
 AGAIN = "もう一度 /send-to-nobu と打ってね"
+RETRY = "この会話でもう一度『送って』と言ってね"      # 送る途中で失敗したとき（控えは残っている）
 
 
 class Stop(Exception):
@@ -390,6 +391,8 @@ def parse_line(raw):
 
 
 _SEND_CMD_RE = re.compile(r"<command-name>/?send-to-nobu(?::send-to-nobu)?</command-name>")
+# Desktop のルーティン（予定タスク）の最初の発言。名前が send-to-nobu で始まるルーティンは送信用の会話として扱う
+_ROUTINE_RE = re.compile(r'<scheduled-task name="send-to-nobu[^"]*"')
 _SR_PREFIX_RE = re.compile(r"^\s*(?:<system-reminder>.*?</system-reminder>\s*)+", re.S)
 _NOT_HUMAN_PREFIXES = ("[Request interrupted by user", "<task-notification>", "<bash-stdout>", "<bash-stderr>",
                        "<local-command-stdout>", "<local-command-stderr>")
@@ -420,7 +423,7 @@ def _human(text, origin):
 
 
 def classify(d):
-    """メインの会話の 1 行 → (種類, テキスト)。種類は send（/send-to-nobu）・human（人の指示）・None。"""
+    """メインの会話の 1 行 → (種類, テキスト)。種類は send（/send-to-nobu か send-to-nobu のルーティン）・human（人の指示）・None。"""
     if d.get("isSidechain") is True:
         return None, None
     if d.get("type") == "attachment":   # 作業中に打った文
@@ -436,7 +439,7 @@ def classify(d):
     text = _texts((d.get("message") or {}).get("content") if isinstance(d.get("message"), dict) else None)
     if text is None:
         return None, None               # tool_result だけ・画像だけの行
-    if _SEND_CMD_RE.search(text):
+    if _SEND_CMD_RE.search(text) or _ROUTINE_RE.match(_SR_PREFIX_RE.sub("", text, count=1).lstrip()):
         return "send", text
     if d.get("isMeta") is True or d.get("isCompactSummary") is True:
         return None, None
@@ -863,7 +866,7 @@ def require_send_session(sid):
     """いまの会話の最初の指示が /send-to-nobu であること。いまの会話ファイルを返す。"""
     path = find_session_path(sid)
     if path is None or scan(path, quick=True).first != "send":
-        raise Stop("この会話では使えない。新しい会話を始めて、最初に /send-to-nobu と打ってね")
+        raise Stop("この会話では使えない。新しい会話を始めて、最初に /send-to-nobu と打ってね（ルーティンなら名前を send-to-nobu にする）")
     return path
 
 
@@ -1056,7 +1059,7 @@ class ApiError(Stop):
             super().__init__(None, code=4, next=NEXT_NEW_CODE)
         else:
             super().__init__("送れなかった（サーバーが受け付けなかった: %s %s %s）。%s。続くなら のぶろう に知らせて"
-                             % (path, status, api_code or "-", AGAIN))
+                             % (path, status, api_code or "-", RETRY))
 
 
 _OPENER = None
@@ -1114,7 +1117,7 @@ def api_post(api_base, path, body, code, retry_ok_codes=()):
             if attempt < RETRIES:
                 time.sleep(BACKOFF_BASE * 2 ** attempt)
                 continue
-            raise Stop("送れなかった（サーバーにつながらない: %s）。%s" % (type(getattr(e, "reason", None) or e).__name__, AGAIN))
+            raise Stop("送れなかった（サーバーにつながらない: %s）。%s" % (type(getattr(e, "reason", None) or e).__name__, RETRY))
 
 
 def put_file(upload, local, size):
@@ -1137,7 +1140,7 @@ def put_file(upload, local, size):
             last = type(getattr(e, "reason", None) or e).__name__
         if attempt < RETRIES:
             time.sleep(BACKOFF_BASE * 2 ** attempt)
-    raise Stop("送れなかった（アップロードに失敗: %s）。%s" % (last, AGAIN))
+    raise Stop("送れなかった（アップロードに失敗: %s）。%s" % (last, RETRY))
 
 
 def upload_all(api_base, code, files):
@@ -1153,7 +1156,7 @@ def upload_all(api_base, code, files):
     for f in files:
         u = urls.get((f["session_id"], f["rel"]))
         if not u or not isinstance(u.get("url"), str) or not u["url"].startswith(ALLOWED_PUT_PREFIXES):
-            raise Stop("送れなかった（サーバーが返したアップロード先がおかしい）。%s" % AGAIN)
+            raise Stop("送れなかった（サーバーが返したアップロード先がおかしい）。%s" % RETRY)
         jobs.append((u, f["local"], f["bytes"]))
     with concurrent.futures.ThreadPoolExecutor(max_workers=PUT_WORKERS) as ex:
         for fut in [ex.submit(put_file, *j) for j in jobs]:
