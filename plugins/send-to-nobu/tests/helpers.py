@@ -12,6 +12,7 @@ import http.server
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -31,7 +32,12 @@ SEND_CMD = "<command-message>send-to-nobu</command-message>\n<command-name>/send
 SEND_CMD_NS = ("<command-message>send-to-nobu:send-to-nobu</command-message>\n"
                "<command-name>/send-to-nobu:send-to-nobu</command-name>")
 
-agentlog.ANSWER_WAIT = 0.0      # 答えの行を待たない（待つ動きは個別に試す）
+# 仮のテンプレ（本物の page.html は別に試す）。データを流し込む場所の約束だけを持つ
+FAKE_TEMPLATE = ('<!doctype html><html><head><meta charset="utf-8"><title>t</title></head><body>'
+                 '<script type="application/json" id="stn-data">__STN_DATA__</script>'
+                 '<script>var d = JSON.parse(document.getElementById("stn-data").textContent);</script>'
+                 '</body></html>\n')
+DATA_RE = re.compile(r'<script type="application/json" id="stn-data">(.*?)</script>', re.S)
 # 判定は偽の claude -p で（本物の claude は呼ばない。子プロセスで動かす agentlog.py にも env で効く）
 FAKE_CLAUDE = os.path.join(HERE, "fake_claude.py")
 os.environ[agentlog.JUDGE_BIN_ENV] = FAKE_CLAUDE
@@ -122,14 +128,17 @@ class World(object):
         self.projects = os.path.join(self.tmp, "projects")
         self.data = os.path.join(self.tmp, "plugins", "data", "send-to-nobu-androots")
         os.makedirs(self.projects)
-        self.saved = (agentlog.CONFIG_DIR, os.environ.get("CLAUDE_CONFIG_DIR"))
+        self.saved = (agentlog.CONFIG_DIR, os.environ.get("CLAUDE_CONFIG_DIR"), agentlog.TEMPLATE)
         agentlog.CONFIG_DIR = self.tmp
+        agentlog.TEMPLATE = os.path.join(self.tmp, "page.html")
+        with open(agentlog.TEMPLATE, "w", encoding="utf-8") as f:
+            f.write(FAKE_TEMPLATE)
         os.environ["CLAUDE_CONFIG_DIR"] = self.tmp
         assert_sandboxed()
         self.current = self.start_send_session()
 
     def close(self):
-        agentlog.CONFIG_DIR = self.saved[0]
+        agentlog.CONFIG_DIR, agentlog.TEMPLATE = self.saved[0], self.saved[2]
         if self.saved[1] is None:
             os.environ.pop("CLAUDE_CONFIG_DIR", None)
         else:
@@ -166,35 +175,14 @@ class World(object):
     def session_file(self):
         return os.path.join(self.projects, self.SEND_PROJECT, self.current + ".jsonl")
 
-    def answer(self, answers, questions=None, annotations=None, afk=None, answers_in_input=False, error=False):
-        """本人が選択画面（AskUserQuestion）に答えた 2 行を、いまの会話に足す。
-        形は Claude Code 2.1.284 の対話で残った行に合わせる（toolUseResult に questions・answers・annotations）。"""
-        questions = questions if questions is not None else self.pending()["questions"]
-        L = Lines(sid=self.current)
-        tid = "toolu_" + new_uuid().replace("-", "")[:20]
-        inp = dict({"questions": questions}, **({"answers": answers} if answers_in_input else {}))
-        L.msg("assistant", [{"type": "tool_use", "id": tid, "name": "AskUserQuestion", "input": inp}])
-        result = {"type": "tool_result", "tool_use_id": tid,
-                  "content": "User has answered your questions: " + ", ".join('"%s"="%s"' % kv for kv in answers.items())}
-        extra = {"sourceToolAssistantUUID": L.parent}
-        if error:
-            result["is_error"] = True
-        else:
-            extra["toolUseResult"] = {"questions": questions, "answers": answers, "annotations": annotations or {}}
-            if afk is not None:
-                extra["toolUseResult"]["afkTimeoutMs"] = afk
-        L.msg("user", [result], **extra)
-        self.append(self.session_file(), L)
-
-    def answer_simple(self, exclude=agentlog.NONE_LABEL, note=agentlog.NOTE_OPTIONS[0], **kw):
-        """1 問目（外す）と 2 問目（感想）に答える。None の質問は答えない。"""
-        p = self.pending()
-        answers = {}
-        if p["exclude_question"] and exclude is not None:
-            answers[p["exclude_question"]] = exclude
-        if note is not None:
-            answers[p["note_question"]] = note
-        self.answer(answers, **kw)
+    def decide(self, exclude=(), note="", round=None, raw=None):
+        """本人がページで「これで送る」を押し、AI が db の send/decision をファイルに保存した状態を作る。"""
+        doc = raw if raw is not None else {"round": round or self.pending()["round"], "exclude": list(exclude),
+                                           "note": note, "at": "2026-10-15T07:30:00+09:00"}
+        path = agentlog.decision_path(self.data)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(doc, f, ensure_ascii=False)
 
     def run(self, *argv, stdin="", session=None, now=None):
         """CLI を呼ぶ。いまの会話 ID は env だけ、時刻は agentlog._now の差し替え。(終了コード, 出力の JSON)。"""
@@ -216,11 +204,23 @@ class World(object):
         text = out.getvalue().strip()
         return code, (json.loads(text) if text else {})
 
-    def list(self, **kw):
-        code, res = self.run("list", **kw)
+    def page(self, **kw):
+        code, res = self.run("page", **kw)
         if code != 0:
-            raise AssertionError("list failed: %s" % res)
+            raise AssertionError("page failed: %s" % res)
         return res
+
+    def page_html(self):
+        """いまのページの HTML（page/ に 1 つだけのはず）。"""
+        d = os.path.join(self.data, "page")
+        names = [n for n in os.listdir(d) if n.endswith(".html")]
+        assert len(names) == 1, names
+        with open(os.path.join(d, names[0]), encoding="utf-8") as f:
+            return f.read()
+
+    def page_data(self):
+        """ページに流し込まれたデータ。"""
+        return json.loads(DATA_RE.search(self.page_html()).group(1))
 
     def titles(self):
         """いまの一覧の番号 → タイトル。"""
