@@ -36,7 +36,8 @@ class Page(Base):
         self.assertRegex(os.path.basename(res["file"]), r"^send-to-nobu-\d{8}-\d{4}\.html$")
         self.assertRegex(res["round"], r"^r-\d{8}-\d{4}-[0-9a-f]{6}$")
         self.assertEqual((res["count"], res[agentlog.LIST_MARKER]), (2, 1))
-        self.assertIn(os.path.join(self.w.data, "page"), res["next"])
+        self.assertIn("--answer-dir", res["next"])
+        self.assertNotIn(self.w.data, res["next"])      # ~/.claude の下には保存させない
         self.assertEqual((data["v"], data["round"], data["judge"], data["failed"], data["more"]),
                          (1, res["round"], "ok", 0, 0))
         self.assertEqual(data[agentlog.LIST_MARKER], 1)      # ページを読んだ会話も一覧に出さない
@@ -84,14 +85,16 @@ class Page(Base):
         old = os.path.join(d, "send-to-nobu-20260101-0700.html")
         with open(old, "w") as f:
             f.write("old")
-        self.w.decide()
-        with open(agentlog.result_path(self.w.data), "w") as f:
-            f.write("{}")
+        # 0.7.0 までの置き場所（<data-dir>/page）に残った答えと結果も消す
+        os.makedirs(os.path.dirname(agentlog.decision_path(d)), exist_ok=True)
+        for path in (agentlog.decision_path(d), agentlog.result_path(d)):
+            with open(path, "w") as f:
+                f.write("{}")
         self.w.page()
         self.assertEqual(len([n for n in os.listdir(d) if n.endswith(".html")]), 1)
         self.assertFalse(os.path.exists(old))
-        self.assertFalse(os.path.exists(agentlog.decision_path(self.w.data)))
-        self.assertFalse(os.path.exists(agentlog.result_path(self.w.data)))
+        self.assertFalse(os.path.exists(agentlog.decision_path(d)))
+        self.assertFalse(os.path.exists(agentlog.result_path(d)))
 
     def test_a_template_without_one_slot_stops(self):
         self.conv("会話")
@@ -113,7 +116,7 @@ class Page(Base):
         self.assertEqual({k: res["result"][k] for k in ("round", "sent", "excluded", "note")},
                          {"round": rnd, "sent": 1, "excluded": 1, "note": True})
         parse_iso(res["result"]["at"])
-        self.assertEqual(res["result_file"], agentlog.result_path(self.w.data))
+        self.assertEqual(res["result_file"], agentlog.result_path(self.w.answers))
         self.assertEqual(agentlog.read_json(res["result_file"], None), res["result"])
         self.assertEqual(res["next"], agentlog.NEXT_RESULT)
         self.assertIsNone(self.w.pending())

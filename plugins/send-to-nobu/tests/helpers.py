@@ -127,6 +127,7 @@ class World(object):
         self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="stn-test-"))
         self.projects = os.path.join(self.tmp, "projects")
         self.data = os.path.join(self.tmp, "plugins", "data", "send-to-nobu-androots")
+        self.answers = os.path.join(self.tmp, "scratchpad")     # AI が ArtifactData の get に渡す out_dir
         os.makedirs(self.projects)
         self.saved = (agentlog.CONFIG_DIR, os.environ.get("CLAUDE_CONFIG_DIR"), agentlog.TEMPLATE)
         agentlog.CONFIG_DIR = self.tmp
@@ -179,7 +180,7 @@ class World(object):
         """本人がページで「これで送る」を押し、AI が db の send/decision をファイルに保存した状態を作る。"""
         doc = raw if raw is not None else {"round": round or self.pending()["round"], "exclude": list(exclude),
                                            "note": note, "at": "2026-10-15T07:30:00+09:00"}
-        path = agentlog.decision_path(self.data)
+        path = agentlog.decision_path(self.answers)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(doc, f, ensure_ascii=False)
@@ -188,6 +189,8 @@ class World(object):
         """CLI を呼ぶ。いまの会話 ID は env だけ、時刻は agentlog._now の差し替え。(終了コード, 出力の JSON)。"""
         assert_sandboxed()
         argv = list(argv) + ["--data-dir", self.data]
+        if argv[0] == "send" and "--answer-dir" not in argv:
+            argv += ["--answer-dir", self.answers]
         saved_env, saved_now = os.environ.get("CLAUDE_CODE_SESSION_ID"), agentlog._now
         os.environ["CLAUDE_CODE_SESSION_ID"] = session or self.current
         if now is not None:

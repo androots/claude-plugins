@@ -123,7 +123,7 @@ class DecisionRequired(Base):
         code, res = self.send()
         self.assertNothingSent(code, res)
         self.assertIn("まだ押されていない", res["say"])
-        self.assertIn(os.path.join(self.w.data, "page"), res["next"])   # 保存先を教えて get し直させる
+        self.assertIn("--answer-dir", res["next"])   # get し直して、保存した場所を渡させる
 
     def test_a_decision_from_an_earlier_page_is_not_read(self):
         self.w.decide()
@@ -160,7 +160,7 @@ class DecisionRequired(Base):
     def test_a_decision_is_used_once(self):
         self.w.decide(exclude=[1])
         self.assertEqual(self.send()[0], 0)
-        self.assertFalse(os.path.exists(agentlog.decision_path(self.w.data)))
+        self.assertFalse(os.path.exists(agentlog.decision_path(self.w.answers)))
         code, res = self.send()
         self.assertEqual(code, 1)
         self.assertEqual(len(self.inbox.finish_bodies), 1)

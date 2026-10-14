@@ -35,7 +35,7 @@ class Judge(Base):
 
     def says_of(self, L, call):
         n = {it["session_id"]: it["n"] for it in self.w.pending()["items"]}[L.sid]
-        return {c["n"]: c["says"] for c in json.loads(call["stdin"])}[n]
+        return [(x["who"], x["text"]) for x in {c["n"]: c["says"] for c in json.loads(call["stdin"])}[n]]
 
     def flags(self):
         return {it["n"]: it["flag"] for it in self.w.page_data()["items"]}
@@ -46,7 +46,8 @@ class Judge(Base):
         data = self.w.page_data()
         self.assertEqual((data["judge"], data["failed"]), ("ok", 0))
         self.assertEqual(self.flags(), {1: None, 3: None, 2: {
-            "reason": "愚痴", "why": "上司への不満が中心", "quote": "部長の愚痴を聞いてほしい 昨日も怒鳴られた"}})
+            "reason": "愚痴", "why": "上司への不満が中心", "quote": "部長の愚痴を聞いてほしい 昨日も怒鳴られた",
+            "who": "本人"}})
         # 候補でも、決めるのは本人（ページで押した答えだけで外す）
         self.w.decide(exclude=[])
         code, res = self.send()
@@ -108,18 +109,30 @@ class Judge(Base):
         self.assertLess(time.time() - t0, 2.5)
         self.assertEqual(self.w.page_data()["judge"], "failed")
 
-    def test_only_the_users_own_words_are_read(self):
+    def test_what_is_sent_is_what_is_read(self):
+        # 本人の発言・AI の返事・ツールの結果を読む（送るのはこれ全部なので）。画像・思考・サブエージェントは読まない
         L = Lines().user("この CSV を整形して").assistant("AI の返事: 了解しました")
-        L.tool("Bash", {"command": "cat list.csv"}, result="ツールの結果: 山田 090-1234-5678")
+        L.msg("assistant", [{"type": "thinking", "thinking": "AI の思考", "signature": "x"}])
+        L.tool("Bash", {"command": "cat list.csv"}, result="ツールの結果: 山田 090-1234-5678 " + "長" * 1000)
+        L.tool("Read", {"file_path": "a.png"}, result=[
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo"}}])
         L.user([{"type": "text", "text": "キーは sk-ant-api03-%s" % ("Q1w2E3r4T5" * 4)},
                 {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo"}}])
+        L.assistant("長い返事 " + "ん" * 3000)
         self.w.subagent(self.w.write(L), "agent-a.jsonl", Lines().user("サブの指示").assistant())
         self.fake()
         self.w.page()
         calls = self.judged()
         self.assertEqual(len(calls), 1)
-        self.assertEqual(self.says_of(L, calls[0]), ["この CSV を整形して", "キーは [REDACTED:anthropic_key]"])
-        for word in ("AI の返事", "ツールの結果", "iVBOR", "サブの指示"):
+        says = self.says_of(L, calls[0])
+        self.assertEqual([w for w, _ in says], ["本人", "AI", "ツール", "本人", "AI"])
+        self.assertEqual(says[0], ("本人", "この CSV を整形して"))
+        self.assertEqual(says[1], ("AI", "AI の返事: 了解しました"))
+        self.assertTrue(says[2][1].startswith("ツールの結果: 山田 090-1234-5678"))
+        self.assertEqual(len(says[2][1]), agentlog.JUDGE_TOOL_MAX)
+        self.assertEqual(says[3], ("本人", "キーは [REDACTED:anthropic_key]"))
+        self.assertEqual(len(says[4][1]), agentlog.JUDGE_AI_MAX)
+        for word in ("AI の思考", "iVBOR", "サブの指示", "sk-ant-api03"):
             self.assertNotIn(word, calls[0]["stdin"])
         argv = calls[0]["argv"]
         self.assertEqual(argv[argv.index("--tools") + 1], "")       # ツールを持たない
@@ -138,13 +151,23 @@ class Judge(Base):
         self.w.write(L)
         self.fake(flag={"愚痴": "愚痴"})
         self.w.page()
-        says = self.says_of(L, self.judged()[0])
+        says = [t for _, t in self.says_of(L, self.judged()[0])]
         self.assertLessEqual(sum(len(x) for x in says), agentlog.JUDGE_CHARS)
-        self.assertTrue(says[0].startswith("先頭の指示") and says[-1].endswith("末尾の指示 愚痴"))
-        self.assertLess(len(says), 32)
+        self.assertTrue(says[0].startswith("先頭の指示") and says[-2].endswith("末尾の指示 愚痴"))
+        self.assertLess(len(says), 64)
         # quote は渡した位置（末尾）でなく、元の発言の位置から本人の発言そのものを抜く
         n = {it["session_id"]: it["n"] for it in self.w.pending()["items"]}[L.sid]
         self.assertEqual(self.flags()[n]["quote"], ("い" * 5000)[:agentlog.QUOTE_MAX - 1] + "…")
+
+    def test_a_quote_from_the_ai_side_says_so(self):
+        L = Lines().user("受信箱を読んで").assistant("届いたメール: 健康診断の再検査のお知らせ")
+        self.w.write(L)
+        self.fake(flag={"再検査": "健康・家族"})
+        self.w.page()
+        n = {it["session_id"]: it["n"] for it in self.w.pending()["items"]}[L.sid]
+        flag = self.flags()[n]
+        self.assertEqual((flag["reason"], flag["who"]), ("健康・家族", "AI"))
+        self.assertEqual(flag["quote"], "届いたメール: 健康診断の再検査のお知らせ")
 
     def test_shorten_says_keeps_positions(self):
         says = ["a" * 10, "b" * 10, "c" * 10, "d" * 10]
