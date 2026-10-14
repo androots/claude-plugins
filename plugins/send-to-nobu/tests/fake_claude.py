@@ -3,7 +3,7 @@
 """判定用の偽の claude -p（テストが SEND_TO_NOBU_CLAUDE で差し替える）。
 
 ふだんはすべて「ふつうの業務」。env の FAKE_JUDGE（JSON）で振る舞いを変える:
-  flag    {発言に含まれる語: 理由}  その語を含む会話を候補にする（quote はその語を含む最初の発言の位置）
+  flag    {やりとりに含まれる語: 理由}  その語を含む会話を候補にする（quote はその語を含む最初の位置）
   why     候補のひとこと（既定は理由と同じ語）
   quote   候補の quote をこの値にする（範囲外を試す）
   fail_on この語を含むバッチはエラーにする
@@ -29,9 +29,9 @@ if mode == "slow":
     time.sleep(3)
 results = []
 for c in json.loads(data):
-    hit = next(((w, r) for w, r in (conf.get("flag") or {}).items() if any(w in s for s in c["says"])), None)
+    hit = next(((w, r) for w, r in (conf.get("flag") or {}).items() if any(w in s["text"] for s in c["says"])), None)
     if hit:
-        q = next(i for i, s in enumerate(c["says"]) if hit[0] in s)
+        q = next(i for i, s in enumerate(c["says"]) if hit[0] in s["text"])
         results.append({"n": c["n"], "exclude": True, "reason": hit[1], "why": conf.get("why", hit[1]),
                         "quote": conf.get("quote", q)})
     else:

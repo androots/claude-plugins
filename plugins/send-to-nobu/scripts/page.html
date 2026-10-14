@@ -108,6 +108,7 @@ button:focus-visible, textarea:focus-visible, .rs:focus-visible { outline: 2px s
 .fr-b { display: grid; gap: 7px; min-width: 0; }
 .fr-why { display: flex; align-items: center; gap: 6px 10px; flex-wrap: wrap; }
 .quote { font-size: 13px; color: var(--ink-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding-left: 10px; border-left: 2px solid var(--line-2); line-height: 1.5; }
+.quote b { font-weight: 600; font-size: 11px; color: var(--ink-2); margin-right: 6px; }
 .fr-ti { font-size: 17px; font-weight: 700; line-height: 1.45; letter-spacing: .005em; }
 .fr .seg { grid-column: 2; grid-row: 1; }
 .seg { display: inline-flex; padding: 3px; gap: 2px; border-radius: 11px; background: var(--soft); box-shadow: inset 0 0 0 1px var(--line); }
@@ -299,7 +300,7 @@ button:focus-visible, textarea:focus-visible, .rs:focus-visible { outline: 2px s
       return {
         n: it.n, title: str(it.title) || "（タイトルなし）", project: str(it.project),
         t: parseT(it.start), minutes: Math.max(1, Math.round(num(it.minutes, 1))), turns: num(it.turns),
-        flag: f && JUDGE !== "failed" ? { reason: str(f.reason) || "注意", why: str(f.why), quote: str(f.quote) } : null,
+        flag: f && JUDGE !== "failed" ? { reason: str(f.reason) || "注意", why: str(f.why), quote: str(f.quote), who: str(f.who) } : null,
         // 既定で送らない（flag なしでも）: スクリプトが send:false を付けたとき
         defSend: it.send === false ? false : !(f && JUDGE !== "failed"),
       };
@@ -453,7 +454,7 @@ button:focus-visible, textarea:focus-visible, .rs:focus-visible { outline: 2px s
       h("div", { class: "fr-list" }, FLAGGED.map(i => h("article", { class: `fr${send[i.n] ? " s" : ""}` },
         h("div", { class: "fr-b" },
           h("div", { class: "fr-why" }, h("span", { class: "tag" }, i.flag.reason), i.flag.why ? h("span", { class: "ph" }, i.flag.why) : null),
-          i.flag.quote ? h("p", { class: "quote", title: i.flag.quote }, `「${i.flag.quote}」`) : null,
+          i.flag.quote ? h("p", { class: "quote", title: i.flag.quote }, i.flag.who === "AI" || i.flag.who === "ツール" ? h("b", null, i.flag.who === "AI" ? "AI の返事" : "ツールの結果") : null, `「${i.flag.quote}」`) : null,
           h("h3", { class: "fr-ti" }, i.title),
           h("p", { class: "meta" }, h("span", { class: "tn" }, itemTime(i)), sep(), dur(i.minutes), sep(), folder(i.project), sep(), "発言 ", h("span", { class: "tn" }, i.turns))),
         h("div", { class: "seg", role: "group", "aria-label": `${i.title} を送るかどうか` },

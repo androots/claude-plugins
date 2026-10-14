@@ -17,13 +17,13 @@ allowed-tools:
 
 1. Bash: `/usr/bin/python3 ${CLAUDE_PLUGIN_ROOT}/scripts/agentlog.py page --data-dir ${CLAUDE_PLUGIN_DATA}`
 2. 出力の `file` を Artifact で公開する。capabilities は `{"db": {}, "room": {}}`、icon は `send`。room 付きを断られたら `{"db": {}}` で公開し直す（ページが「この会話に『送って』と打つ」案内に切り替わる）
-3. 本人に、ページを作ったこと・決めたら「これで送る」を押すことを URL を添えて伝えて終わる
+3. 本人に、ページを作ったこと・決めたら「これで送る」を押すことを URL を添えて伝えて終わる。agent-log-inbox がまだ認証待ち（ログインしていない）なら、「押す前に /mcp で agent-log-inbox にログインしておいてね」も添える
 
 ページから「これで送る」の知らせが来た、または本人が送ってと言ったら、送る:
 
-1. ArtifactData で、この会話で公開したページの collection `send`・doc `decision` を、`out_dir` に `${CLAUDE_PLUGIN_DATA}/page` を付けて get する。無ければ「ページでまだ押されていない」と伝えて終わる
+1. ArtifactData で、この会話で公開したページの collection `send`・doc `decision` を、`out_dir` に自分のスクラッチパッド（無ければ書ける一時フォルダ。~/.claude の下は保存を断られる）を付けて get する。無ければ「ページでまだ押されていない」と伝えて終わる
 2. `mcp__plugin_send-to-nobu_agent-log-inbox__start_submission` を `{"tool": "claude-code"}` で呼び、`upload_code` と `api_base` を受け取る。使えなければ「/mcp で agent-log-inbox にログイン（会社の Google アカウント）してから、もう一度『送って』と言ってね」と伝えて終わる
-3. Bash: `/usr/bin/python3 ${CLAUDE_PLUGIN_ROOT}/scripts/agentlog.py send --data-dir ${CLAUDE_PLUGIN_DATA} --code <upload_code> --api-base <api_base>`
+3. Bash: `/usr/bin/python3 ${CLAUDE_PLUGIN_ROOT}/scripts/agentlog.py send --data-dir ${CLAUDE_PLUGIN_DATA} --answer-dir <1 の out_dir> --code <upload_code> --api-base <api_base>`
 4. 出力に `result_file` があれば、ArtifactData で同じページの `send`・`result` に `file_path` で set する（ページが受け取り票に変わる）。あとは出力の `next` に従う
 
 守ること:

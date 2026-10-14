@@ -3,7 +3,7 @@
 """send-to-nobu: Claude Code の会話ログを のぶろう に送る。
 
   nudge  SessionStart フック。未送信の会話があれば 1 日 1 回だけ 1 行知らせる
-  page   未送信の会話を集め、ツールを持たない claude -p に本人の発言を読ませて外す候補を付け、
+  page   未送信の会話を集め、ツールを持たない claude -p にやりとりを読ませて外す候補を付け、
          「今日のページ」（テンプレ page.html にデータを流し込んだ HTML）を書いて控えに残す
   send   ページの答え（db の send/decision を AI がファイルに保存したもの）を読み、
          外さなかった会話を一覧の時点の中身で送る
@@ -58,9 +58,9 @@ TEMPLATE = None               # テストだけが差し替える（ふだんは
 END = "say をそのまま本人に伝えて終わる"
 NEXT_PAGE = ("file を Artifact で公開する（capabilities は {\"db\":{},\"room\":{}}。room が断られたら {\"db\":{}}）。"
              "中身を本文に書き写さない。本人がページで「これで送る」を押したら、ArtifactData で send/decision を "
-             "out_dir=%s 付きで get し、send を実行する")
-NEXT_GET = ("ArtifactData で send/decision を out_dir=%s 付きで get し直して send をもう一度。"
-            "get で見つからなければ say を伝えて終わる")
+             "out_dir（自分のスクラッチパッド。~/.claude の下は不可）付きで get し、send に --answer-dir で同じ場所を渡す")
+NEXT_GET = ("ArtifactData で send/decision を out_dir（自分のスクラッチパッド）付きで get し直し、"
+            "send に --answer-dir で同じ場所を渡してもう一度。get で見つからなければ say を伝えて終わる")
 NEXT_RESULT = "ArtifactData で send/result に result_file を file_path で set してから say を伝える"
 NEXT_NEW_CODE = "start_submission をもう一度呼び、新しい upload_code で send をもう一度実行する（本人には聞き直さない）"
 AGAIN = "もう一度 /send-to-nobu と打ってね"
@@ -714,13 +714,15 @@ def cmd_nudge(args, out):
 
 JUDGE_ENV = "SEND_TO_NOBU_JUDGE"      # 判定用の claude -p に付ける（その中の SessionStart フックで nudge が黙る）
 JUDGE_BIN_ENV = "SEND_TO_NOBU_CLAUDE"  # 使う claude の場所（テストが偽物に差し替える）
-JUDGE_BATCH = 10              # 1 回の判定に入れる会話の数
-JUDGE_WORKERS = 4
+JUDGE_BATCH = 5               # 1 回の判定に入れる会話の数
+JUDGE_WORKERS = 6
 JUDGE_CALL_TIMEOUT = 120.0
 JUDGE_BUDGET = 90.0           # 判定全体の上限（スキルの Bash は 2 分で切れる）。過ぎた分は確認できなかった扱い
-JUDGE_CHARS = 6000            # 会話 1 本から渡す本人の発言の上限（超えたら先頭と末尾の発言を残す）
+JUDGE_CHARS = 12000           # 会話 1 本から渡すやりとりの上限（超えたら先頭と末尾を残す）
+JUDGE_AI_MAX = 1500           # AI の返事 1 つから渡す字数
+JUDGE_TOOL_MAX = 400          # ツールの結果 1 つから渡す字数（先頭だけ）
 WHY_MAX = 20                  # 判定の AI のひとこと
-QUOTE_MAX = 80                # ページに出す本人の発言
+QUOTE_MAX = 80                # ページに出す、引っかかった発言
 # 理由は決まった語から選ばせる
 JUDGE_REASONS = ("私的な話", "愚痴", "人事・評価", "人への不満", "健康・家族", "個人のお金", "他人の個人情報")
 JUDGE_OK = "ふつうの業務"
@@ -733,9 +735,9 @@ JUDGE_SCHEMA = {
                        "why": {"type": "string", "maxLength": WHY_MAX}, "quote": {"type": "integer"}}}}}}
 JUDGE_SYSTEM = """あなたは仕分け係。ある社員が、自分と Claude Code（AI）との会話のログを、社内の AI 推進担当の同僚「のぶろう」に送ろうとしている。送る前に、のぶろうに読まれたら本人が気まずい会話を「外す候補」として挙げる。最後に決めるのは本人なので、見落とすより挙げる方がいい。ただ、挙げすぎると本人は毎朝すべてに目を通すことになる。
 
-入力は JSON の配列。1 要素が会話 1 本で、n は会話の番号、says はその会話で本人が打った発言の配列（AI の返事やツールの結果は入っていない）。長い会話は途中を省いてある。
+入力は JSON の配列。1 要素が会話 1 本で、n は会話の番号、says はその会話のやりとりの配列。who が「本人」なら本人が打った発言、「AI」なら AI の返事、「ツール」なら AI が読んだファイル・メールなどの中身（先頭だけ）。送られるのはこのやりとり全部なので、本人の発言だけでなく全部を読んで判定する。長い会話は途中を省いてある。
 
-候補にするのは、下の話題が会話の中心のとき。つまり、本人が相談している・頼んでいる中身そのものがそれのとき。業務の中で一言触れただけのもの、仕事として扱っているもの（採用面接の質問づくり、顧客対応の文面など）は、読まれても気まずくないので候補にしない。
+候補にするのは、下の話題が会話の中心のとき。つまり、本人が相談している・頼んでいる中身や、やりとりで扱っている中身そのものがそれのとき。業務の中で一言触れただけのもの、仕事として扱っているもの（採用面接の質問づくり、顧客対応の文面など）は、読まれても気まずくないので候補にしない。
 - 私的な話 / 愚痴 / 人事・評価（自分や特定の人の） / 人への不満 / 健康・家族 / 個人のお金
 - 他人の個人情報: 顧客や第三者の氏名と連絡先・住所・個人の事情を、データとして直接扱っている会話
 コード・ツール・AI へのぼやき（「このコードひどい」「疲れた」）は、作業の一部なので候補にしない。
@@ -758,16 +760,36 @@ def claude_path():
     return None
 
 
+def _cap(text, limit):
+    """キー類を伏せてから limit 字に切る（巨大な結果は先に粗く切ってから伏せる）。"""
+    t = mask_text(text[:limit + 8000])[0].strip()
+    return t if len(t) <= limit else t[:limit - 1] + "…"
+
+
 def judge_says(path, limit):
-    """会話の先頭 limit バイト（一覧の時点）の、本人の発言の並び（キー類は伏せる）。
-    ツールの結果・画像・PDF・AI の発言・サブエージェントは入れない。"""
+    """会話の先頭 limit バイト（一覧の時点）のやりとり [(誰, 文)]（キー類は伏せる）。
+    誰は 本人・AI・ツール。AI の返事とツールの結果は長ければ切る。画像・PDF・AI の思考・サブエージェントは入れない。"""
     says = []
     with open(path, "rb") as fh:
         for raw in _lines_upto(fh, limit):
             d = parse_line(raw)
-            kind, text = classify(d) if d is not None else (None, None)
+            if d is None or d.get("isSidechain") is True:
+                continue
+            kind, text = classify(d)
+            msg = d.get("message") if isinstance(d.get("message"), dict) else {}
             if kind == "human":
-                says.append(mask_text(display_text(text))[0])
+                says.append(("本人", mask_text(display_text(text))[0]))
+            elif d.get("type") == "assistant":
+                t = _texts(msg.get("content"))
+                if t and t.strip():
+                    says.append(("AI", _cap(t, JUDGE_AI_MAX)))
+            elif d.get("type") == "user" and isinstance(msg.get("content"), list):
+                for b in msg["content"]:
+                    if isinstance(b, dict) and b.get("type") == "tool_result":
+                        c = b.get("content")
+                        t = c if isinstance(c, str) else _texts(c)
+                        if t and t.strip():
+                            says.append(("ツール", _cap(t, JUDGE_TOOL_MAX)))
     return says
 
 
@@ -794,11 +816,12 @@ def shorten_says(says, limit):
 
 
 def judge_batch(batch, deadline):
-    """1 バッチ [(n, 発言の並び)] を claude -p に判定させる。{n: (理由, ひとこと, 位置) か None}。読めない結果は例外。"""
+    """1 バッチ [(n, [(誰, 文)])] を claude -p に判定させる。{n: (理由, ひとこと, 位置) か None}。読めない結果は例外。"""
     exe, timeout = claude_path(), min(JUDGE_CALL_TIMEOUT, deadline - time.time())
     if not exe or timeout <= 0:
         raise RuntimeError("no claude or no time")
-    payload = json.dumps([{"n": n, "says": says} for n, says in batch], ensure_ascii=False)
+    payload = json.dumps([{"n": n, "says": [{"who": w, "text": t} for w, t in says]} for n, says in batch],
+                         ensure_ascii=False)
     tmp = tempfile.mkdtemp(prefix="send-to-nobu-judge-")    # 作業場所の CLAUDE.md などを読ませない
     try:
         # --safe-mode: CLAUDE.md・フック・プラグイン・MCP を読まない（ログインはそのまま効く）
@@ -829,7 +852,7 @@ def judge_batch(batch, deadline):
 
 
 def judge(items, paths):
-    """一覧の会話を判定し、候補なら it["flag"] = {reason, why, quote} を入れる。
+    """一覧の会話を判定し、候補なら it["flag"] = {reason, why, quote, who} を入れる。
     確認できなかった件数を返す（失敗しても止めない）。"""
     says = {}
     for it in items:
@@ -837,8 +860,8 @@ def judge(items, paths):
             says[it["n"]] = judge_says(paths[it["session_id"]], it["offset"])
         except OSError:
             says[it["n"]] = []
-    shown = {n: shorten_says(x, JUDGE_CHARS) for n, x in says.items()}
-    pairs = [(it["n"], shown[it["n"]][0]) for it in items]
+    shown = {n: shorten_says([t for _, t in x], JUDGE_CHARS) for n, x in says.items()}
+    pairs = [(n, [(says[n][i][0], t) for t, i in zip(*shown[n])]) for n in (it["n"] for it in items)]
     batches = [pairs[i:i + JUDGE_BATCH] for i in range(0, len(pairs), JUDGE_BATCH)]
     deadline, flags, failed = time.time() + JUDGE_BUDGET, {}, 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=JUDGE_WORKERS) as ex:
@@ -854,8 +877,9 @@ def judge(items, paths):
             continue
         reason, why, q = got
         where = shown[it["n"]][1]       # 渡した位置 → 元の発言の位置
+        who, text = says[it["n"]][where[q]] if 0 <= q < len(where) else ("", "")
         it["flag"] = {"reason": reason, "why": re.sub(r"\s+", " ", mask_text(why)[0]).strip()[:WHY_MAX],
-                      "quote": squash(says[it["n"]][where[q]], QUOTE_MAX) if 0 <= q < len(where) else ""}
+                      "quote": squash(text, QUOTE_MAX), "who": who}
     return failed
 
 
@@ -891,13 +915,13 @@ def page_dir(data_dir):
     return os.path.join(data_dir, "page")
 
 
-def decision_path(data_dir):
-    """ページの答え。AI が ArtifactData の get に out_dir=<data-dir>/page を渡すと、ここに保存される。"""
-    return os.path.join(page_dir(data_dir), "send", "decision.json")
+def decision_path(answer_dir):
+    """ページの答え。AI が ArtifactData の get に out_dir=<answer_dir> を渡すと、ここに保存される。"""
+    return os.path.join(answer_dir, "send", "decision.json")
 
 
-def result_path(data_dir):
-    return os.path.join(page_dir(data_dir), "result.json")
+def result_path(answer_dir):
+    return os.path.join(answer_dir, "result.json")
 
 
 def template_path():
@@ -938,8 +962,8 @@ def clear_page(data_dir):
     for name in names:
         if name.startswith("send-to-nobu-") and name.endswith(".html"):
             remove_quietly(os.path.join(d, name))
-    remove_quietly(decision_path(data_dir))
-    remove_quietly(result_path(data_dir))
+    remove_quietly(decision_path(d))
+    remove_quietly(result_path(d))
 
 
 def cmd_page(args, out):
@@ -991,7 +1015,7 @@ def cmd_page(args, out):
     write_json(pending_path(data_dir), {LIST_MARKER: 1, "v": PENDING_V, "session": sid, "created": now,
                                         "round": round_id, "items": items, "more": more})
     emit(out, **{LIST_MARKER: 1, "count": len(items), "file": os.path.abspath(path), "round": round_id,
-                 "next": NEXT_PAGE % os.path.abspath(page_dir(data_dir))})
+                 "next": NEXT_PAGE})
     return 0
 
 
@@ -1185,12 +1209,12 @@ def result_say(sent, excluded, note, more):
     return say + ("。ほかに %d 件ある。続けるなら %s" % (more, AGAIN) if more else "")
 
 
-def read_decision(data_dir, pending):
+def read_decision(answer_dir, pending):
     """ページの答え → (外す番号, 感想)。無い・前の回の答え・形が違うときは送らずに止まる。"""
-    d = read_json(decision_path(data_dir), None)
+    d = read_json(decision_path(answer_dir), None)
     if not isinstance(d, dict):
         raise Stop("ページの「これで送る」がまだ押されていない。押してから、この会話に「送って」と打ってね",
-                   next=NEXT_GET % os.path.abspath(page_dir(data_dir)))
+                   next=NEXT_GET)
     if d.get("round") != pending.get("round"):
         raise Stop("前のページの答えだった。何も送っていない。いちばん新しいページで「これで送る」を押してね")
     exclude, note, ns = d.get("exclude"), d.get("note"), {it["n"] for it in pending["items"]}
@@ -1207,7 +1231,8 @@ def cmd_send(args, out, stdin):
     pending = read_json(pending_path(data_dir), None)
     if not isinstance(pending, dict) or pending.get("v") != PENDING_V or pending.get("session") != sid:
         raise Stop("一覧が見つからない。%s" % AGAIN)
-    exclude, note = read_decision(data_dir, pending)
+    answer_dir = os.path.abspath(os.path.expanduser(args.answer_dir)) if args.answer_dir else page_dir(data_dir)
+    exclude, note = read_decision(answer_dir, pending)
     note = mask_text(note.strip())[0][:NOTE_MAX]
     items = pending["items"]
     excluded = [it for it in items if it["n"] in exclude]
@@ -1231,12 +1256,12 @@ def cmd_send(args, out, stdin):
             shutil.rmtree(tmp, ignore_errors=True)
     record(data_dir, now, to_send, excluded)
     remove_quietly(pending_path(data_dir))
-    remove_quietly(decision_path(data_dir))
+    remove_quietly(decision_path(answer_dir))
     result = {"round": pending["round"], "sent": len(to_send), "excluded": len(excluded), "note": bool(note),
               "at": iso_local(now)}
-    write_json(result_path(data_dir), result)   # AI は数を書き写さず、このファイルを db に置く
+    write_json(result_path(answer_dir), result)   # AI は数を書き写さず、このファイルを db に置く
     emit(out, say=result_say(len(to_send), len(excluded), note, pending.get("more")), sent=len(to_send),
-         excluded=len(excluded), result=result, result_file=os.path.abspath(result_path(data_dir)), next=NEXT_RESULT)
+         excluded=len(excluded), result=result, result_file=result_path(answer_dir), next=NEXT_RESULT)
     return 0
 
 
@@ -1260,6 +1285,7 @@ def main(argv=None, stdin=None, stdout=None):
         if name == "send":
             sp.add_argument("--code")
             sp.add_argument("--api-base")
+            sp.add_argument("--answer-dir", help="ArtifactData の get に渡した out_dir（無ければ <data-dir>/page）")
             sp.add_argument("--assistant-note", help="AI のメモ（- なら標準入力から）")
     try:
         args = p.parse_args(argv)
