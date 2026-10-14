@@ -1,0 +1,729 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>send-to-nobu 今日のページ</title>
+<!-- send-to-nobu「今日のページ」のテンプレ。agentlog.py page が下の stn-data にデータ（JSON）を流し込む。
+     db（コレクション send）: decision = ページが書く答え / result = 会話の AI が書く結果（来たら受け取り票）
+     room: 「これで送る」のクリックの中で sendToClaudeSession を呼び、横の会話にターンを起こす -->
+<style>
+:root {
+  color-scheme: light;
+  --bg: #FAF8F4; --paper: #FFFFFF; --soft: #F3EFE8; --soft-2: #EEE9E0;
+  --ink: #1F1D1A; --ink-2: #57514A; --ink-3: #8A8378; --ink-4: #B3AC9F;
+  --line: #E6E1D8; --line-2: #D5CDBF;
+  --warn: #B86E00; --warn-bar: #C9830F; --warn-bg: #FFF3DD; --warn-line: #F0D6A6;
+  --go: #1D5F57; --go-2: #2B7569; --go-ink: #1D5F57; --go-bg: #E7F1EE; --go-line: #B7D5CD;
+  --on-go: #FFFFFF;
+  --sh: 31, 29, 26;
+  --hatch: repeating-linear-gradient(135deg, rgba(31, 29, 26, .14) 0 1.2px, transparent 1.2px 5px);
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --sans: "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Noto Sans JP", system-ui, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #171614; --paper: #211F1C; --soft: #2A2723; --soft-2: #322F2A;
+    --ink: #ECE7DE; --ink-2: #BEB7AB; --ink-3: #8F887C; --ink-4: #615B52;
+    --line: #302D29; --line-2: #45413A;
+    --warn: #E8A944; --warn-bar: #D99528; --warn-bg: #3A2A10; --warn-line: #5E4418;
+    --go: #2F8173; --go-2: #379183; --go-ink: #74C7B7; --go-bg: #15302B; --go-line: #2A5A51;
+    --sh: 0, 0, 0;
+    --hatch: repeating-linear-gradient(135deg, rgba(236, 231, 222, .2) 0 1.2px, transparent 1.2px 5px);
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #171614; --paper: #211F1C; --soft: #2A2723; --soft-2: #322F2A;
+  --ink: #ECE7DE; --ink-2: #BEB7AB; --ink-3: #8F887C; --ink-4: #615B52;
+  --line: #302D29; --line-2: #45413A;
+  --warn: #E8A944; --warn-bar: #D99528; --warn-bg: #3A2A10; --warn-line: #5E4418;
+  --go: #2F8173; --go-2: #379183; --go-ink: #74C7B7; --go-bg: #15302B; --go-line: #2A5A51;
+  --sh: 0, 0, 0;
+  --hatch: repeating-linear-gradient(135deg, rgba(236, 231, 222, .2) 0 1.2px, transparent 1.2px 5px);
+}
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0; min-height: 100vh; background: var(--bg); color: var(--ink);
+  font-family: var(--sans); font-size: 15px; line-height: 1.6;
+  -webkit-font-smoothing: antialiased; overflow-wrap: anywhere;
+}
+* { box-sizing: border-box; }
+h1, h2, h3, p, ul, blockquote { margin: 0; padding: 0; }
+ul { list-style: none; }
+button, textarea { font: inherit; color: inherit; }
+button { cursor: pointer; background: none; border: 0; padding: 0; text-align: inherit; }
+button:focus-visible, textarea:focus-visible, .rs:focus-visible { outline: 2px solid var(--go-ink); outline-offset: 2px; }
+[hidden] { display: none !important; }
+.tn { font-variant-numeric: tabular-nums; }
+.wrap { max-width: 800px; margin: 0 auto; padding: 0 32px; }
+.mono { font-family: var(--mono); font-size: .92em; letter-spacing: -.01em; }
+
+/* ── 共通の部品 ── */
+.tag { display: inline-flex; align-items: center; gap: 5px; height: 22px; padding: 0 9px 0 7px; border-radius: 6px; background: var(--warn-bg); color: var(--warn); border: 1px solid var(--warn-line); font-size: 12px; font-weight: 700; letter-spacing: .02em; white-space: nowrap; }
+.tag::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.ph { color: var(--ink-2); font-size: 13px; }
+.meta { color: var(--ink-3); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+.meta .sep { margin: 0 6px; color: var(--ink-4); }
+.sh { display: flex; align-items: baseline; gap: 4px 12px; flex-wrap: wrap; margin-bottom: 14px; }
+.sh h2 { font-size: 16px; font-weight: 700; letter-spacing: .01em; }
+.sh p { color: var(--ink-3); font-size: 13px; }
+.eyebrow { display: flex; align-items: center; gap: 8px; color: var(--ink-3); font-size: 12px; font-weight: 600; letter-spacing: .06em; margin-bottom: 12px; }
+.eyebrow .mk { width: 18px; height: 18px; border-radius: 5px; background: var(--go); position: relative; flex: none; }
+.eyebrow .mk::after { content: ""; position: absolute; left: 5px; top: 5px; width: 8px; height: 8px; border-top: 2px solid var(--on-go); border-right: 2px solid var(--on-go); transform: rotate(45deg) translate(-1px, 1px); }
+
+/* ── 頭 ── */
+#top { padding-top: 36px; padding-bottom: 26px; }
+.head { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 20px 32px; align-items: end; }
+#top h1 { font-size: 27px; line-height: 1.42; font-weight: 700; letter-spacing: .005em; }
+#top h1 em { font-style: normal; color: var(--warn); background: linear-gradient(transparent 62%, var(--warn-bg) 62%); padding: 0 2px; }
+#top h1 em.ok { color: var(--go-ink); background: linear-gradient(transparent 62%, var(--go-bg) 62%); }
+#top h1 .rest-t { color: var(--ink-2); font-weight: 600; }
+.period { margin-top: 8px; color: var(--ink-3); font-size: 13px; }
+.top-r { display: grid; gap: 10px; justify-items: end; }
+/* 目盛り: 会話 1 本 = 1 本、時刻順。緑 = 送る / 斜線 = 送らない / 下の琥珀 = 注意 */
+.tally { display: flex; flex-wrap: wrap; gap: 9px var(--tg, 4px); align-items: flex-end; justify-content: flex-end; max-width: 280px; padding-bottom: 7px; }
+.tk { width: var(--tw, 9px); height: 26px; border-radius: 3px; background: var(--go); position: relative; flex: none; }
+.tk.h { background: var(--paper) var(--hatch); box-shadow: inset 0 0 0 1px var(--line-2); }
+.tk.w::after { content: ""; position: absolute; left: max(0px, calc((var(--tw, 9px) - 6px) / 2)); right: max(0px, calc((var(--tw, 9px) - 6px) / 2)); bottom: -7px; height: 3px; border-radius: 2px; background: var(--warn-bar); }
+.counts { display: flex; gap: 16px; font-size: 13px; color: var(--ink-2); white-space: nowrap; }
+.counts b { font-size: 22px; font-weight: 700; margin-right: 4px; font-variant-numeric: tabular-nums; letter-spacing: -.01em; }
+.counts .cs b { color: var(--go-ink); }
+.counts .ch b { color: var(--ink-3); }
+.when { display: flex; align-items: center; gap: 10px; margin-top: 22px; padding: 11px 16px; border-radius: 10px; background: var(--paper); border: 1px solid var(--line); font-size: 13.5px; color: var(--ink-2); }
+.when svg { flex: none; color: var(--go-ink); }
+.when b { color: var(--ink); font-weight: 700; }
+.when.warn { background: var(--warn-bg); border-color: var(--warn-line); color: var(--ink); }
+.when.warn svg { color: var(--warn); }
+
+/* ── 決めること（注意の会話） ── */
+#flagged { padding-top: 4px; }
+#rest { padding-top: 36px; }
+.fr-list { display: grid; gap: 10px; }
+.fr { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px 22px; align-items: center; padding: 18px 20px 18px 24px; background: var(--paper); border: 1px solid var(--line); border-radius: 14px; position: relative; overflow: hidden; transition: border-color .2s; }
+.fr::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 4px; background: var(--warn-bar); transition: background .2s; }
+.fr.s::before { background: var(--go); }
+.fr.s { border-color: var(--go-line); }
+.fr-b { display: grid; gap: 7px; min-width: 0; }
+.fr-why { display: flex; align-items: center; gap: 6px 10px; flex-wrap: wrap; }
+.quote { font-size: 13px; color: var(--ink-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding-left: 10px; border-left: 2px solid var(--line-2); line-height: 1.5; }
+.fr-ti { font-size: 17px; font-weight: 700; line-height: 1.45; letter-spacing: .005em; }
+.fr .seg { grid-column: 2; grid-row: 1; }
+.seg { display: inline-flex; padding: 3px; gap: 2px; border-radius: 11px; background: var(--soft); box-shadow: inset 0 0 0 1px var(--line); }
+.seg button { height: 36px; padding: 0 15px; border-radius: 8px; font-size: 13.5px; font-weight: 700; color: var(--ink-3); display: inline-flex; align-items: center; gap: 7px; transition: background .15s, color .15s; white-space: nowrap; }
+.seg button:hover { color: var(--ink); }
+.seg button .sw-h { width: 12px; height: 12px; border-radius: 3px; background: var(--hatch); box-shadow: inset 0 0 0 1px var(--line-2); }
+.seg button[aria-pressed="true"].bh { background: var(--paper); color: var(--ink); box-shadow: 0 1px 2px rgba(var(--sh), .12), inset 0 0 0 1px var(--line-2); }
+.seg button[aria-pressed="true"].bs { background: var(--go); color: var(--on-go); box-shadow: 0 1px 2px rgba(29, 95, 87, .3); }
+.caveat { display: flex; align-items: flex-start; gap: 8px; margin: -4px 0 14px; font-size: 13px; color: var(--ink-2); }
+.caveat i { width: 7px; height: 7px; border-radius: 50%; background: var(--warn-bar); flex: none; margin-top: 7px; }
+
+/* 注意ゼロの日・判定できなかった日: 決めることの場所に大きな札 */
+.verdict { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 18px; align-items: center; padding: 22px 24px; border-radius: 16px; background: var(--go-bg); border: 1px solid var(--go-line); }
+.verdict .vk { grid-row: span 2; display: grid; place-items: center; width: 56px; height: 56px; border-radius: 50%; background: var(--go); color: var(--on-go); box-shadow: 0 0 0 6px rgba(255, 255, 255, .5); }
+.verdict .vh { font-size: 24px; font-weight: 800; line-height: 1.3; letter-spacing: .02em; color: var(--go-ink); align-self: end; }
+.verdict .vs { font-size: 13.5px; color: var(--ink-2); align-self: start; }
+.verdict .vs b { color: var(--ink); font-variant-numeric: tabular-nums; }
+.verdict .vc { grid-column: 2; display: flex; align-items: flex-start; gap: 8px; margin-top: 6px; font-size: 13px; color: var(--ink); }
+.verdict .vc i { width: 7px; height: 7px; border-radius: 50%; background: var(--warn-bar); flex: none; margin-top: 7px; }
+.verdict.fail { background: var(--warn-bg); border-color: var(--warn-line); }
+.verdict.fail .vk { background: var(--warn-bar); font-size: 28px; font-weight: 800; line-height: 1; }
+.verdict.fail .vh { color: var(--warn); font-size: 21px; }
+:root[data-theme="dark"] .verdict .vk { box-shadow: 0 0 0 6px rgba(0, 0, 0, .25); }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .verdict .vk { box-shadow: 0 0 0 6px rgba(0, 0, 0, .25); } }
+
+/* ── ふつうの業務 ── */
+.rs-list { background: var(--paper); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
+.rs { display: grid; grid-template-columns: 44px minmax(0, 1fr) auto 44px; gap: 14px; align-items: center; min-height: 46px; padding: 0 16px 0 18px; border-top: 1px solid var(--line); cursor: pointer; }
+.rs:first-child, .day + .rs { border-top: 0; }
+.rs .t { color: var(--ink-3); font-size: 13px; font-variant-numeric: tabular-nums; }
+.rs .ti { font-size: 14.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rs .fo { color: var(--ink-3); font-size: 12px; white-space: nowrap; max-width: 160px; overflow: hidden; text-overflow: ellipsis; }
+.rs.h .ti { color: var(--ink-3); text-decoration: line-through; text-decoration-color: var(--ink-4); }
+.rs.h .fo::before { content: "送らない"; font-family: var(--sans); font-weight: 700; color: var(--ink-2); margin-right: 10px; font-size: 11.5px; }
+.day { padding: 7px 18px 5px; font-size: 11.5px; font-weight: 700; letter-spacing: .06em; color: var(--ink-3); background: var(--soft); border-top: 1px solid var(--line); }
+.day:first-child { border-top: 0; }
+.sw { justify-self: end; width: 38px; height: 22px; border-radius: 999px; background: var(--go); position: relative; transition: background .18s; }
+.sw::after { content: ""; position: absolute; top: 3px; left: 19px; width: 16px; height: 16px; border-radius: 50%; background: #fff; box-shadow: 0 1px 2px rgba(0, 0, 0, .2); transition: left .18s; }
+.sw[aria-checked="false"] { background: var(--line-2); }
+.sw[aria-checked="false"]::after { left: 3px; }
+.more { margin-top: 10px; font-size: 12.5px; color: var(--ink-3); }
+.page[data-calm] .rs { min-height: 40px; }
+.page[data-calm] #rest { padding-top: 24px; }
+
+/* ── 感想と送る ── */
+#send { padding-top: 32px; padding-bottom: 56px; }
+.send-box { background: var(--paper); border: 1px solid var(--line); border-radius: 14px; padding: 20px 22px 16px; display: grid; gap: 12px; }
+.send-box label { font-size: 13px; font-weight: 700; color: var(--ink-2); }
+.send-box label span { font-weight: 500; color: var(--ink-3); margin-left: 6px; }
+.send-box textarea { width: 100%; min-height: 80px; resize: vertical; padding: 12px 14px; border-radius: 10px; border: 1px solid var(--line-2); background: var(--bg); line-height: 1.6; font-size: 14.5px; }
+.page[data-calm] .send-box textarea { min-height: 56px; }
+.send-box textarea::placeholder { color: var(--ink-4); }
+.send-row { display: flex; align-items: center; justify-content: space-between; gap: 20px; }
+.send-note { font-size: 13px; color: var(--ink-3); line-height: 1.55; }
+.send-note b { color: var(--ink); font-variant-numeric: tabular-nums; }
+.send-note .st { display: block; color: var(--ink-2); }
+.send-note .dirty { color: var(--warn); font-weight: 700; }
+.go { flex: none; display: inline-flex; align-items: center; justify-content: center; gap: 10px; height: 50px; padding: 0 26px; border-radius: 12px; background: var(--go); color: var(--on-go); font-size: 15.5px; font-weight: 700; letter-spacing: .03em; box-shadow: 0 1px 0 rgba(0, 0, 0, .06), 0 6px 16px -8px rgba(29, 95, 87, .7); transition: background .15s, opacity .15s; }
+.go:hover { background: var(--go-2); }
+.go .gc { font-size: 12px; font-weight: 600; padding: 2px 8px; border-radius: 999px; background: rgba(255, 255, 255, .16); font-variant-numeric: tabular-nums; }
+.go[disabled] { cursor: default; background: var(--go-2); }
+.go.off { background: var(--line-2); color: var(--ink-3); box-shadow: none; }
+.spin { width: 16px; height: 16px; border-radius: 50%; border: 2px solid rgba(255, 255, 255, .35); border-top-color: #fff; animation: spin .7s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* 会話で打つ案内 */
+.guide { display: grid; gap: 12px; padding: 16px 18px; border-radius: 12px; background: var(--soft); }
+.guide .g1 { font-size: 14px; color: var(--ink); line-height: 1.6; }
+.guide .g1 b { font-weight: 700; }
+.say { display: flex; align-items: center; gap: 12px; padding: 10px 10px 10px 20px; border-radius: 12px; background: var(--paper); border: 1.5px dashed var(--go-ink); }
+.say-t { flex: 1; font-size: 28px; font-weight: 700; letter-spacing: .04em; color: var(--ink); user-select: all; -webkit-user-select: all; }
+.copy { flex: none; height: 38px; padding: 0 16px; border-radius: 9px; background: var(--go); color: var(--on-go); font-size: 13px; font-weight: 700; white-space: nowrap; }
+.copy.ok { background: var(--go-bg); color: var(--go-ink); }
+.guide .g2 { display: flex; align-items: flex-start; gap: 8px; font-size: 12.5px; color: var(--ink-3); }
+.guide .g2 i { width: 7px; height: 7px; border-radius: 50%; background: var(--warn-bar); flex: none; margin-top: 6px; }
+.guide.small { padding: 12px 14px; gap: 8px; }
+.guide.small .g1 { font-size: 13px; color: var(--ink-2); }
+.guide.small .say-t { font-size: 20px; }
+.guide.small .say { padding: 6px 6px 6px 16px; }
+.guide.small .copy { height: 32px; }
+.err { font-size: 13px; color: var(--warn); font-weight: 700; }
+
+/* ── 受け取り票 ── */
+#receipt { padding-top: 8px; padding-bottom: 56px; }
+.receipt { max-width: 480px; margin: 0 auto; background: var(--paper); border-radius: 18px; box-shadow: 0 1px 0 rgba(var(--sh), .04), 0 18px 40px -22px rgba(var(--sh), .35); position: relative; }
+.rc-top { display: grid; justify-items: center; gap: 6px; padding: 30px 28px 22px; text-align: center; }
+.rc-ck { display: grid; place-items: center; width: 56px; height: 56px; border-radius: 50%; background: var(--go); color: var(--on-go); margin-bottom: 6px; box-shadow: 0 0 0 8px var(--go-bg); }
+.rc-k { font-size: 24px; font-weight: 700; letter-spacing: .04em; }
+.rc-when { font-size: 12.5px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+.rc-cut { position: relative; height: 22px; }
+.rc-cut::before, .rc-cut::after { content: ""; position: absolute; top: 0; width: 22px; height: 22px; border-radius: 50%; background: var(--bg); }
+.rc-cut::before { left: -11px; } .rc-cut::after { right: -11px; }
+.rc-cut i { position: absolute; left: 20px; right: 20px; top: 50%; border-top: 1.5px dashed var(--line-2); }
+.rc-nums { display: grid; grid-template-columns: 1fr 1fr; padding: 10px 28px 4px; }
+.rc-nums > div { display: grid; gap: 2px; justify-items: center; }
+.rc-nums > div + div { border-left: 1px solid var(--line); }
+.rc-nums b { font-size: 40px; font-weight: 700; line-height: 1.1; letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
+.rc-nums .s b { color: var(--go-ink); }
+.rc-nums .h b { color: var(--ink-3); }
+.rc-nums span { font-size: 12.5px; color: var(--ink-2); }
+.rc-nums p em { font-style: normal; font-size: 14px; font-weight: 700; margin-left: 3px; color: var(--ink-2); }
+.rc-viz { display: flex; justify-content: center; padding: 16px 28px 6px; }
+.rc-viz .tally { justify-content: center; max-width: 360px; }
+.rc-sec { padding: 14px 28px 0; }
+.rc-l { font-size: 11.5px; font-weight: 700; letter-spacing: .08em; color: var(--ink-3); margin-bottom: 6px; }
+.rc-hold li { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 10px; font-size: 13px; color: var(--ink-2); line-height: 1.75; }
+.rc-hold li .t { color: var(--ink-4); font-variant-numeric: tabular-nums; min-width: 32px; }
+.rc-hold li .ti { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rc-note blockquote { font-size: 14px; line-height: 1.7; color: var(--ink); padding: 10px 14px; border-radius: 10px; background: var(--bg); white-space: pre-wrap; }
+.rc-note blockquote.empty { color: var(--ink-4); }
+.rc-next { display: flex; align-items: center; justify-content: center; gap: 8px; padding: 2px 28px 24px; font-size: 13px; color: var(--ink-2); }
+.rc-next svg { color: var(--go-ink); flex: none; }
+
+/* ── 幅 ── */
+@media (max-width: 680px) {
+  .wrap { padding: 0 24px; }
+  .head { grid-template-columns: 1fr; gap: 16px; }
+  .top-r { justify-items: start; grid-template-columns: auto 1fr; align-items: end; gap: 0 18px; }
+  .tally { justify-content: flex-start; }
+}
+@media (max-width: 520px) {
+  .wrap { padding: 0 16px; }
+  #top { padding-top: 26px; padding-bottom: 20px; }
+  #top h1 { font-size: 22px; }
+  .top-r { grid-template-columns: 1fr; gap: 8px; }
+  .when { font-size: 13px; align-items: flex-start; padding: 10px 12px; margin-top: 16px; }
+  .when svg { margin-top: 2px; }
+  .fr { grid-template-columns: 1fr; padding: 16px 16px 16px 20px; gap: 8px; }
+  .fr .seg { grid-column: 1; grid-row: auto; justify-self: start; margin-top: 4px; }
+  .fr-ti { font-size: 16px; }
+  .verdict { padding: 18px 18px; gap: 4px 14px; }
+  .verdict .vk { width: 48px; height: 48px; }
+  .verdict .vh { font-size: 20px; }
+  .verdict.fail .vh { font-size: 18px; }
+  .rs { grid-template-columns: 40px minmax(0, 1fr) 44px; gap: 10px; padding: 8px 12px 8px 14px; }
+  .rs .fo { display: none; }
+  .rs .ti { white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; font-size: 14px; line-height: 1.45; }
+  .day { padding-left: 14px; }
+  .send-row { flex-direction: column; align-items: stretch; }
+  .send-box { padding: 16px 16px 12px; }
+  #send, #receipt { padding-bottom: 40px; }
+  .say { padding-left: 14px; }
+  .say-t { font-size: 24px; }
+  .rc-top { padding: 26px 20px 18px; }
+  .rc-nums, .rc-sec, .rc-viz { padding-left: 20px; padding-right: 20px; }
+  .rc-nums b { font-size: 34px; }
+  .rc-next { padding: 2px 16px 22px; font-size: 12.5px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { transition: none !important; animation-duration: 0s !important; }
+}
+</style>
+</head>
+<body>
+<div id="app" class="page" data-st="idle">
+  <section id="top" class="wrap"></section>
+  <div class="body wrap">
+    <section id="flagged"></section>
+    <section id="rest"></section>
+  </div>
+  <section id="send" class="wrap"></section>
+  <section id="receipt" class="wrap" hidden></section>
+</div>
+<script type="application/json" id="stn-data">__STN_DATA__</script>
+<script>
+(() => {
+  "use strict";
+  const $ = id => document.getElementById(id);
+  const APP = $("app");
+
+  // ── データ（会話由来の文字は全部 textContent で入れる） ──
+  let DATA = null;
+  try { DATA = JSON.parse($("stn-data").textContent); } catch (_) { DATA = null; }
+  if (!DATA || typeof DATA !== "object" || !Array.isArray(DATA.items)) {
+    APP.textContent = "";
+    APP.append(h("p", { class: "wrap", style: "padding-top:40px;color:var(--ink-3)" }, "このページにはデータが入っていない。/send-to-nobu をもう一度回してね"));
+    return;
+  }
+  const str = v => (typeof v === "string" ? v : "");
+  const num = (v, d = 0) => (typeof v === "number" && isFinite(v) ? v : d);
+  const ROUND = str(DATA.round);
+  const JUDGE = DATA.judge === "failed" || DATA.judge === "partial" ? DATA.judge : "ok";
+  const FAILED = Math.max(0, num(DATA.failed));
+  const MORE = Math.max(0, num(DATA.more));
+  const ITEMS = DATA.items
+    .filter(it => it && typeof it.n === "number")
+    .map(it => {
+      const f = it.flag && typeof it.flag === "object" ? it.flag : null;
+      return {
+        n: it.n, title: str(it.title) || "（タイトルなし）", project: str(it.project),
+        t: parseT(it.start), minutes: Math.max(1, Math.round(num(it.minutes, 1))), turns: num(it.turns),
+        flag: f && JUDGE !== "failed" ? { reason: str(f.reason) || "注意", why: str(f.why), quote: str(f.quote) } : null,
+        // 既定で送らない（flag なしでも）: スクリプトが send:false を付けたとき
+        defSend: it.send === false ? false : !(f && JUDGE !== "failed"),
+      };
+    })
+    .sort((a, b) => (a.t ? a.t.ms : 0) - (b.t ? b.t.ms : 0) || a.n - b.n);
+  const FLAGGED = ITEMS.filter(i => i.flag);
+  const NORMAL = ITEMS.filter(i => !i.flag);
+  const isFlag = i => !!i.flag;
+  const MULTI_DAY = new Set(ITEMS.filter(i => i.t).map(i => i.t.key)).size > 1;
+
+  // ── 時刻（オフセット付きの ISO はその壁時計の時刻で、それ以外は端末の時刻で） ──
+  function parseT(s) {
+    if (typeof s !== "string") return null;
+    const m = s.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/);
+    let y, mo, d, hh, mi;
+    if (m && /[+-]\d{2}:?\d{2}$/.test(s)) { [y, mo, d, hh, mi] = m.slice(1).map(Number); }
+    else {
+      const dt = new Date(s); if (isNaN(dt)) return null;
+      y = dt.getFullYear(); mo = dt.getMonth() + 1; d = dt.getDate(); hh = dt.getHours(); mi = dt.getMinutes();
+    }
+    const wd = "日月火水木金土"[new Date(Date.UTC(y, mo - 1, d)).getUTCDay()];
+    return { y, mo, d, hh, mi, wd, key: `${y}-${mo}-${d}`, ms: Date.UTC(y, mo - 1, d, hh, mi) };
+  }
+  const hm = t => (t ? `${t.hh}:${String(t.mi).padStart(2, "0")}` : "—");
+  const md = t => (t ? `${t.mo}/${t.d}` : "");
+  const day = t => (t ? `${t.mo}/${t.d}（${t.wd}）` : "");
+  const when = t => (t ? `${day(t)}${hm(t)}` : "");
+  // 長さ: 何日も再開した会話は minutes が 1 万を超えるので、分のまま出さない
+  const dur = m => (m <= 180 ? `${m} 分` : m < 1440 ? `約 ${Math.round(m / 60)} 時間` : `${Math.max(1, Math.round(m / 1440))} 日にわたる`);
+  const itemTime = i => (MULTI_DAY && i.t ? `${md(i.t)} ${hm(i.t)}` : hm(i.t));
+  const R_FROM = parseT(DATA.range && DATA.range.from), R_TO = parseT(DATA.range && DATA.range.to);
+  function daysLabel() {
+    const ts = ITEMS.map(i => i.t).filter(Boolean);
+    if (!ts.length) return R_FROM ? day(R_FROM) : "";
+    const a = ts[0], b = ts[ts.length - 1];
+    return a.key === b.key ? day(a) : `${day(a)}〜${day(b)}`;
+  }
+  { const d = R_TO || parseT(DATA.made_at); if (d) document.title = `send-to-nobu ${md(d)}`; }
+
+  // ── DOM（文字列は必ずテキストノード。innerHTML は下の定数の SVG だけ） ──
+  function h(tag, props, ...kids) {
+    const el = document.createElement(tag);
+    if (props) for (const k of Object.keys(props)) {
+      const v = props[k];
+      if (v == null || v === false) continue;
+      if (k === "class") el.className = v;
+      else el.setAttribute(k, v === true ? "" : String(v));
+    }
+    for (const c of kids.flat(Infinity)) {
+      if (c == null || c === false) continue;
+      el.append(c instanceof Node ? c : String(c));
+    }
+    return el;
+  }
+  const ICON = {
+    clock: '<svg width="18" height="18" viewBox="0 0 18 18" fill="none" aria-hidden="true"><circle cx="9" cy="9" r="7.25" stroke="currentColor" stroke-width="1.5"/><path d="M9 5v4.2l2.8 1.7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+    alert: '<svg width="18" height="18" viewBox="0 0 18 18" fill="none" aria-hidden="true"><circle cx="9" cy="9" r="7.25" stroke="currentColor" stroke-width="1.5"/><path d="M9 5.2v4.6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><circle cx="9" cy="12.6" r="1" fill="currentColor"/></svg>',
+    check: s => `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5" stroke="currentColor" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
+  };
+  function icon(svg) { const t = document.createElement("template"); t.innerHTML = svg; return t.content.firstChild; }
+  // null / false は入れない（replaceChildren は null を "null" の字にする）
+  const fill = (el, ...kids) => el.replaceChildren(...kids.flat(Infinity).filter(k => k != null && k !== false));
+  const sep = () => h("span", { class: "sep" }, "·");
+  const folder = p => (p ? h("span", { class: "mono" }, p) : "ホーム");
+
+  // ── 状態 ──
+  const send = {};
+  ITEMS.forEach(i => { send[i.n] = i.defSend; });
+  let memo = "";
+  let st = "idle";            // idle | sending | typed | done
+  let dirty = false;          // 押したあと、結果の前に変えた
+  let touched = false;        // 読み込み後に本人が触った（復元で上書きしない）
+  let restored = false;       // db の decision から復元した
+  let slow = false;           // 送っている…が長い
+  let failWhy = "";           // 会話へ直接送れなかった理由（小さく出す）
+  let errMsg = "";            // decision を残せなかった
+  let dbState = "pending";    // pending | ok | none
+  let db = null, room = null, canState = null;
+  let lastDecision = null, result = null, slowTimer = 0;
+  const nSend = () => ITEMS.filter(i => send[i.n]).length;
+  const canDirect = () => !!room && (canState === "available" || canState === "available_if_summoned");
+
+  // ── 目盛り（会話 1 本 = 1 本、時刻順） ──
+  function tally(sendMap, maxW = 280) {
+    const n = Math.max(1, ITEMS.length);
+    const tg = n > 24 ? 2 : 4;   // 多い日は詰めて 1 行に収める（上限 60 本で 2px）
+    const tw = Math.max(2, Math.min(9, Math.floor((maxW - tg * (n - 1)) / n)));
+    return h("div", { class: "tally", "aria-hidden": "true", style: `--tw:${tw}px;--tg:${tg}px` },
+      ITEMS.map(i => h("i", { class: `tk${sendMap[i.n] ? "" : " h"}${isFlag(i) ? " w" : ""}`, title: `${itemTime(i)} ${i.title}` })));
+  }
+
+  // ── 頭 ──
+  function renderTop() {
+    const top = $("top");
+    if (st === "done") {
+      fill(top, h("p", { class: "eyebrow", style: "margin:0" }, h("span", { class: "mk" }), `send-to-nobu · ${daysLabel()}の会話`));
+      return;
+    }
+    const N = ITEMS.length, W = FLAGGED.length, s = nSend();
+    let h1;
+    if (JUDGE === "failed") h1 = [h("span", { class: "tn" }, N), " 件。", h("em", null, "AI の確認なし"), "。", h("br"), h("span", { class: "rest-t" }, "タイトルを見て選ぶ")];
+    else if (!W) h1 = ["今日は", h("em", { class: "ok" }, "注意なし"), "。", h("br"), h("span", { class: "rest-t" }, h("span", { class: "tn" }, N), " 件をそのまま送る")];
+    else h1 = [h("span", { class: "tn" }, N), " 件のうち ", h("em", null, h("span", { class: "tn" }, W), " 件に注意"), "。", h("br"), h("span", { class: "rest-t" }, "ほかはふつうの業務")];
+    const period = R_FROM && R_TO ? `${when(R_FROM)} → ${when(R_TO)} の会話` : `${daysLabel()}の会話`;
+    let bar;
+    if (dbState === "none") {
+      bar = h("p", { class: "when warn" }, icon(ICON.alert), h("span", null, "このページは ", h("b", null, "Claude のアプリ（claude.ai / Desktop）"), " で開いてね。ここからは送れない"));
+    } else if (canState && !canDirect()) {
+      bar = h("p", { class: "when" }, icon(ICON.clock), h("span", null, "決めて「これで送る」→ このページを出した会話に ", h("b", null, "「送って」"), " と打つと送る。それまでは何度でも変えられる"));
+    } else {
+      bar = h("p", { class: "when" }, icon(ICON.clock), h("span", null, "「これで送る」を押すと、", h("b", null, "その場でのぶろうに送る"), "。押すまでは何度でも変えられる"));
+    }
+    fill(top,
+      h("div", { class: "head" },
+        h("div", null,
+          h("p", { class: "eyebrow" }, h("span", { class: "mk" }), "send-to-nobu · 今日のページ"),
+          h("h1", null, h1),
+          h("p", { class: "period tn" }, period)),
+        h("div", { class: "top-r" },
+          tally(send),
+          h("p", { class: "counts" },
+            h("span", { class: "cs" }, h("b", null, s), "送る"),
+            h("span", { class: "ch" }, h("b", null, N - s), "送らない")))),
+      bar);
+  }
+
+  // ── 決めること ──
+  function renderFlagged() {
+    const box = $("flagged");
+    const W = FLAGGED.length;
+    if (JUDGE === "failed") {
+      fill(box, h("div", { class: "verdict fail", role: "status" },
+        h("span", { class: "vk", "aria-hidden": "true" }, "!"),
+        h("p", { class: "vh" }, "AI の確認は今回できなかった"),
+        h("p", { class: "vs" }, "タイトルを見て、送りたくないものだけオフに")));
+      return;
+    }
+    const caveat = JUDGE === "partial" && FAILED > 0
+      ? `${FAILED} 件は AI の確認ができなかった。下の一覧でタイトルを見てね` : "";
+    if (!W) {
+      fill(box, h("div", { class: "verdict", role: "status" },
+        h("span", { class: "vk" }, icon(ICON.check(30))),
+        h("p", { class: "vh" }, "今日は注意なし"),
+        h("p", { class: "vs" }, "AI が ", h("b", null, ITEMS.length - (JUDGE === "partial" ? FAILED : 0)), " 件を読んで、外す候補は見つからなかった。全部そのまま送れる"),
+        caveat ? h("p", { class: "vc" }, h("i"), caveat) : null));
+      return;
+    }
+    fill(box,
+      h("div", { class: "sh" }, h("h2", null, "決めること ", h("span", { class: "tn" }, W), " 件"), h("p", null, "注意が付いたので、最初は「送らない」にしてある")),
+      caveat ? h("p", { class: "caveat" }, h("i"), caveat) : null,
+      h("div", { class: "fr-list" }, FLAGGED.map(i => h("article", { class: `fr${send[i.n] ? " s" : ""}` },
+        h("div", { class: "fr-b" },
+          h("div", { class: "fr-why" }, h("span", { class: "tag" }, i.flag.reason), i.flag.why ? h("span", { class: "ph" }, i.flag.why) : null),
+          i.flag.quote ? h("p", { class: "quote", title: i.flag.quote }, `「${i.flag.quote}」`) : null,
+          h("h3", { class: "fr-ti" }, i.title),
+          h("p", { class: "meta" }, h("span", { class: "tn" }, itemTime(i)), sep(), dur(i.minutes), sep(), folder(i.project), sep(), "発言 ", h("span", { class: "tn" }, i.turns))),
+        h("div", { class: "seg", role: "group", "aria-label": `${i.title} を送るかどうか` },
+          h("button", { type: "button", class: "bh", "data-set": `${i.n}:0`, "data-fk": `s${i.n}:0`, "aria-pressed": String(!send[i.n]) }, h("i", { class: "sw-h" }), "送らない"),
+          h("button", { type: "button", class: "bs", "data-set": `${i.n}:1`, "data-fk": `s${i.n}:1`, "aria-pressed": String(!!send[i.n]) }, "送る"))))));
+  }
+
+  // ── ふつうの業務 ──
+  function renderRest() {
+    const box = $("rest");
+    const list = NORMAL;
+    if (!list.length) { fill(box, MORE ? h("p", { class: "more" }, `ほかに ${MORE} 件。送ったあと、次のページに出る`) : ""); return; }
+    const on = list.filter(i => send[i.n]).length;
+    const label = FLAGGED.length ? "ふつうの業務 " : "";
+    const rows = [];
+    let lastKey = null;
+    for (const i of list) {
+      if (MULTI_DAY && i.t && i.t.key !== lastKey) { rows.push(h("div", { class: "day" }, day(i.t))); lastKey = i.t.key; }
+      rows.push(h("div", { class: `rs${send[i.n] ? "" : " h"}`, "data-toggle": i.n },
+        h("span", { class: "t" }, hm(i.t)),
+        h("span", { class: "ti", title: i.title }, i.title),
+        h("span", { class: "fo" }, folder(i.project)),
+        h("button", { type: "button", class: "sw", role: "switch", "aria-checked": String(!!send[i.n]), "aria-label": `${i.title} を送る`, "data-toggle": i.n, "data-fk": `t${i.n}` })));
+    }
+    fill(box,
+      h("div", { class: "sh" },
+        h("h2", null, label, h("span", { class: "tn" }, list.length), " 件 — そのまま送る"),
+        h("p", null, on < list.length ? ["うち ", h("span", { class: "tn" }, list.length - on), " 件を外した"] : "外したいものだけオフに")),
+      h("div", { class: "rs-list" }, rows),
+      MORE ? h("p", { class: "more" }, `ほかに ${MORE} 件。送ったあと、次のページに出る`) : null);
+  }
+
+  // ── 感想と送る（textarea は作り直さない: 打っている途中の字とフォーカスを守る） ──
+  const memoEl = h("textarea", { id: "stn-memo", maxlength: "4000", placeholder: "のぶろう に一言（任意）。困ったこと・うまくいったこと" });
+  const footEl = h("div", { class: "foot" });
+  $("send").append(h("div", { class: "send-box" },
+    h("label", { for: "stn-memo" }, "のぶろう に一言", h("span", null, "任意")), memoEl, footEl));
+
+  function sayBox(small) {
+    return h("div", { class: "say" }, h("span", { class: "say-t" }, "送って"),
+      h("button", { type: "button", class: "copy", "data-copy": "", "data-fk": small ? "copy-s" : "copy" }, "コピー"));
+  }
+  function renderSend() {
+    const s = nSend(), x = ITEMS.length - s;
+    const counts = ["送る ", h("b", null, s), " 件 · 送らない ", h("b", null, x), " 件"];
+    if (st === "typed") {
+      fill(footEl, h("div", { class: "guide" },
+        h("p", { class: "g1" }, restored ? "この内容で押してある。まだ送っていなければ、" : "決めた内容をページに残した。", h("b", null, "このページを出した会話"), "に、こう打つと送る"),
+        sayBox(false),
+        h("p", { class: "g2" }, h("i"), h("span", null, "会話で送るまで待っている。それまでは、ここで変えて押し直せる", failWhy ? `（ボタンからは会話に届かなかった: ${failWhy}）` : ""))));
+      return;
+    }
+    if (st === "sending") {
+      fill(footEl,
+        h("div", { class: "send-row" },
+          h("p", { class: "send-note" }, counts, h("span", { class: "st" }, "会話の AI が送っている。終わると、ここが受け取り票に変わる")),
+          h("button", { class: "go", type: "button", disabled: true }, h("i", { class: "spin" }), "送っている…")),
+        slow ? h("div", { class: "guide small" },
+          h("p", { class: "g1" }, "動かないときは、", h("b", null, "このページを出した会話"), "にこう打つ"), sayBox(true)) : null);
+      return;
+    }
+    let note, btn;
+    if (dbState !== "ok") {
+      note = [counts, h("span", { class: "st" }, dbState === "none" ? "このページは Claude のアプリ（claude.ai / Desktop）で開いてね" : "準備している…")];
+      btn = h("button", { class: "go off", type: "button", disabled: true }, "これで送る ", h("span", { class: "gc" }, `${s} 件`));
+    } else {
+      const sub = errMsg ? h("span", { class: "st err" }, errMsg)
+        : dirty ? h("span", { class: "st" }, h("span", { class: "dirty" }, "変更あり。"), "もう一度押すと、この内容で送る")
+        : h("span", { class: "st" }, "押すまでは、どれも送らない");
+      note = [counts, sub];
+      btn = h("button", { class: "go", type: "button", "data-go": "", "data-fk": "go" }, "これで送る ", h("span", { class: "gc" }, `${s} 件`));
+    }
+    fill(footEl, h("div", { class: "send-row" }, h("p", { class: "send-note" }, note), btn));
+  }
+
+  // ── 受け取り票 ──
+  function renderReceipt() {
+    const box = $("receipt");
+    if (st !== "done" || !result) { fill(box); return; }
+    const dec = lastDecision && lastDecision.round === ROUND ? lastDecision : null;
+    const ex = new Set(dec && Array.isArray(dec.exclude) ? dec.exclude : ITEMS.filter(i => !send[i.n]).map(i => i.n));
+    const sentMap = {}; ITEMS.forEach(i => { sentMap[i.n] = !ex.has(i.n); });
+    const held = ITEMS.filter(i => ex.has(i.n));
+    const nS = num(result.sent, ITEMS.length - held.length), nH = num(result.excluded, held.length);
+    const noteText = result.note && dec ? str(dec.note) : "";
+    const at = parseT(result.at);
+    fill(box, h("div", { class: "receipt" },
+      h("div", { class: "rc-top" },
+        h("span", { class: "rc-ck" }, icon(ICON.check(28))),
+        h("p", { class: "rc-k" }, "送った"),
+        h("p", { class: "rc-when" }, [at ? when(at) : "", `${daysLabel()}の会話`].filter(Boolean).join(" · "))),
+      h("div", { class: "rc-cut" }, h("i")),
+      h("div", { class: "rc-nums" },
+        h("div", { class: "s" }, h("p", null, h("b", null, nS), h("em", null, "件")), h("span", null, "送った")),
+        h("div", { class: "h" }, h("p", null, h("b", null, nH), h("em", null, "件")), h("span", null, "送らなかった"))),
+      ITEMS.length ? h("div", { class: "rc-viz" }, tally(sentMap, 360)) : null,
+      held.length ? h("div", { class: "rc-sec" }, h("p", { class: "rc-l" }, `送らなかった ${held.length} 件`),
+        h("ul", { class: "rc-hold" }, held.map(i => h("li", null, h("span", { class: "t" }, itemTime(i)), h("span", { class: "ti", title: i.title }, i.title))))) : null,
+      h("div", { class: "rc-sec rc-note" }, h("p", { class: "rc-l" }, "のぶろうへの一言"),
+        h("blockquote", { class: noteText ? "" : "empty" }, noteText || "（なし）")),
+      h("div", { class: "rc-cut", style: "margin-top:18px" }, h("i")),
+      h("p", { class: "rc-next" }, icon(ICON.clock), h("span", null, "明日の朝、次のページが来る"))));
+  }
+
+  // ── 描く ──
+  function render() {
+    const fk = document.activeElement && document.activeElement.dataset ? document.activeElement.dataset.fk : null;
+    APP.dataset.st = st;
+    if (!FLAGGED.length && JUDGE !== "failed") APP.dataset.calm = ""; else delete APP.dataset.calm;
+    const done = st === "done";
+    APP.querySelector(".body").hidden = done;
+    $("send").hidden = done;
+    $("receipt").hidden = !done;
+    renderTop(); renderFlagged(); renderRest(); renderSend(); renderReceipt();
+    if (fk) { const el = APP.querySelector(`[data-fk="${fk}"]`); if (el) el.focus({ preventScroll: true }); }
+  }
+  function animIn(sel, kf, o) {
+    if (window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    const el = APP.querySelector(sel);
+    if (el && el.animate) el.animate(kf, Object.assign({ duration: 420, easing: "cubic-bezier(.2,.7,.2,1)", fill: "both" }, o));
+  }
+
+  // ── 変える ──
+  function changed() {
+    touched = true;
+    if (st === "sending" || st === "typed") { st = "idle"; dirty = true; restored = false; clearTimeout(slowTimer); }
+    errMsg = "";
+  }
+  function toggle(n, val) {
+    if (st === "done" || !(n in send)) return;
+    const next = val === undefined ? !send[n] : val;
+    if (send[n] === next) return;
+    send[n] = next;
+    changed();
+    render();
+  }
+
+  // ── 押す: decision を書き始め（await しない）、同じクリックの中で同期的に会話へ ──
+  function toTyped(why) {
+    st = "typed"; failWhy = why ? String(why).slice(0, 40) : ""; clearTimeout(slowTimer); render();
+  }
+  function press() {
+    if (dbState !== "ok" || !db || st === "done") return;
+    const dec = {
+      round: ROUND,
+      exclude: ITEMS.filter(i => !send[i.n]).map(i => i.n).sort((a, b) => a - b),
+      note: memo.trim(),
+      at: new Date().toISOString(),
+    };
+    lastDecision = dec; touched = true; dirty = false; restored = false; errMsg = ""; failWhy = ""; slow = false;
+    let w;
+    try { w = db.doc("send/decision").set(dec); } catch (e) { w = Promise.reject(e); }
+    Promise.resolve(w).catch(e => {
+      if (lastDecision !== dec || st === "done") return;
+      st = "idle"; clearTimeout(slowTimer);
+      errMsg = `ページに残せなかった（${(e && e.code) || "error"}）。もう一度押して`;
+      render();
+    });
+    if (canDirect()) {
+      try {
+        const p = room.sendToClaudeSession(
+          { label: "send-to-nobu: これで送る", round: ROUND },
+          {
+            deliver: "send",
+            onStatus: s => {
+              if (lastDecision !== dec || !s) return;
+              if (s.state === "failed" && st === "sending") toTyped(s.reason || "failed");
+              else if (s.state === "sent" && st === "typed" && failWhy) { st = "sending"; failWhy = ""; startSlow(); render(); }
+            },
+          });
+        st = "sending"; startSlow();
+        Promise.resolve(p).catch(e => { if (lastDecision === dec && st === "sending") toTyped((e && e.code) || "error"); });
+      } catch (e) { st = "typed"; failWhy = (e && e.code) || "error"; }
+    } else {
+      st = "typed";
+    }
+    render();
+  }
+  function startSlow() {
+    clearTimeout(slowTimer); slow = false;
+    slowTimer = setTimeout(() => { if (st === "sending") { slow = true; render(); } }, 25000);
+  }
+
+  // ── 結果（会話の AI が send/result を書いたら受け取り票） ──
+  function showResult(v) {
+    if (st === "done" && result && result.at === v.at) return;
+    const finish = () => {
+      result = v; st = "done"; clearTimeout(slowTimer); render();
+      animIn(".receipt", [{ opacity: 0, transform: "translateY(18px) scale(.985)" }, { opacity: 1, transform: "none" }], { duration: 560 });
+      animIn(".rc-ck", [{ transform: "scale(.3)", opacity: 0 }, { transform: "scale(1.1)", opacity: 1, offset: .6 }, { transform: "none", opacity: 1 }], { duration: 600, delay: 160 });
+      try { window.scrollTo({ top: 0 }); } catch (_) {}
+    };
+    if (lastDecision && lastDecision.round === ROUND) { finish(); return; }
+    db.doc("send/decision").get()
+      .then(s => { const d = s && s.exists ? s.data() : null; if (d && d.round === ROUND) applyDecision(d); })
+      .catch(() => {})
+      .then(finish);
+  }
+  function applyDecision(d) {
+    const ex = new Set(Array.isArray(d.exclude) ? d.exclude : []);
+    ITEMS.forEach(i => { send[i.n] = !ex.has(i.n); });
+    memo = str(d.note); memoEl.value = memo;
+    lastDecision = d;
+  }
+
+  // ── 起動: 先に db なしで描き、capability が来たら点ける ──
+  const use = name => {
+    try {
+      const c = window.claude;
+      if (!c || typeof c.use !== "function") return Promise.resolve(null);
+      return Promise.resolve(c.use(name)).catch(() => null);
+    } catch (_) { return Promise.resolve(null); }
+  };
+  function refreshCan() {
+    if (!room || typeof room.canSendToClaudeSession !== "function") { canState = room ? "off" : canState; return; }
+    Promise.resolve().then(() => room.canSendToClaudeSession())
+      .then(v => { canState = v; }, () => { canState = "off"; })
+      .then(() => { if (st !== "done") render(); });
+  }
+  use("room").then(r => { room = r || null; if (room) refreshCan(); else { canState = "off"; if (st !== "done") render(); } });
+  use("db").then(d => {
+    if (!d) { dbState = "none"; render(); return; }
+    db = d; dbState = "ok";
+    db.doc("send/decision").get().then(s => {
+      const v = s && s.exists ? s.data() : null;
+      if (!v || v.round !== ROUND || touched || st !== "idle") return;
+      applyDecision(v); restored = true; st = "typed"; render();
+    }).catch(() => {});
+    try {
+      db.doc("send/result").onSnapshot(s => {
+        const v = s && s.exists ? s.data() : null;
+        if (v && v.round === ROUND) showResult(v);
+      }, () => {});
+    } catch (_) {}
+    render();
+  });
+  document.addEventListener("visibilitychange", () => { if (!document.hidden && st !== "done") refreshCan(); });
+
+  // ── 操作 ──
+  APP.addEventListener("click", e => {
+    const t = e.target;
+    const set = t.closest("[data-set]");
+    if (set) { const [n, v] = set.dataset.set.split(":"); toggle(+n, v === "1"); return; }
+    const tg = t.closest("[data-toggle]");
+    if (tg) { toggle(+tg.dataset.toggle); return; }
+    const cp = t.closest("[data-copy]");
+    if (cp) { copySay(cp); return; }
+    if (t.closest("[data-go]")) press();
+  });
+  memoEl.addEventListener("input", () => {
+    memo = memoEl.value;
+    const was = st;
+    changed();
+    if (was !== st) render();
+  });
+  function copySay(btn) {
+    const ok = () => { btn.textContent = "コピーした"; btn.classList.add("ok"); };
+    const fallback = () => {
+      const t = btn.parentElement && btn.parentElement.querySelector(".say-t");
+      if (t) { const r = document.createRange(); r.selectNodeContents(t); const s = getSelection(); s.removeAllRanges(); s.addRange(r); }
+      btn.textContent = "選んだ。⌘C で"; btn.classList.add("ok");
+    };
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText("送って").then(ok, fallback);
+      else fallback();
+    } catch (_) { fallback(); }
+  }
+
+  render();
+})();
+</script>
+</body>
+</html>

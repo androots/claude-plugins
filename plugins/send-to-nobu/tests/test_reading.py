@@ -22,9 +22,6 @@ def builtin(name):
 
 
 class Reading(Base):
-    def first_question(self):
-        return self.w.pending()["questions"][0]["question"]
-
     def test_what_counts_as_a_human_instruction(self):
         # 人の指示でないものだけの会話は出さない
         L = Lines().user(builtin("model")).user("<local-command-stdout>Set model</local-command-stdout>")
@@ -34,8 +31,7 @@ class Reading(Base):
         L.user([{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}])
         L.assistant()
         self.w.write(L)
-        self.w.list()
-        self.assertEqual(self.w.listed(), [])
+        self.assertEqual(self.w.page()["count"], 0)
         # 組み込みコマンドのあとの指示・スキル呼び出し・! コマンド・作業中に打った文は人の指示
         for first, title in (("<system-reminder>注意</system-reminder>\n本当の指示", "本当の指示"),
                              ("<command-message>deck</command-message>\n<command-name>/deck</command-name>\n"
@@ -47,7 +43,7 @@ class Reading(Base):
                                                    "prompt": "作業中に打った文"}, isSidechain=False)
         self.w.write(Q.assistant())
         self.w.next_day()
-        self.w.list()
+        self.w.page()
         self.assertEqual(sorted(self.w.titles().values()), sorted(["本当の指示", "/deck 来週の資料", "!ls -la", "作業中に打った文"]))
 
     def test_title_prefers_last_custom_then_last_ai_title(self):
@@ -57,7 +53,7 @@ class Reading(Base):
         c = Lines().user("  とても長い最初の指示。" + "あ" * 60 + "\n二行目").assistant()
         for L in (a, b, c):
             self.w.write(L)
-        self.w.list()
+        self.w.page()
         titles = {it["session_id"]: it["title"] for it in self.w.pending()["items"]}
         self.assertEqual(titles[a.sid], "自分の題")
         self.assertEqual(titles[b.sid], "最後の AI の題")
@@ -67,9 +63,9 @@ class Reading(Base):
         now = time.time()
         L = Lines().user("一つ目", at=now - 100).assistant(at=now - 50).user("二つ目", at=now - 5000).assistant(at=now - 4000)
         path = self.w.write(L)
-        self.w.list()
+        self.w.page()
         self.assertEqual(self.w.pending()["items"][0]["last_activity"], agentlog.iso_utc(agentlog.parse_ts(iso(now - 50))))
-        self.w.answer_simple()
+        self.w.decide()
         self.send()
         with open(path, "rb") as f:
             self.assertEqual(self.inbox.body(L.sid), f.read())
@@ -79,7 +75,7 @@ class Reading(Base):
         mixed = Lines(entrypoint="sdk-cli").user("自動で始めた").assistant()
         mixed.entrypoint = "cli"
         self.w.write(mixed.user("人が続けた").assistant())
-        self.w.list()
+        self.w.page()
         self.assertEqual(self.w.listed(), [mixed.sid])
 
     def test_first_run_is_the_last_7_days(self):
@@ -88,11 +84,10 @@ class Reading(Base):
         opened = Lines(base=old).user("開いて閉じただけ").assistant()
         opened_path = self.w.write(opened, mtime=old + 600)
         self.w.append(opened_path, Lines(sid=opened.sid).meta("last-prompt", lastPrompt="x").meta("mode", mode="default"))
-        self.w.list()
-        self.assertEqual(self.w.listed(), [])
+        self.assertEqual(self.w.page()["count"], 0)
         self.w.append(path, Lines(sid=os.path.basename(path)[:-6]).user("また使った").assistant())
         self.w.next_day()
-        self.w.list()
+        self.w.page()
         self.assertEqual(self.w.listed(), [os.path.basename(path)[:-6]])
 
     def test_subagents_are_read_recursively(self):
@@ -105,8 +100,8 @@ class Reading(Base):
         os.makedirs(os.path.join(path[:-6], "tool-results"))
         with open(os.path.join(path[:-6], "tool-results", "t.json"), "w") as f:
             f.write("{}")
-        self.w.list()
-        self.w.answer_simple()
+        self.w.page()
+        self.w.decide()
         code, res = self.send()
         self.assertEqual(code, 0, res)
         rels = [s["rel"] for s in self.finish()["sent"][0]["subagents"]]
@@ -121,42 +116,35 @@ class Reading(Base):
         path = self.w.write(L)
         size = os.path.getsize(path)
         self.w.append(path, '{"type":"user","message":{"content":"書きかけ'.encode("utf-8"))
-        self.w.list()
+        self.w.page()
         self.assertEqual(self.w.pending()["items"][0]["offset"], size)
-        self.w.answer_simple()
+        self.w.decide()
         self.send()
         body = self.inbox.body(L.sid)
         self.assertEqual(len(body), size)
         self.assertNotIn("書きかけ".encode("utf-8"), body)
         self.assertIn(b"\xff", body)    # 読めない文字も手を加えずに送る
 
-    def test_the_selection_screen(self):
-        self.w.write(Lines().user("請求書の集計").assistant())
-        res = self.w.list()
-        qs = res["ask"]["questions"]
-        self.assertEqual(res["next"], agentlog.NEXT_ASK)
-        self.assertEqual(len(qs), 2)
-        self.assertEqual(qs[0]["question"].splitlines(), [
-            "未送信の会話が 1 件ある。外したもの以外を のぶろう に送る。", "AI が中身を読んだ。外す候補はなし", "",
-            "1. 請求書の集計", "",
-            "送らない会話は？（外すなら入力欄に番号。例: 3, 5-7）"])
-        self.assertEqual([o["label"] for o in qs[0]["options"]], [agentlog.NONE_LABEL, agentlog.PASS_LABEL])
-        self.assertEqual([o["label"] for o in qs[1]["options"]], list(agentlog.NOTE_OPTIONS))
-        self.assertFalse(qs[0]["multiSelect"] or qs[1]["multiSelect"])
-        self.assertNotIn("session_id", json.dumps(res))     # 出力は質問だけ（会話 ID・パスは控えにだけ）
+    def test_nothing_to_send(self):
+        res = self.w.page()
+        self.assertEqual(res, {agentlog.LIST_MARKER: 1, "count": 0, "say": "未送信の会話はない", "next": agentlog.END})
+        self.assertIsNone(self.w.pending())
+        d = os.path.join(self.w.data, "page")
+        self.assertEqual(os.listdir(d) if os.path.isdir(d) else [], [])
 
-    def test_nothing_to_send_still_takes_the_note(self):
-        res = self.w.list()
-        self.assertEqual(len(res["ask"]["questions"]), 1)
-        self.assertTrue(res["ask"]["questions"][0]["question"].startswith("送る会話はない"))
-        self.w.answer_simple(exclude=None, note="質問: MCP って何？")
+    def test_only_a_note_still_goes(self):
+        self.w.write(Lines().user("請求書の集計").assistant())
+        self.w.page()
+        self.w.decide(exclude=[1], note="質問: MCP って何？")
         code, res = self.send()
-        self.assertEqual((code, res["say"]), (0, "感想を送った"))
-        self.assertEqual(self.finish()["note"], "質問: MCP って何？")
-        self.w.list()
-        self.w.answer_simple(exclude=None, note="特になし")
+        self.assertEqual((code, res["say"]), (0, "感想を送った（会話は 1 件外した）"))
+        self.assertEqual((self.finish()["sent"], self.finish()["note"]), ([], "質問: MCP って何？"))
+        self.w.next_day()
+        self.w.write(Lines().user("議事録").assistant())
+        self.w.page()
+        self.w.decide(exclude=[1])
         code, res = self.w.run("send")     # 送るものが無いときはサーバーに行かない（引換券も要らない）
-        self.assertEqual((code, res["say"]), (0, "今回は何も送っていない"))
+        self.assertEqual((code, res["say"]), (0, "今回は何も送っていない（1 件外した）"))
 
 
 class Nudge(Base):
@@ -178,7 +166,7 @@ class Nudge(Base):
         self.conv("B")
         self.w.write(Lines(entrypoint="sdk-cli").user("自動").assistant())
         self.assertIn("2 件", self.nudge(time.time(), session="00000000-0000-4000-8000-000000000000"))
-        self.assertEqual(self.w.list()["count"], 2)
+        self.assertEqual(self.w.page()["count"], 2)
 
     def test_never_gets_in_the_way(self):
         for argv in (["nudge"], ["nudge", "--data-dir", "/etc"], ["nudge", "--bogus"]):
@@ -200,14 +188,15 @@ class Sending(Base):
     def test_uploads_go_in_batches_and_the_finish_follows_the_contract(self):
         for i in range(120):
             self.w.subagent(self.path, "agent-%03d.jsonl" % i, Lines().user("サブ %d" % i).assistant())
-        self.w.list()
-        self.w.answer_simple(note="感想")
+        self.w.page()
+        self.w.decide(note="感想")
         code, res = self.send()
         self.assertEqual(code, 0, res)
         self.assertEqual(self.inbox.upload_batches, [100, 21])
         body = self.finish()
         self.assertEqual(sorted(body), ["excluded_count", "note", "plugin_version", "sent"])
-        self.assertEqual(body["plugin_version"], "0.6.0")
+        self.assertEqual(body["plugin_version"], agentlog.plugin_version())
+        self.assertRegex(body["plugin_version"], r"^\d+\.\d+\.\d+$")
         s = body["sent"][0]
         self.assertEqual(sorted(s), sorted(["session_id", "bytes", "sha256", "title", "project", "last_activity",
                                             "redactions", "subagents"]))
@@ -215,24 +204,24 @@ class Sending(Base):
 
     def test_a_lost_finish_reply_counts_as_done_on_retry(self):
         self.inbox.finish_lose_first = True     # 送信票は置けたが 502。リトライで 409 already_finished → 成功
-        self.w.list()
-        self.w.answer_simple()
+        self.w.page()
+        self.w.decide()
         code, res = self.send()
         self.assertEqual((code, res["sent"]), (0, 1))
 
     def test_a_used_or_expired_code_asks_for_a_new_one(self):
-        self.w.list()
-        self.w.answer_simple()
+        self.w.page()
+        self.w.decide()
         code, res = self.w.run("send", "--code", "x" * 26, "--api-base", self.inbox.base)
         self.assertEqual(code, 4)
         self.assertEqual(res, {"next": agentlog.NEXT_NEW_CODE})
         self.assertEqual(self.w.state()["sessions"], {})
-        code, res = self.send()     # 新しい引換券で。答えはもう一度読む（聞き直さない）
+        code, res = self.send()     # 新しい引換券で。答えはもう一度読む（押し直させない）
         self.assertEqual((code, res["sent"]), (0, 1))
 
     def test_only_our_server_and_storage(self):
-        self.w.list()
-        self.w.answer_simple()
+        self.w.page()
+        self.w.decide()
         code, res = self.w.run("send", "--code", FakeInbox.CODE, "--api-base", "https://example.com")
         self.assertEqual(code, 2)
         self.inbox.put_url_base = "http://127.0.0.1:9"      # 決まった場所ではないアップロード先
@@ -258,17 +247,22 @@ class Sending(Base):
         for bad in ("", os.path.join(self.w.tmp, "elsewhere", "send-to-nobu-x"),
                     os.path.join(self.w.tmp, "plugins", "data", "other-plugin")):
             out = io.StringIO()
-            self.assertEqual(agentlog.main(["list", "--data-dir", bad], stdout=out), 1)
+            self.assertEqual(agentlog.main(["page", "--data-dir", bad], stdout=out), 1)
             self.assertIn("データの置き場所", json.loads(out.getvalue())["say"])
 
     def test_the_real_entrypoint_uses_the_env(self):
+        # 子プロセスは本物のテンプレ（scripts/page.html）を使うので、会話 0 件で env の読み方だけを見る
+        os.unlink(self.path)
         env = dict(os.environ, CLAUDE_CONFIG_DIR=self.w.tmp, CLAUDE_CODE_SESSION_ID=self.w.current,
                    CLAUDE_PLUGIN_DATA="/somewhere/else")
         script = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts", "agentlog.py")
-        r = subprocess.run([sys.executable, script, "list", "--data-dir", self.w.data], env=env,
+        r = subprocess.run([sys.executable, script, "page", "--data-dir", self.w.data], env=env,
                            capture_output=True, text=True, timeout=60)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertEqual(json.loads(r.stdout)["count"], 1)
+        self.assertEqual(json.loads(r.stdout)["count"], 0)
+        r = subprocess.run([sys.executable, script, "page", "--data-dir", self.w.data], capture_output=True,
+                           text=True, timeout=60, env=dict(env, CLAUDE_CODE_SESSION_ID=""))
+        self.assertIn("いまの会話がわからない", json.loads(r.stdout)["say"])
 
 
 if __name__ == "__main__":
