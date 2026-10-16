@@ -1376,7 +1376,8 @@ def review_input(convs, arts, labels, t_from, t_to, limit=None):
     for c in convs:
         title = c.scan.title()
         model = " ".join(x for x in (labels.get(c.sid, ""), c.effort or "") if x)
-        group = "×%d（同じ頼み方で並列に立てた %d 本。中身は代表の 1 本）" % (c.n, c.n) if c.n > 1 else ""
+        group = ("×%d（同じ頼み方で並列に立てた %d 本。中身は代表の 1 本。本数はページが札で出すので、title には数を入れない）"
+                 % (c.n, c.n)) if c.n > 1 else ""
         top = "  ".join(x for x in ("=== 会話 " + c.id, "%s–%s" % (hhmm(c.first_ts), hhmm(c.last_ts)), model,
                                      "「%s」" % title, group) if x)
         mine = [a for a in arts if a["conv"] == c.id]
@@ -1736,6 +1737,22 @@ def conv_artifacts(c):
     return [p for ts, p in sorted(mine)]
 
 
+_COUNT_TAIL_RE = re.compile(
+    r"[\s　]*(?:[×xX✕*][\s　]*[0-9０-９]+[\s　]*(?:本|件|個)?|[（(][\s　]*[×xX✕]?[\s　]*[0-9０-９]+[\s　]*(?:本|件|個)[\s　]*[）)]"
+    r"|[0-9０-９]+[\s　]*(?:本|件)(?:分|まとめ)?)[\s　]*$")
+
+
+def strip_count(title):
+    """まとめた行の題から、末尾の数の書き込み（×12・x 12・（12 本）・12 本 など）を取る。ページが「× N」の札で出すので。"""
+    t = title or ""
+    for _ in range(3):
+        new = _COUNT_TAIL_RE.sub("", t).rstrip(" 　・、,-–—")
+        if new == t or not new:
+            break
+        t = new
+    return t
+
+
 def _group_keys(c):
     keys = {("t", c.scan.title(TITLE_MAX))}
     head = squash(mask_text(display_text(c.scan.first_text or ""))[0], 80)
@@ -1809,6 +1826,7 @@ def build_report(kit, round_id, t_from, t_to, convs, removed, nums, labels, shap
                "model": labels.get(c.sid, "")}
         if c.n > 1:
             row["group"] = {"n": c.n}
+            row["title"] = strip_count(row["title"]) or c.scan.title(24)
         if r.get("memo"):
             row["memo"] = r["memo"]
         rows.append(row)

@@ -44,7 +44,7 @@ class Groups(Base):
         self.assertEqual(g["shots"], ["s1.jpg"])           # まとめた会話のアーティファクトも代表に寄せる
         text = self.review_text()
         self.assertEqual(text.count("=== 会話 "), 2)
-        self.assertIn("×4（同じ頼み方で並列に立てた 4 本。中身は代表の 1 本）", text)
+        self.assertIn("×4（同じ頼み方で並列に立てた 4 本。中身は代表の 1 本。", text)
         self.assertIn("[本人] 追加の直し 1", text)           # 代表は中身の一番多い 1 本
         self.assertNotIn("発売ページを比較して 2", text)
         self.assertIn("会話 5 本", text.splitlines()[0])
@@ -54,6 +54,27 @@ class Groups(Base):
         self.assertEqual(code, 0, out)
         body = self.inbox.body()
         self.assertEqual((body["report"]["numbers"]["convs"], body["removed_count"]), (1, 4))
+
+    def test_a_count_written_into_the_title_is_removed(self):
+        self.parallel(3, time.time() - 3000)
+        self.conv("ひとつだけの会話 x 2", base=time.time() - 1000)
+        self.fake_review(output={"advices": [], "praises": [], "hide": {}, "convs": [
+            {"id": "c1", "title": "AIR ONE 発売ページ ×3", "flow": ["a", "b"], "thumb": "doc", "gaveup": False,
+             "memo": {"verdict": "言わない", "why": "x"}},
+            {"id": "c2", "title": "ひとつだけの会話 x 2", "flow": ["a", "b"], "thumb": "doc", "gaveup": False,
+             "memo": {"verdict": "言わない", "why": "x"}}]})
+        self.prepared()
+        self.assertIn("title には数を入れない", self.review_text())
+        rows = self.report()["convs"]
+        self.assertEqual((rows[0]["title"], rows[0]["group"]), ("AIR ONE 発売ページ", {"n": 3}))
+        self.assertEqual(rows[1]["title"], "ひとつだけの会話 x 2")     # まとめていない行は触らない
+
+    def test_strip_count(self):
+        for raw in ("AIR ONE 発売ページ ×12", "AIR ONE 発売ページ x 12", "AIR ONE 発売ページ（12 本）",
+                    "AIR ONE 発売ページ (×12本)", "AIR ONE 発売ページ・12本", "AIR ONE 発売ページ ✕１２", "AIR ONE 発売ページ"):
+            self.assertEqual(agentlog.strip_count(raw), "AIR ONE 発売ページ", raw)
+        self.assertEqual(agentlog.strip_count("Windows 11"), "Windows 11")
+        self.assertEqual(agentlog.strip_count("×3"), "×3")              # 数だけなら残す（呼び出し側が元の題に戻す）
 
     def test_far_apart_or_different_ones_stay_apart(self):
         t0 = time.time() - 7000
