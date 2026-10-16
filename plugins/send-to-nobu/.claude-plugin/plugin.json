@@ -1,7 +1,7 @@
 {
   "name": "send-to-nobu",
-  "version": "0.7.1",
-  "description": "Claude Code の会話ログを のぶろう に送る。毎朝の今日のページで、送らない会話と感想を決めて押すだけ",
+  "version": "0.8.0",
+  "description": "毎朝のレポート（使い方のアドバイス・よかったこと・やったこと）を自分の Mac で作り、ページで確かめてから のぶろう に送る。会話そのものは送らない",
   "author": {
     "name": "androots"
   },

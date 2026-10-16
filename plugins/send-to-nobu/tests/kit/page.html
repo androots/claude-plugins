@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>毎朝のレポート（テスト用）</title>
+<!-- テスト用の最小のひな形。本番のひな形はキット（サーバー）から届く。約束はスロット 1 か所とデータの形（ARCH 6 章）だけ -->
+<style>
+  :root { --bg: #f5f6f8; --card: #fff; --ink: #1f2937; --sub: #6b7280; --line: #e5e7eb; --hl: #fff3a3; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.6 -apple-system, "Hiragino Sans", sans-serif; }
+  main { max-width: 1080px; margin: 0 auto; padding: 20px 16px 40px; display: grid; gap: 16px; }
+  h1 { font-size: 20px; margin: 0; } h2 { font-size: 15px; margin: 0 0 8px; color: var(--sub); }
+  section { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; }
+  .nums { display: flex; gap: 20px; flex-wrap: wrap; } .nums b { display: block; font-size: 20px; }
+  .adv { border-top: 1px solid var(--line); padding: 10px 0; } .adv:first-of-type { border-top: 0; }
+  .say { font-weight: 700; } mark { background: var(--hl); } .q { color: var(--sub); }
+  pre { white-space: pre-wrap; background: var(--bg); padding: 8px; border-radius: 8px; margin: 6px 0 0; }
+  .conv { display: grid; grid-template-columns: 56px 1fr 180px; gap: 12px; padding: 8px 0; border-top: 1px solid var(--line); }
+  .conv img { width: 180px; border-radius: 6px; border: 1px solid var(--line); }
+  .muted { color: var(--sub); font-size: 12px; }
+</style>
+</head>
+<body>
+<script type="application/json" id="report-data">__REPORT__</script>
+<main id="app"></main>
+<script>
+(function () {
+  var d = JSON.parse(document.getElementById("report-data").textContent);
+  var app = document.getElementById("app");
+  function el(tag, text, cls) { var e = document.createElement(tag); if (text != null) e.textContent = text; if (cls) e.className = cls; return e; }
+  function box(title) { var s = el("section"); s.appendChild(el("h2", title)); app.appendChild(s); return s; }
+  app.appendChild(el("h1", d.day_label + " のレポート" + (d.who && d.who.label ? "（" + d.who.label + "）" : "")));
+  var n = d.numbers || {}, nb = box("数字"), row = el("div", null, "nums");
+  [["費用", "$" + n.cost_usd], ["今月", "$" + n.cost_month_usd], ["1 日平均", "$" + n.cost_avg_usd],
+   ["会話", n.convs + " 本"], ["モデル", n.model], ["外した", n.removed + " 本"]].forEach(function (x) {
+    var c = el("div", x[0]); c.appendChild(el("b", x[1])); row.appendChild(c); });
+  nb.appendChild(row);
+  var ab = box("アドバイス");
+  (d.advices || []).forEach(function (a) {
+    var w = el("div", null, "adv");
+    w.appendChild(el("div", (a.today ? "今日の一手 · " : "") + a.type + " · " + a.conv, "muted"));
+    w.appendChild(el("div", a.say, "say"));
+    (a.scene && a.scene.quotes || []).forEach(function (q) { w.appendChild(el("div", "「" + q + "」", "q")); });
+    var p = el("pre"), i = a.key ? a.prompt.indexOf(a.key) : -1;
+    if (i >= 0) { p.appendChild(document.createTextNode(a.prompt.slice(0, i))); p.appendChild(el("mark", a.key));
+      p.appendChild(document.createTextNode(a.prompt.slice(i + a.key.length))); } else { p.textContent = a.prompt; }
+    w.appendChild(p); ab.appendChild(w); });
+  if (!(d.advices || []).length) ab.appendChild(el("div", "アドバイスはなし", "muted"));
+  var pb = box("よかったこと");
+  (d.praises || []).forEach(function (p) { pb.appendChild(el("div", "👏 " + p.say + "（" + p.conv + "）")); });
+  var cb = box("やったこと");
+  (d.convs || []).forEach(function (c) {
+    var r = el("div", null, "conv"); r.appendChild(el("div", c.time, "muted"));
+    var m = el("div"); m.appendChild(el("div", c.title, "say")); m.appendChild(el("div", (c.flow || []).join(" → "), "muted"));
+    if (c.memo) m.appendChild(el("div", "AI のメモ: " + c.memo.verdict + " — " + c.memo.why, "muted"));
+    r.appendChild(m); var t = el("div");
+    var src = c.thumb && c.thumb.img && d.images && d.images[c.thumb.img];
+    if (src) { var im = el("img"); im.src = src; im.alt = c.title; t.appendChild(im); } else { t.appendChild(el("div", c.thumb ? c.thumb.kind : "", "muted")); }
+    r.appendChild(t); cb.appendChild(r); });
+})();
+</script>
+</body>
+</html>

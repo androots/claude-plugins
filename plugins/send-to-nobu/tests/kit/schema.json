@@ -1,0 +1,41 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["advices", "praises", "convs", "hide"],
+  "properties": {
+    "advices": {"type": "array", "maxItems": 3, "items": {
+      "type": "object", "additionalProperties": false,
+      "required": ["type", "conv", "say", "key", "quotes", "count", "n", "items", "next_label", "yesterday", "next", "prompt"],
+      "properties": {
+        "type": {"type": "string"},
+        "conv": {"type": "string", "pattern": "^c[0-9]+$"},
+        "say": {"type": "string", "maxLength": 30},
+        "key": {"type": "string"},
+        "quotes": {"type": "array", "maxItems": 5, "items": {"type": "string", "maxLength": 80}},
+        "count": {"type": "string", "maxLength": 12},
+        "n": {"type": "integer", "minimum": 0},
+        "items": {"type": "array", "maxItems": 12, "items": {"type": "string", "maxLength": 12}},
+        "next_label": {"type": "string", "maxLength": 24},
+        "yesterday": {"type": "string"},
+        "next": {"type": "string"},
+        "prompt": {"type": "string"},
+        "free_title": {"type": "string", "maxLength": 24}
+      }}},
+    "praises": {"type": "array", "maxItems": 2, "items": {
+      "type": "object", "additionalProperties": false, "required": ["conv", "say", "first"],
+      "properties": {"conv": {"type": "string", "pattern": "^c[0-9]+$"}, "say": {"type": "string", "maxLength": 30},
+                     "first": {"type": "boolean"}}}},
+    "convs": {"type": "array", "items": {
+      "type": "object", "additionalProperties": false, "required": ["id", "title", "flow", "thumb", "gaveup", "memo"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^c[0-9]+$"},
+        "title": {"type": "string", "maxLength": 24},
+        "flow": {"type": "array", "minItems": 2, "maxItems": 5, "items": {"type": "string", "maxLength": 24}},
+        "thumb": {"type": "string", "enum": ["doc", "mail", "sheet", "slide", "code", "image", "art"]},
+        "gaveup": {"type": "boolean"},
+        "memo": {"type": "object", "additionalProperties": false, "required": ["verdict", "why"],
+                 "properties": {"verdict": {"type": "string", "enum": ["言う", "言わない"]},
+                                "why": {"type": "string", "maxLength": 80}}}}}},
+    "hide": {"type": "object", "additionalProperties": {"type": "array", "items": {"type": "string"}}}
+  }
+}

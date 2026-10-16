@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""AI の確認（ツールを持たない claude -p が外す候補を提案する）。claude は偽物（tests/fake_claude.py）。"""
+"""外す判定（ツールを持たない claude -p が、私的・仕事以外の会話を外す）。claude は偽物（tests/fake_claude.py）。"""
 
 import json
 import os
@@ -8,111 +8,21 @@ import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from helpers import FAKE_CLAUDE, Lines, agentlog  # noqa: E402
-from test_guarantees import Base  # noqa: E402
+from helpers import FAKE_CLAUDE, Base, Lines, agentlog  # noqa: E402
 
 
 class Judge(Base):
-    def setUp(self):
-        super().setUp()
-        self.record = os.path.join(self.w.tmp, "judge.jsonl")
-        self.a, _ = self.conv("請求書の集計をして", base=time.time() - 3000)
-        self.b, _ = self.conv("この表を整形して", "部長の愚痴を聞いてほしい\n昨日も怒鳴られた", base=time.time() - 2000)
-        self.c, _ = self.conv("議事録のテンプレート", base=time.time() - 1000)
+    def says_of(self, call, word):
+        """判定の入力のうち、word を含む会話のやりとり [(誰, 文)]。"""
+        for c in json.loads(call["stdin"]):
+            if any(word in s["text"] for s in c["says"]):
+                return [(s["who"], s["text"]) for s in c["says"]]
+        raise AssertionError(word)
 
-    def tearDown(self):
-        os.environ.pop("FAKE_JUDGE", None)
-        os.environ[agentlog.JUDGE_BIN_ENV] = FAKE_CLAUDE
-        super().tearDown()
-
-    def fake(self, **conf):
-        os.environ["FAKE_JUDGE"] = json.dumps(dict(conf, record=self.record), ensure_ascii=False)
-
-    def judged(self):
-        """偽の claude が受け取った呼び出し [{argv, stdin, judge_env, cwd}]。"""
-        with open(self.record, encoding="utf-8") as f:
-            return [json.loads(x) for x in f]
-
-    def says_of(self, L, call):
-        n = {it["session_id"]: it["n"] for it in self.w.pending()["items"]}[L.sid]
-        return [(x["who"], x["text"]) for x in {c["n"]: c["says"] for c in json.loads(call["stdin"])}[n]]
-
-    def flags(self):
-        return {it["n"]: it["flag"] for it in self.w.page_data()["items"]}
-
-    def test_candidates_carry_the_reason_a_word_and_the_users_own_line(self):
-        self.fake(flag={"愚痴": "愚痴"}, why="上司への不満が中心")
-        self.w.page()
-        data = self.w.page_data()
-        self.assertEqual((data["judge"], data["failed"]), ("ok", 0))
-        self.assertEqual(self.flags(), {1: None, 3: None, 2: {
-            "reason": "愚痴", "why": "上司への不満が中心", "quote": "部長の愚痴を聞いてほしい 昨日も怒鳴られた",
-            "who": "本人"}})
-        # 候補でも、決めるのは本人（ページで押した答えだけで外す）
-        self.w.decide(exclude=[])
-        code, res = self.send()
-        self.assertEqual((code, res["sent"]), (0, 3))
-
-    def test_a_long_word_is_cut_and_a_long_line_is_shortened(self):
-        self.conv("お金の相談 " + "い" * 200, base=time.time() - 500)
-        self.fake(flag={"お金": "個人のお金"}, why="家計の相談。ローンと貯金と保険の見直しについて長く")
-        self.w.page()
-        flag = self.flags()[4]
-        self.assertEqual(flag["why"], "家計の相談。ローンと貯金と保険の見直しについて長く"[:agentlog.WHY_MAX])
-        self.assertEqual(len(flag["quote"]), agentlog.QUOTE_MAX)
-        self.assertTrue(flag["quote"].startswith("お金の相談") and flag["quote"].endswith("…"))
-
-    def test_a_quote_outside_the_says_is_empty(self):
-        for q in (5, -1, -3):
-            self.fake(flag={"愚痴": "愚痴"}, quote=q)
-            self.w.page()
-            self.assertEqual(self.flags()[2]["quote"], "", q)
-            self.assertEqual(self.flags()[2]["reason"], "愚痴")
-
-    def test_a_failed_check_falls_back_to_titles_only(self):
-        for conf, env in (({"mode": "error"}, None), ({}, ""), ({"mode": "drop"}, None)):
-            self.fake(**conf)
-            if env is not None:
-                os.environ[agentlog.JUDGE_BIN_ENV] = env     # claude が見つからない
-            try:
-                self.w.page()
-            finally:
-                os.environ[agentlog.JUDGE_BIN_ENV] = FAKE_CLAUDE
-            data = self.w.page_data()
-            self.assertEqual((data["judge"], data["failed"]), ("failed", 3), conf)
-            self.assertEqual(list(self.flags().values()), [None] * 3)
-        self.w.decide()
-        code, res = self.send()
-        self.assertEqual((code, res["sent"]), (0, 3))
-
-    def test_a_partly_failed_check(self):
-        saved = agentlog.JUDGE_BATCH
-        agentlog.JUDGE_BATCH = 1
-        self.fake(flag={"愚痴": "愚痴"}, fail_on="議事録")
-        try:
-            self.w.page()
-        finally:
-            agentlog.JUDGE_BATCH = saved
-        data = self.w.page_data()
-        self.assertEqual((data["judge"], data["failed"]), ("partial", 1))
-        self.assertEqual(self.flags()[2]["reason"], "愚痴")
-
-    def test_the_whole_check_has_a_time_limit(self):
-        saved = agentlog.JUDGE_BUDGET
-        agentlog.JUDGE_BUDGET = 0.5
-        self.fake(mode="slow", flag={"愚痴": "愚痴"})
-        try:
-            t0 = time.time()
-            self.w.page()
-        finally:
-            agentlog.JUDGE_BUDGET = saved
-        self.assertLess(time.time() - t0, 2.5)
-        self.assertEqual(self.w.page_data()["judge"], "failed")
-
-    def test_what_is_sent_is_what_is_read(self):
-        # 本人の発言・AI の返事・ツールの結果を読む（送るのはこれ全部なので）。画像・思考・サブエージェントは読まない
+    def test_what_is_read(self):
+        # 本人の発言・AI の返事・ツールの結果（範囲の中だけ）。画像・思考・サブエージェントは読まない
         L = Lines().user("この CSV を整形して").assistant("AI の返事: 了解しました")
-        L.msg("assistant", [{"type": "thinking", "thinking": "AI の思考", "signature": "x"}])
+        L.ai([{"type": "thinking", "thinking": "AI の思考", "signature": "x"}])
         L.tool("Bash", {"command": "cat list.csv"}, result="ツールの結果: 山田 090-1234-5678 " + "長" * 1000)
         L.tool("Read", {"file_path": "a.png"}, result=[
             {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo"}}])
@@ -120,71 +30,101 @@ class Judge(Base):
                 {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo"}}])
         L.assistant("長い返事 " + "ん" * 3000)
         self.w.subagent(self.w.write(L), "agent-a.jsonl", Lines().user("サブの指示").assistant())
-        self.fake()
-        self.w.page()
-        calls = self.judged()
+        self.prepared()
+        calls = self.calls("judge")
         self.assertEqual(len(calls), 1)
-        says = self.says_of(L, calls[0])
+        says = self.says_of(calls[0], "CSV")
         self.assertEqual([w for w, _ in says], ["本人", "AI", "ツール", "本人", "AI"])
-        self.assertEqual(says[0], ("本人", "この CSV を整形して"))
         self.assertEqual(says[1], ("AI", "AI の返事: 了解しました"))
-        self.assertTrue(says[2][1].startswith("ツールの結果: 山田 090-1234-5678"))
         self.assertEqual(len(says[2][1]), agentlog.JUDGE_TOOL_MAX)
         self.assertEqual(says[3], ("本人", "キーは [REDACTED:anthropic_key]"))
         self.assertEqual(len(says[4][1]), agentlog.JUDGE_AI_MAX)
         for word in ("AI の思考", "iVBOR", "サブの指示", "sk-ant-api03"):
             self.assertNotIn(word, calls[0]["stdin"])
         argv = calls[0]["argv"]
+        self.assertEqual(argv[argv.index("--model") + 1], "sonnet")
         self.assertEqual(argv[argv.index("--tools") + 1], "")       # ツールを持たない
-        self.assertIn("--no-session-persistence", argv)              # 判定の会話を残さない
+        for flag in ("--no-session-persistence", "--safe-mode", "--strict-mcp-config", "--disable-slash-commands"):
+            self.assertIn(flag, argv)
+        self.assertEqual(argv[argv.index("--setting-sources") + 1], "")
         self.assertEqual(argv[argv.index("--system-prompt") + 1], agentlog.JUDGE_SYSTEM)
         schema = json.loads(argv[argv.index("--json-schema") + 1])["properties"]["results"]["items"]
-        self.assertEqual(schema["required"], ["n", "exclude", "reason", "why", "quote"])
+        self.assertIn("仕事以外", schema["properties"]["reason"]["enum"])
         self.assertEqual(calls[0]["judge_env"], "1")
         self.assertNotEqual(os.path.realpath(calls[0]["cwd"]), os.path.realpath(os.getcwd()))
 
-    def test_long_conversations_keep_the_head_and_the_tail_and_quote_the_original(self):
+    def test_only_lines_inside_the_range_are_read(self):
+        now = time.time()
+        L = Lines().user("きのうより前の話 古い指示", at=now - 3 * 86400).assistant(at=now - 3 * 86400 + 60)
+        L.user("今日の指示", at=now - 600).assistant(at=now - 540)
+        self.w.write(L)
+        self.prepared(now=now)
+        says = self.says_of(self.calls("judge")[0], "今日の指示")
+        self.assertNotIn("古い指示", json.dumps(says, ensure_ascii=False))
+
+    def test_not_work_is_excluded(self):
+        self.conv("請求書の集計", base=time.time() - 2000)
+        self.conv("週末の旅行の宿を探して", base=time.time() - 1000)
+        self.fake_judge(flag={"旅行": "仕事以外"})
+        res = self.prepared()
+        self.assertEqual((res["count"], res["removed"]), (1, 1))
+        self.assertNotIn("旅行", self.review_text())
+
+    def test_a_partly_failed_check_keeps_the_unchecked(self):
+        saved = agentlog.JUDGE_BATCH
+        agentlog.JUDGE_BATCH = 1
+        self.conv("愚痴を聞いて", base=time.time() - 3000)
+        self.conv("議事録", base=time.time() - 2000)
+        self.conv("請求書", base=time.time() - 1000)
+        self.fake_judge(flag={"愚痴": "愚痴"}, fail_on="議事録")
+        try:
+            res = self.prepared()
+        finally:
+            agentlog.JUDGE_BATCH = saved
+        self.assertEqual((res["count"], res["removed"]), (2, 1))
+        self.assertIn("1 本は私的かどうかを確かめられなかった", res["say"])
+
+    def test_broken_results_count_as_unchecked(self):
+        self.conv("A", base=time.time() - 2000)
+        self.conv("B", base=time.time() - 1000)
+        for conf, env in (({"mode": "drop"}, None), ({}, "")):
+            self.fake_judge(**conf)
+            if env is not None:
+                os.environ[agentlog.JUDGE_BIN_ENV] = env     # claude が見つからない
+            try:
+                res = self.prepared()
+            finally:
+                os.environ[agentlog.JUDGE_BIN_ENV] = FAKE_CLAUDE
+            self.assertEqual((res["count"], self.w.last()["judge_failed"]), (2, 2), conf)
+
+    def test_the_check_has_a_time_limit(self):
+        saved = agentlog.JUDGE_BUDGET
+        agentlog.JUDGE_BUDGET = 0.5
+        self.conv("A")
+        self.fake_judge(mode="slow")
+        try:
+            t0 = time.time()
+            self.prepared()
+        finally:
+            agentlog.JUDGE_BUDGET = saved
+        self.assertLess(time.time() - t0, 2.5)
+        self.assertEqual(self.w.last()["judge_failed"], 1)
+
+    def test_long_conversations_keep_the_head_and_the_tail(self):
         L = Lines().user("先頭の指示 " + "あ" * 5000).assistant()
         for i in range(30):
             L.user("途中 %d " % i + "う" * 100).assistant()
-        L.user("い" * 5000 + " 末尾の指示 愚痴").assistant()
+        L.user("い" * 5000 + " 末尾の指示").assistant()
         self.w.write(L)
-        self.fake(flag={"愚痴": "愚痴"})
-        self.w.page()
-        says = [t for _, t in self.says_of(L, self.judged()[0])]
+        self.prepared()
+        says = [t for _, t in self.says_of(self.calls("judge")[0], "先頭の指示")]
         self.assertLessEqual(sum(len(x) for x in says), agentlog.JUDGE_CHARS)
-        self.assertTrue(says[0].startswith("先頭の指示") and says[-2].endswith("末尾の指示 愚痴"))
-        self.assertLess(len(says), 64)
-        # quote は渡した位置（末尾）でなく、元の発言の位置から本人の発言そのものを抜く
-        n = {it["session_id"]: it["n"] for it in self.w.pending()["items"]}[L.sid]
-        self.assertEqual(self.flags()[n]["quote"], ("い" * 5000)[:agentlog.QUOTE_MAX - 1] + "…")
-
-    def test_a_quote_from_the_ai_side_says_so(self):
-        L = Lines().user("受信箱を読んで").assistant("届いたメール: 健康診断の再検査のお知らせ")
-        self.w.write(L)
-        self.fake(flag={"再検査": "健康・家族"})
-        self.w.page()
-        n = {it["session_id"]: it["n"] for it in self.w.pending()["items"]}[L.sid]
-        flag = self.flags()[n]
-        self.assertEqual((flag["reason"], flag["who"]), ("健康・家族", "AI"))
-        self.assertEqual(flag["quote"], "届いたメール: 健康診断の再検査のお知らせ")
+        self.assertTrue(says[0].startswith("先頭の指示") and says[-2].endswith("末尾の指示"))
 
     def test_shorten_says_keeps_positions(self):
         says = ["a" * 10, "b" * 10, "c" * 10, "d" * 10]
         self.assertEqual(agentlog.shorten_says(says, 100), (says, [0, 1, 2, 3]))
-        shown, where = agentlog.shorten_says(says, 20)
-        self.assertEqual((shown, where), (["a" * 10, "d" * 10], [0, 3]))
-        shown, where = agentlog.shorten_says(["x" * 50], 20)
-        self.assertEqual((len(shown[0]), where), (10, [0]))
-
-    def test_nudge_is_quiet_inside_the_check(self):
-        os.environ[agentlog.JUDGE_ENV] = "1"
-        try:
-            code, out = self.w.run("nudge")
-        finally:
-            os.environ.pop(agentlog.JUDGE_ENV)
-        self.assertEqual((code, out), (0, {}))
-        self.assertIn("3 件", self.w.run("nudge")[1]["systemMessage"])
+        self.assertEqual(agentlog.shorten_says(says, 20), (["a" * 10, "d" * 10], [0, 3]))
 
 
 if __name__ == "__main__":

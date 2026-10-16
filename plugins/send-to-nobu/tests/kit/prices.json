@@ -1,0 +1,7 @@
+{
+  "unit": "USD per million tokens（テスト用の値）",
+  "models": {
+    "claude-opus-5-5": {"label": "Opus 5.5", "input": 5, "output": 25, "cache_read": 0.5, "cache_write_5m": 6.25, "cache_write_1h": 10},
+    "claude-sonnet-5-5": {"label": "Sonnet 5.5", "input": 3, "output": 15, "cache_read": 0.3, "cache_write_5m": 3.75, "cache_write_1h": 6}
+  }
+}
