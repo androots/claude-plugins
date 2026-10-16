@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""画像・文書の base64 を外す変換。データはすべて作り物。"""
+"""画像・文書の base64 を外す変換（会話を読むとき、要約や判定に base64 を持ち込まない）。データはすべて作り物。"""
 
 import base64
 import json
@@ -95,16 +95,6 @@ class OmitTest(unittest.TestCase):
         new, n = agentlog.omit_blob(raw)
         self.assertEqual(n, 1)
         self.assertEqual(json.loads(new)["t"], "\ud800 x")
-
-    def test_transform_omits_then_masks(self):
-        key = "sk-ant-api03-" + "A1b2C3d4E5f6G7h8I9j0" * 4
-        row = {"message": {"content": [{"type": "text", "text": "キー %s" % key},
-                                       {"type": "image", "source": {"type": "base64", "media_type": "image/png",
-                                                                    "data": PNG}}]}}
-        new, counts, omitted = agentlog.transform_blob(dumps(row))
-        self.assertEqual((counts, omitted), ({"anthropic_key": 1}, 1))
-        self.assertNotIn(key.encode(), new)
-        json.loads(new)
 
     def test_b64_size(self):
         for n in range(0, 10):

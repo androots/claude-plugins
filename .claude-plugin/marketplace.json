@@ -8,7 +8,7 @@
     {
       "name": "send-to-nobu",
       "source": "./plugins/send-to-nobu",
-      "description": "Claude Code の会話ログを のぶろう に送る（毎朝の今日のページで決めて押すだけ）"
+      "description": "毎朝のレポートを自分の Mac で作り、ページで確かめてから のぶろう に送る（会話そのものは送らない）"
     }
   ]
 }
