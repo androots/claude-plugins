@@ -58,6 +58,12 @@ SHOTS_PER_CONV = 3
 ARTIFACT_CHARS = 2000         # アーティファクトから抜く見える文字
 REVIEW_MODEL = "claude-opus-5-5"
 REVIEW_CHARS = 80000          # レビュー役に渡す要約の上限（超えたら会話ごとに頭と尻を残して詰める）
+REVIEW_MIN_CHARS = 20000      # 時間が足りないときに詰める下限
+REVIEW_FULL_TIME = 240.0      # レビュー役にこれだけ時間があれば、要約を詰めずに渡す
+AI_BUDGET = 480.0             # 外す判定とレビュー役の合計の上限（8 分）
+GROUP_WINDOW = 600.0          # 並列に立てた会話をつなぐ幅（直前の 1 本から 10 分以内）
+GROUP_WINDOW_SPAWNED = 1800.0  # 別の会話から立てた会話（origin が人でない）どうしは 30 分以内
+GROUP_SPAN = 3 * 3600.0       # 1 つのまとまりの全体は、最初の 1 本から 3 時間まで（午前と午後の別の仕事を混ぜない）
 REVIEW_TIMEOUT = 450.0
 HUMAN_MAX = 600               # 要約に入れる本人の発言 1 つ
 AI_HEAD = 160                 # 要約に入れる AI の返事の頭
@@ -519,6 +525,7 @@ class Scan(object):
         self.custom_title = self.ai_title = self.cwd = None
         self.marker = False         # レポートや控えの中身が残っている
         self.sdk = self.other_entry = False
+        self.spawned = False        # 最初の発言が人でない（別の会話から立てた会話など。origin.kind が human 以外）
 
     def title(self, limit=TITLE_CHARS):
         """最後の custom-title > 最後の ai-title > 最初の指示。秘密は伏せる。"""
@@ -534,6 +541,10 @@ class Scan(object):
 
 def _scan_line(s, d):
     t = d.get("type")
+    if t == "user" and s.first is None and d.get("isSidechain") is not True:
+        o = d.get("origin")
+        if isinstance(o, dict) and o.get("kind") not in (None, "human"):
+            s.spawned = True
     if t in ("user", "assistant"):
         if s.cwd is None and isinstance(d.get("cwd"), str):
             s.cwd = d["cwd"]
@@ -639,6 +650,7 @@ class Conv(object):
         self.artifacts = {}         # 公開した .html のパス → 最後に公開した時刻
         self.first_ts = self.last_ts = None
         self.effort = None
+        self.n = 1                  # 並列に立てた会話をまとめたときの本数（代表の 1 本が持つ）
         self.compact_args = None
 
     def mark(self, ts):
@@ -1355,7 +1367,7 @@ def fair_shares(sizes, total):
 def review_input(convs, arts, labels, t_from, t_to, limit=None):
     """レビュー役に渡す要約（day1.txt と同じ書き方）。会話ごとに、時刻・モデル・題・やりとり・アーティファクトの頭。"""
     limit = REVIEW_CHARS if limit is None else limit
-    head = ["日付: %s ／ 会話 %d 本（%s 〜 %s）" % (day_label(t_from), len(convs),
+    head = ["日付: %s ／ 会話 %d 本（%s 〜 %s）" % (day_label(t_from), sum(c.n for c in convs),
                                                datetime.datetime.fromtimestamp(t_from).strftime("%m/%d %H:%M"),
                                                datetime.datetime.fromtimestamp(t_to).strftime("%m/%d %H:%M")),
             "表記: [本人] = 本人の発言（長いものは頭だけ）、[AI] = AI の返事の頭、( ) = AI が使った道具、〔 〕 = 出来事、"
@@ -1364,8 +1376,9 @@ def review_input(convs, arts, labels, t_from, t_to, limit=None):
     for c in convs:
         title = c.scan.title()
         model = " ".join(x for x in (labels.get(c.sid, ""), c.effort or "") if x)
+        group = "×%d（同じ頼み方で並列に立てた %d 本。中身は代表の 1 本）" % (c.n, c.n) if c.n > 1 else ""
         top = "  ".join(x for x in ("=== 会話 " + c.id, "%s–%s" % (hhmm(c.first_ts), hhmm(c.last_ts)), model,
-                                     "「%s」" % title) if x)
+                                     "「%s」" % title, group) if x)
         mine = [a for a in arts if a["conv"] == c.id]
         blocks.append((top, conv_lines(c), mine))
     def size(b, art_cap=ARTIFACT_CHARS):
@@ -1723,6 +1736,51 @@ def conv_artifacts(c):
     return [p for ts, p in sorted(mine)]
 
 
+def _group_keys(c):
+    keys = {("t", c.scan.title(TITLE_MAX))}
+    head = squash(mask_text(display_text(c.scan.first_text or ""))[0], 80)
+    if head:
+        keys.add(("h", head))
+    return keys
+
+
+def group_convs(convs):
+    """並列に立てた会話を 1 本にまとめる。同じ題か同じ最初の指示で、まとまりの直前の 1 本から 10 分以内なら鎖のように
+    つなぐ（どちらも別の会話から立てた会話なら 30 分以内）。ただし最初の 1 本から 3 時間を超えたら新しいまとまりにする。
+    代表は中身の一番多い 1 本で、まとめた本数・時刻の幅・アーティファクト・本人の発言（引用の照合用）を代表に寄せる。
+    時刻順の代表の並びを返す。"""
+    groups = []
+    for c in convs:
+        keys = _group_keys(c)
+        for g in groups:
+            first, last = g["members"][0], g["members"][-1]
+            win = GROUP_WINDOW_SPAWNED if c.scan.spawned and last.scan.spawned else GROUP_WINDOW
+            t = c.first_ts or 0
+            if t - (last.first_ts or 0) <= win and t - (first.first_ts or 0) <= GROUP_SPAN and keys & g["keys"]:
+                g["members"].append(c)
+                g["keys"] |= keys
+                break
+        else:
+            groups.append({"members": [c], "keys": set(keys)})
+    out = []
+    for g in groups:
+        ms = g["members"]
+        r = max(ms, key=lambda c: (len(c.events), -(c.first_ts or 0)))
+        if len(ms) > 1:
+            r.n = len(ms)
+            r.first_ts = min(m.first_ts for m in ms if m.first_ts is not None)
+            r.last_ts = max(m.last_ts for m in ms if m.last_ts is not None)
+            arts = {}
+            for m in ms:
+                for path, ts in m.artifacts.items():
+                    arts[path] = max(arts.get(path, 0), ts)
+            r.artifacts = arts
+            r.humans = [h for m in ms for h in m.humans]
+        out.append(r)
+    out.sort(key=lambda c: (c.first_ts or 0, c.sid))
+    return out
+
+
 def pick_artifacts(convs, texts):
     """会話ごとのアーティファクト。id は a1… を会話の順に。texts は パス → 見える文字。"""
     arts = []
@@ -1749,6 +1807,8 @@ def build_report(kit, round_id, t_from, t_to, convs, removed, nums, labels, shap
         row = {"id": c.id, "time": hhmm(c.first_ts), "title": r.get("title") or c.scan.title(24),
                "flow": r.get("flow") or [], "thumb": thumb, "shots": mine, "gaveup": bool(r.get("gaveup")),
                "model": labels.get(c.sid, "")}
+        if c.n > 1:
+            row["group"] = {"n": c.n}
         if r.get("memo"):
             row["memo"] = r["memo"]
         rows.append(row)
@@ -1757,7 +1817,8 @@ def build_report(kit, round_id, t_from, t_to, convs, removed, nums, labels, shap
               "who": {"label": who_label()}, "range": {"from": iso_local(t_from), "to": iso_local(t_to)},
               "day_label": day_label(t_from),
               "numbers": {"cost_usd": nums["cost_usd"], "cost_month_usd": nums["cost_month_usd"],
-                          "cost_avg_usd": nums["cost_avg_usd"], "convs": len(convs), "model": nums["model"],
+                          "cost_avg_usd": nums["cost_avg_usd"], "convs": sum(c.n for c in convs),
+                          "model": nums["model"],
                           "removed": removed},
               "advices": shaped["advices"] if shaped else [], "praises": shaped["praises"] if shaped else [],
               "convs": rows,
@@ -1793,6 +1854,7 @@ def cmd_prepare(args, out):
         usage_fut = ex.submit(collect_usage, min(month_start(now), t_from), t_to)
         text_futs = {p: ex.submit(artifact_text, p, deadline - SHOT_RESERVE)
                      for p in sorted({p for c in convs for p in conv_artifacts(c)})}
+        ai_start = time.time()
         removed, judge_failed, judge_cost = judge(convs, deadline)
         usage = usage_fut.result()
         texts = {}
@@ -1801,7 +1863,7 @@ def cmd_prepare(args, out):
                 texts[p] = fut.result()
             except Exception:
                 texts[p] = ""
-    kept = [c for c in convs if c.sid not in removed]
+    kept = group_convs([c for c in convs if c.sid not in removed])
     for n, c in enumerate(kept, 1):
         c.id = "c%d" % n
     table = price_table(kit["files"]["prices.json"])
@@ -1811,8 +1873,14 @@ def cmd_prepare(args, out):
     shaped, review_cost, review_errors = None, 0.0, []
     if kept:
         log["judged_at_s"] = round(time.time() - t0, 1)
-        so, review_cost, review_errors = run_review(review_input(kept, arts, labels, t_from, t_to), kit,
-                                                    deadline - SHOT_RESERVE)
+        # 外す判定とレビュー役で 8 分まで。時間が足りなければ要約を詰める（全体はスキルの Bash の 600 秒に収める）
+        review_deadline = min(deadline - SHOT_RESERVE, ai_start + AI_BUDGET)
+        avail = review_deadline - time.time()
+        limit = REVIEW_CHARS if avail >= REVIEW_FULL_TIME else \
+            max(REVIEW_MIN_CHARS, int(REVIEW_CHARS * max(avail, 0) / REVIEW_FULL_TIME))
+        text = review_input(kept, arts, labels, t_from, t_to, limit)
+        log.update({"rows": len(kept), "review_chars": len(text)})
+        so, review_cost, review_errors = run_review(text, kit, review_deadline)
         shaped = shape_review(so, kept, catalog_types(kit), {a["id"] for a in arts}) if so else None
     shots = []
     if shaped and arts and can_shoot():   # 何を伏せるかが分からないとき（レビュー役が失敗）は撮らない
@@ -1840,13 +1908,13 @@ def cmd_prepare(args, out):
                 "artifacts": len(arts), "judge_cost_usd": round(judge_cost, 4), "review_cost_usd": round(review_cost, 4),
                 "unpriced_models": unpriced, "seconds": round(time.time() - t0, 1)})
     write_json(os.path.join(data_dir, "last-prepare.json"), log)
-    say = "今朝のレポートを作った（会話 %d 本%s）。" % (len(kept), "・私的なもの %d 本は外した" % len(removed) if removed else "")
+    say = "今朝のレポートを作った（会話 %d 本%s）。" % (sum(c.n for c in kept), "・私的なもの %d 本は外した" % len(removed) if removed else "")
     if kept and not shaped:
         say += "今日はアドバイスを作れなかった（やったことだけ）。"
     if judge_failed:
         say += "%d 本は私的かどうかを確かめられなかった。" % judge_failed
     say += "ページで送らないものを決めて「送る」を押してね"
-    emit(out, **{LIST_MARKER: 1, "count": len(kept), "removed": len(removed), "file": os.path.abspath(path),
+    emit(out, **{LIST_MARKER: 1, "count": sum(c.n for c in kept), "removed": len(removed), "file": os.path.abspath(path),
                  "round": round_id, "say": say, "next": NEXT_PAGE})
     return 0
 
@@ -1877,6 +1945,7 @@ def final_report(report, exclude, hide_shots):
     r.pop("round", None)
     r.pop("images", None)
     gone = {n for n, s in r["shots"].items() if s.get("conv") in exclude or n in hide_shots}
+    gone_n = sum(c.get("group", {}).get("n", 1) for c in r["convs"] if c["id"] in exclude)
     r["convs"] = [c for c in r["convs"] if c["id"] not in exclude]
     for c in r["convs"]:
         c["shots"] = [n for n in c.get("shots", []) if n not in gone]
@@ -1889,8 +1958,8 @@ def final_report(report, exclude, hide_shots):
     for i, a in enumerate(r["advices"]):
         a["today"] = i == 0
     r["praises"] = [p for p in r["praises"] if p.get("conv") not in exclude]
-    r["numbers"]["convs"] = len(r["convs"])
-    r["numbers"]["removed"] = r["numbers"].get("removed", 0) + len(exclude)
+    r["numbers"]["convs"] = sum(c.get("group", {}).get("n", 1) for c in r["convs"])
+    r["numbers"]["removed"] = r["numbers"].get("removed", 0) + gone_n
     return r
 
 
@@ -1932,7 +2001,7 @@ def cmd_send(args, out):
               "image_count": len(images)}
     write_json(result_path(answer_dir), result)   # AI は数を書き写さず、このファイルを db に置く
     say = "今朝のレポートを送った（会話 %d 本・スクショ %d 枚%s）" % (
-        len(report["convs"]), len(images), "・送らなかった会話 %d 本" % len(exclude) if exclude else "")
+        report["numbers"]["convs"], len(images), "・送らなかった会話 %d 本" % len(exclude) if exclude else "")
     emit(out, say=say, result=result, result_file=result_path(answer_dir), next=NEXT_RESULT)
     return 0
 

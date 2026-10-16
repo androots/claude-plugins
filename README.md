@@ -70,6 +70,9 @@ Mac。macOS の `/usr/bin/python3`（コマンドライン デベロッパツー
 - 読む AI とツールを持つ AI を分ける。中身を読むのは `prepare` の中から呼ぶツールなしの `claude -p` だけ。空の一時フォルダで `--tools ""`・`--setting-sources ""`・`--strict-mcp-config`・`--safe-mode`・`--no-session-persistence` を付ける（付けないと本人の CLAUDE.md・フック・MCP が入り、入力が十数万トークン増えて判断も汚れる）
   - 外す判定: Sonnet。理由は 7 つ＋「仕事以外」。線はプラグインの中（サーバーから変えられない）。確かめられなかった会話は残し、本人がページで決める
   - レビュー役: Opus（`claude-opus-5-5`）。system = rubric.md ＋ examples.md ＋ 型の一覧、出力 = schema.json。入力は `_spec/maiasa/test/day1.txt` の書き方の要約（会話 c1… を時刻順・本人の発言・AI の返事の頭・道具・compact・貼った画像・アーティファクトの見える文字の頭）。大きい日は会話ごとに頭と尻を残して詰める。失敗したら 1 回だけやり直し、だめならアドバイスなしのページ（スクショも撮らない）
+- 並列に立てた会話（同じ題か同じ最初の指示で、直前の 1 本から 10 分以内なら鎖のようにつなぐ。最初の発言の origin が人でない会話どうしは 30 分以内。1 つのまとまりは最初の 1 本から 3 時間まで）は 1 行にまとめ、`convs[].group.n` に本数を入れる。題・流れ・メモは代表（中身の一番多い 1 本）から、要約も代表の 1 本だけを渡す
+- ぼかしの札: レビュー役の `hide` が `{text, label}` なら label を `shots[name].hidden` に入れる（text は送らない）。文字列だけの形（キット v1）は「伏せた文字」
+- 時間: 外す判定とレビュー役の合計で 8 分まで、prepare 全体で 560 秒まで。レビュー役に 240 秒残らなければ、残り時間に合わせて要約を詰める
 - 引用（quotes）は AI の出力をそのまま使わない。本人の原文（伏せたもの）と照合し、原文にある部分だけを 80 字に切る
 - 費用: assistant 行の `message.usage` × キットの prices.json（$/MTok）。単価は models のキーで一番長く前方一致するもの → 無ければ fallback。`zero` のモデルは 0、`multipliers.inference_geo_<地域>` は `usage.inference_geo` で掛ける。応答 id で 1 つにする（1 応答が複数行に書かれる）。サブエージェント・送信用の会話も含む。主なモデル = 範囲の中で費用が一番多いもの
 - スクショ: headless Chrome（`--headless=new`・`--use-mock-keychain`・一時プロファイル・1280×800）で、元のフォルダを `<base>` にし、レビュー役の `hide` の文字列を含む要素に blur と札を付ける JS を差し込んで撮る → `sips` で JPEG（幅 1100・品質 70）。Chrome か sips が無ければ撮らない
@@ -86,6 +89,6 @@ Mac。macOS の `/usr/bin/python3`（コマンドライン デベロッパツー
   9. 費用の計算
 - データディレクトリ: `state.json`（`sent_until`・`sent_day`）・`pending.json`（今のページの控え）・`kit/kit.json`（キットの写し）・`page/`（最新のページ）・`shots/`（送るまでのスクショ）・`nudged.json`・`last-prepare.json`（件数・秒数・AI の費用だけ。中身は書かない）
 - サーバーとの取り決めは ARCH.md の 4 章（契約 v3）。v2 の `/v1/uploads`・`/v1/finish` はもう使わない
-- テスト: `cd plugins/send-to-nobu && /usr/bin/python3 -m unittest discover -s tests`（3.9・標準ライブラリだけ）。一時の設定ディレクトリと合成の会話ログだけで走り、読む projects が一時ディレクトリでなければ止まる。claude・Chrome・sips は偽物（`tests/fake_*.py`）、受け口は v3 の偽物、キットは `tests/kit/` のダミー。本物のひな形（ai-iinkai の `send-to-nobu/dist/kit/`）があれば `tests/test_real_kit.py` がそれでも組んで、Chrome で描けることを確かめる（場所は env の `SEND_TO_NOBU_REAL_KIT`）
+- テスト: `cd plugins/send-to-nobu && /usr/bin/python3 -m unittest discover -s tests`（3.9・標準ライブラリだけ）。一時の設定ディレクトリと合成の会話ログだけで走り、読む projects が一時ディレクトリでなければ止まる。claude・Chrome・sips は偽物（`tests/fake_*.py`）、受け口は v3 の偽物、キットは `tests/kit/` のダミー。本物のキット（ai-iinkai の `send-to-nobu/dist/publish/v1/`）があれば `tests/test_real_kit.py` がそれでも組んで、Chrome で描けることを確かめる（場所は env の `SEND_TO_NOBU_REAL_KIT`）
 - 形式: `claude plugin validate --strict .` と `claude plugin validate --strict plugins/send-to-nobu`
 - 利用者に更新を届けるには `plugins/send-to-nobu/.claude-plugin/plugin.json` の `version` を上げる

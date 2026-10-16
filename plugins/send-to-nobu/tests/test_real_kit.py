@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """本物のキット（ai-iinkai の send-to-nobu/dist/kit/。python3 kit/build.py で組む）でも、ページが組めて壊れないこと。
 
-キットの置き場所は env の SEND_TO_NOBU_REAL_KIT（無ければ ~/Dev/GHDev/ai-iinkai/send-to-nobu/dist/kit）。
+キットの置き場所は env の SEND_TO_NOBU_REAL_KIT（無ければ ~/Dev/GHDev/ai-iinkai/send-to-nobu/dist/publish/v1）。
 見つからなければ飛ばす。Chrome があれば、本物の headless Chrome で描いて中身が出ることも確かめる。
 """
 
@@ -17,7 +17,8 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from helpers import Base, Lines, agentlog  # noqa: E402
 
-REAL_KIT = os.environ.get("SEND_TO_NOBU_REAL_KIT") or os.path.expanduser("~/Dev/GHDev/ai-iinkai/send-to-nobu/dist/kit")
+REAL_KIT = os.environ.get("SEND_TO_NOBU_REAL_KIT") or os.path.expanduser(
+    "~/Dev/GHDev/ai-iinkai/send-to-nobu/dist/publish/v1")
 REAL_CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 
 
